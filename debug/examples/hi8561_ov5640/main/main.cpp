@@ -385,12 +385,12 @@ extern "C" void app_main(void)
         printf("esp_ldo_acquire_channel 3 fail\n");
     }
 
+    Screen_Init(&screen_mipi_dpi_panel);
+
     if (App_Video_Init() == false)
     {
         printf("App_Video_Init fail\n");
     }
-
-    Screen_Init(&screen_mipi_dpi_panel);
 
     esp_err_t assert = esp_lcd_panel_init(screen_mipi_dpi_panel);
     if (assert != ESP_OK)

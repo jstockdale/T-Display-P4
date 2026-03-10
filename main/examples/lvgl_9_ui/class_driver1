@@ -1,0 +1,685 @@
+/*
+ * SPDX-FileCopyrightText: 2021-2024 Espressif Systems (Shanghai) CO LTD
+ *
+ * SPDX-License-Identifier: Unlicense OR CC0-1.0
+ */
+
+#include <stdlib.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "esp_log.h"
+#include "usb/usb_host.h"
+#include "rtl-sdr.h"
+#include "mode-s.h"
+
+#define CLIENT_NUM_EVENT_MSG 5
+
+#define MAX_PACKET_SIZE 128000
+#define DEFAULT_BUF_LENGTH (MAX_PACKET_SIZE * 2)
+#define preamble_len 16
+#define long_frame 112
+#define short_frame 56
+#define MESSAGEGO 253
+#define OVERWRITE 254
+#define BADSAMPLE 255
+
+typedef enum
+{
+    ACTION_OPEN_DEV = (1 << 0),
+    ACTION_GET_DEV_INFO = (1 << 1),
+    ACTION_GET_DEV_DESC = (1 << 2),
+    ACTION_GET_CONFIG_DESC = (1 << 3),
+    ACTION_GET_STR_DESC = (1 << 4),
+    ACTION_CLOSE_DEV = (1 << 5),
+} action_t;
+
+#define DEV_MAX_COUNT 128
+
+typedef struct
+{
+    usb_host_client_handle_t client_hdl;
+    uint8_t dev_addr;
+    usb_device_handle_t dev_hdl;
+    action_t actions;
+} usb_device_t;
+
+typedef struct
+{
+    struct
+    {
+        union
+        {
+            struct
+            {
+                uint8_t unhandled_devices : 1; /**< Device has unhandled devices */
+                uint8_t shutdown : 1;          /**<  */
+                uint8_t reserved6 : 6;         /**< Reserved */
+            };
+            uint8_t val;                    /**< Class drivers' flags value */
+        } flags;                            /**< Class drivers' flags */
+        usb_device_t device[DEV_MAX_COUNT]; /**< Class drivers' static array of devices */
+    } mux_protected;                        /**< Mutex protected members. Must be protected by the Class mux_lock when accessed */
+
+    struct
+    {
+        usb_host_client_handle_t client_hdl;
+        SemaphoreHandle_t mux_lock; /**< Mutex for protected members */
+    } constant;                     /**< Constant members. Do not change after installation thus do not require a critical section or mutex */
+} class_driver_t;
+
+static const char *TAG = "CLASS";
+static rtlsdr_dev_t *rtldev = NULL;
+static class_driver_t *s_driver_obj;
+// static mode_s_t state;
+// static uint16_t mag[DEFAULT_BUF_LENGTH / 2];
+uint16_t squares[256];
+
+int short_output = 0;
+int quality = 10;
+int allowed_errors = 5;
+int adsb_frame[14];
+
+void display(int *frame, int len)
+{
+    int i, df;
+    // if (!short_output && len <= short_frame)
+    // {
+    //     return;
+    // }
+    df = (frame[0] >> 3) & 0x1f;
+    // if (quality == 0 && !(df == 11 || df == 17 || df == 18 || df == 19))
+    // {
+    //     return;
+    // }
+    fprintf(stdout, "*");
+    for (i = 0; i < ((len + 7) / 8); i++)
+    {
+        fprintf(stdout, "%02x", frame[i]);
+    }
+    fprintf(stdout, ";\r\n");
+    fprintf(stdout, "DF=%i CA=%i\n", df, frame[0] & 0x07);
+    fprintf(stdout, "ICAO Address=%06x\n", frame[1] << 16 | frame[2] << 8 | frame[3]);
+    if (len <= short_frame)
+    {
+        return;
+    }
+    fprintf(stdout, "PI=0x%06x\n", frame[11] << 16 | frame[12] << 8 | frame[13]);
+    fprintf(stdout, "Type Code=%i S.Type/Ant.=%x\n", (frame[4] >> 3) & 0x1f, frame[4] & 0x07);
+    fprintf(stdout, "--------------\n");
+}
+
+int magnitute(uint8_t *buf, int len)
+/* takes i/q, changes buf in place (16 bit), returns new len (16 bit) */
+{
+    int i;
+    uint16_t *m;
+    for (i = 0; i < len; i += 2)
+    {
+        m = (uint16_t *)(&buf[i]);
+        *m = squares[buf[i]] + squares[buf[i + 1]];
+    }
+    return len / 2;
+}
+uint16_t single_manchester(uint16_t a, uint16_t b, uint16_t c, uint16_t d)
+/* takes 4 consecutive real samples, return 0 or 1, BADSAMPLE on error */
+{
+    int bit, bit_p;
+    bit_p = a > b;
+    bit = c > d;
+
+    if (quality == 0)
+    {
+        return bit;
+    }
+
+    if (quality == 5)
+    {
+        if (bit && bit_p && b > c)
+        {
+            return BADSAMPLE;
+        }
+        if (!bit && !bit_p && b < c)
+        {
+            return BADSAMPLE;
+        }
+        return bit;
+    }
+
+    if (quality == 10)
+    {
+        if (bit && bit_p && c > b)
+        {
+            return 1;
+        }
+        if (bit && !bit_p && d < b)
+        {
+            return 1;
+        }
+        if (!bit && bit_p && d > b)
+        {
+            return 0;
+        }
+        if (!bit && !bit_p && c < b)
+        {
+            return 0;
+        }
+        return BADSAMPLE;
+    }
+
+    if (bit && bit_p && c > b && d < a)
+    {
+        return 1;
+    }
+    if (bit && !bit_p && c > a && d < b)
+    {
+        return 1;
+    }
+    if (!bit && bit_p && c < a && d > b)
+    {
+        return 0;
+    }
+    if (!bit && !bit_p && c < b && d > a)
+    {
+        return 0;
+    }
+    return BADSAMPLE;
+}
+
+inline uint16_t min16(uint16_t a, uint16_t b)
+{
+    return a < b ? a : b;
+}
+
+inline uint16_t max16(uint16_t a, uint16_t b)
+{
+    return a > b ? a : b;
+}
+
+int preamble(uint16_t *buf, int i)
+/* returns 0/1 for preamble at index i */
+{
+    int i2;
+    uint16_t low = 0;
+    uint16_t high = 65535;
+    for (i2 = 0; i2 < preamble_len; i2++)
+    {
+        switch (i2)
+        {
+        case 0:
+        case 2:
+        case 7:
+        case 9:
+            // high = min16(high, buf[i+i2]);
+            high = buf[i + i2];
+            break;
+        default:
+            // low  = max16(low,  buf[i+i2]);
+            low = buf[i + i2];
+            break;
+        }
+        if (high <= low)
+        {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+void manchester(uint16_t *buf, int len)
+/* overwrites magnitude buffer with valid bits (BADSAMPLE on errors) */
+{
+    /* a and b hold old values to verify local manchester */
+    uint16_t a = 0, b = 0;
+    uint16_t bit;
+    int i, i2, start, errors;
+    int maximum_i = len - 1; // len-1 since we look at i and i+1
+    // todo, allow wrap across buffers
+    i = 0;
+    while (i < maximum_i)
+    {
+        /* find preamble */
+        for (; i < (len - preamble_len); i++)
+        {
+            if (!preamble(buf, i))
+            {
+                continue;
+            }
+            a = buf[i];
+            b = buf[i + 1];
+            for (i2 = 0; i2 < preamble_len; i2++)
+            {
+                buf[i + i2] = MESSAGEGO;
+            }
+            i += preamble_len;
+            break;
+        }
+        i2 = start = i;
+        errors = 0;
+        /* mark bits until encoding breaks */
+        for (; i < maximum_i; i += 2, i2++)
+        {
+            bit = single_manchester(a, b, buf[i], buf[i + 1]);
+            a = buf[i];
+            b = buf[i + 1];
+            if (bit == BADSAMPLE)
+            {
+                errors += 1;
+                if (errors > allowed_errors)
+                {
+                    buf[i2] = BADSAMPLE;
+                    break;
+                }
+                else
+                {
+                    bit = a > b;
+                    /* these don't have to match the bit */
+                    a = 0;
+                    b = 65535;
+                }
+            }
+            buf[i] = buf[i + 1] = OVERWRITE;
+            buf[i2] = bit;
+        }
+    }
+}
+
+void messages(uint16_t *buf, int len)
+{
+    int i, data_i, index, shift, frame_len;
+    // todo, allow wrap across buffers
+    for (i = 0; i < len; i++)
+    {
+        if (buf[i] > 1)
+        {
+            continue;
+        }
+        frame_len = long_frame;
+        data_i = 0;
+        for (index = 0; index < 14; index++)
+        {
+            adsb_frame[index] = 0;
+        }
+        for (; i < len && buf[i] <= 1 && data_i < frame_len; i++, data_i++)
+        {
+            if (buf[i])
+            {
+                index = data_i / 8;
+                shift = 7 - (data_i % 8);
+                adsb_frame[index] |= (uint8_t)(1 << shift);
+            }
+            if (data_i == 7)
+            {
+                if (adsb_frame[0] == 0)
+                {
+                    break;
+                }
+                if (adsb_frame[0] & 0x80)
+                {
+                    frame_len = long_frame;
+                }
+                else
+                {
+                    frame_len = short_frame;
+                }
+            }
+        }
+        if (data_i < (frame_len - 1))
+        {
+            continue;
+        }
+        display(adsb_frame, frame_len);
+        fflush(stdout);
+    }
+}
+
+void on_msg(mode_s_t *self, struct mode_s_msg *mm)
+{
+    fprintf(stderr, "WARNING:here.\n");
+    int msgLength = mm->msgbits / 8;
+    for (int i = 0; i < msgLength; i++)
+        fprintf(stdout, "%02X", mm->msg[i]);
+}
+
+// void demodulate(uint8_t *source, int length)
+// {
+//     mode_s_compute_magnitude_vector(&source, &mag, length);
+//     mode_s_detect(&state, &mag, length / 2, on_msg);
+// }
+
+static void client_event_cb(const usb_host_client_event_msg_t *event_msg, void *arg)
+{
+    class_driver_t *driver_obj = (class_driver_t *)arg;
+    switch (event_msg->event)
+    {
+    case USB_HOST_CLIENT_EVENT_NEW_DEV:
+        // Save the device address
+        xSemaphoreTake(driver_obj->constant.mux_lock, portMAX_DELAY);
+        driver_obj->mux_protected.device[event_msg->new_dev.address].dev_addr = event_msg->new_dev.address;
+        int r;
+        r = rtlsdr_open(&rtldev, event_msg->new_dev.address, driver_obj->mux_protected.device[event_msg->new_dev.address].client_hdl);
+        r = rtlsdr_set_center_freq(rtldev, 1090000000);
+        if (r < 0)
+        {
+            fprintf(stderr, "WARNING: Failed to set center freq.\n");
+        }
+        else
+        {
+            fprintf(stderr, "Tuned to %u Hz.\n", 1090000000);
+        }
+        r = rtlsdr_set_sample_rate(rtldev, 2000000);
+        if (r < 0)
+        {
+            fprintf(stderr, "WARNING: Failed to set sample rate.\n");
+        }
+        else
+        {
+            fprintf(stderr, "Sampling at %u S/s.\n", 2000000);
+        }
+
+        r = rtlsdr_set_tuner_gain_mode(rtldev, 0.5);
+        if (r != 0)
+        {
+            fprintf(stderr, "WARNING: Failed to set tuner gain.\n");
+        }
+        else
+        {
+            fprintf(stderr, "Tuner gain set to automatic.\n");
+        }
+        // r = rtlsdr_set_freq_correction(rtldev, 0);
+        // if (r < 0)
+        // {
+        //     fprintf(stderr, "WARNING: Failed to set ppm error.\n");
+        // }
+        // else
+        // {
+        //     fprintf(stderr, "Tuner error set to %i ppm.\n", 0);
+        // }
+        r = rtlsdr_reset_buffer(rtldev);
+        if (r < 0)
+        {
+            fprintf(stderr, "WARNING: Failed to reset buffers.\n");
+        }
+        vTaskDelay(100); // Short delay to let client task spin up
+
+        uint8_t *buffer = malloc(DEFAULT_BUF_LENGTH * sizeof(uint8_t));
+        int n_read = 2;
+        ESP_LOGI(TAG, "[APP] Free memory: %ld bytes", esp_get_free_heap_size());
+        // mode_s_init(&state);
+        while (true)
+        {
+            for (int i = 0; i < DEFAULT_BUF_LENGTH; i += MAX_PACKET_SIZE)
+            {
+                uint8_t *tbuffer = malloc(MAX_PACKET_SIZE * sizeof(uint8_t));
+                r = rtlsdr_read_sync(rtldev, tbuffer, MAX_PACKET_SIZE, &n_read);
+                if (r < 0)
+                {
+                    fprintf(stderr, "WARNING: sync read failed.\n");
+                    break;
+                }
+                if ((uint32_t)n_read < MAX_PACKET_SIZE)
+                {
+                    fprintf(stderr, "Short read, samples lost, exiting!\n");
+                    break;
+                }
+                for (int j = 0; j < MAX_PACKET_SIZE; j++)
+                {
+                    buffer[i + j] = tbuffer[j];
+                }
+                free(tbuffer);
+            }
+            // int sbyte = DEFAULT_BUF_LENGTH - 10;
+            // for (int i = sbyte; i < sbyte + 10; i++)
+            //     fprintf(stdout, "%02X", buffer[i]);
+            // fprintf(stdout, "\n");
+            // sbyte = 512 - 10;
+            // for (int i = sbyte; i < sbyte + 10; i++)
+            //     fprintf(stdout, "%02X", buffer[i]);
+            // fprintf(stdout, "\n");
+            // demodulate(buffer, DEFAULT_BUF_LENGTH);
+            int len = magnitute(buffer, DEFAULT_BUF_LENGTH);
+            manchester((uint16_t *)buffer, len);
+            messages((uint16_t *)buffer, len);
+        }
+        // driver_obj->mux_protected.device[event_msg->new_dev.address].dev_hdl = NULL;
+        // // Open the device next
+        // driver_obj->mux_protected.device[event_msg->new_dev.address].actions |= ACTION_OPEN_DEV;
+        // // Set flag
+        // driver_obj->mux_protected.flags.unhandled_devices = 1;
+        // xSemaphoreGive(driver_obj->constant.mux_lock);
+        break;
+    case USB_HOST_CLIENT_EVENT_DEV_GONE:
+        // Cancel any other actions and close the device next
+        xSemaphoreTake(driver_obj->constant.mux_lock, portMAX_DELAY);
+        for (uint8_t i = 0; i < DEV_MAX_COUNT; i++)
+        {
+            if (driver_obj->mux_protected.device[i].dev_hdl == event_msg->dev_gone.dev_hdl)
+            {
+                driver_obj->mux_protected.device[i].actions = ACTION_CLOSE_DEV;
+                // Set flag
+                driver_obj->mux_protected.flags.unhandled_devices = 1;
+            }
+        }
+        xSemaphoreGive(driver_obj->constant.mux_lock);
+        break;
+    default:
+        // Should never occur
+        abort();
+    }
+}
+
+static void action_open_dev(usb_device_t *device_obj)
+{
+    assert(device_obj->dev_addr != 0);
+    ESP_LOGI(TAG, "Opening device at address %d", device_obj->dev_addr);
+    ESP_ERROR_CHECK(usb_host_device_open(device_obj->client_hdl, device_obj->dev_addr, &device_obj->dev_hdl));
+    // Get the device's information next
+    device_obj->actions |= ACTION_GET_DEV_INFO;
+}
+
+static void action_get_info(usb_device_t *device_obj)
+{
+    assert(device_obj->dev_hdl != NULL);
+    ESP_LOGI(TAG, "Getting device information");
+    usb_device_info_t dev_info;
+    ESP_ERROR_CHECK(usb_host_device_info(device_obj->dev_hdl, &dev_info));
+    ESP_LOGI(TAG, "\t%s speed", (char *[]){"Low", "Full", "High"}[dev_info.speed]);
+    ESP_LOGI(TAG, "\tParent info:");
+    if (dev_info.parent.dev_hdl)
+    {
+        usb_device_info_t parent_dev_info;
+        ESP_ERROR_CHECK(usb_host_device_info(dev_info.parent.dev_hdl, &parent_dev_info));
+        ESP_LOGI(TAG, "\t\tBus addr: %d", parent_dev_info.dev_addr);
+        ESP_LOGI(TAG, "\t\tPort: %d", dev_info.parent.port_num);
+    }
+    else
+    {
+        ESP_LOGI(TAG, "\t\tPort: ROOT");
+    }
+    ESP_LOGI(TAG, "\tbConfigurationValue %d", dev_info.bConfigurationValue);
+    // Get the device descriptor next
+    device_obj->actions |= ACTION_GET_DEV_DESC;
+}
+
+static void action_get_dev_desc(usb_device_t *device_obj)
+{
+    assert(device_obj->dev_hdl != NULL);
+    ESP_LOGI(TAG, "Getting device descriptor");
+    const usb_device_desc_t *dev_desc;
+    ESP_ERROR_CHECK(usb_host_get_device_descriptor(device_obj->dev_hdl, &dev_desc));
+    usb_print_device_descriptor(dev_desc);
+    // Get the device's config descriptor next
+    device_obj->actions |= ACTION_GET_CONFIG_DESC;
+}
+
+static void action_get_config_desc(usb_device_t *device_obj)
+{
+    assert(device_obj->dev_hdl != NULL);
+    ESP_LOGI(TAG, "Getting config descriptor");
+    const usb_config_desc_t *config_desc;
+    ESP_ERROR_CHECK(usb_host_get_active_config_descriptor(device_obj->dev_hdl, &config_desc));
+    usb_print_config_descriptor(config_desc, NULL);
+    // Get the device's string descriptors next
+    device_obj->actions |= ACTION_GET_STR_DESC;
+}
+
+static void action_get_str_desc(usb_device_t *device_obj)
+{
+    assert(device_obj->dev_hdl != NULL);
+    usb_device_info_t dev_info;
+    ESP_ERROR_CHECK(usb_host_device_info(device_obj->dev_hdl, &dev_info));
+    if (dev_info.str_desc_manufacturer)
+    {
+        ESP_LOGI(TAG, "Getting Manufacturer string descriptor");
+        usb_print_string_descriptor(dev_info.str_desc_manufacturer);
+    }
+    if (dev_info.str_desc_product)
+    {
+        ESP_LOGI(TAG, "Getting Product string descriptor");
+        usb_print_string_descriptor(dev_info.str_desc_product);
+    }
+    if (dev_info.str_desc_serial_num)
+    {
+        ESP_LOGI(TAG, "Getting Serial Number string descriptor");
+        usb_print_string_descriptor(dev_info.str_desc_serial_num);
+    }
+}
+
+static void action_close_dev(usb_device_t *device_obj)
+{
+    ESP_ERROR_CHECK(usb_host_device_close(device_obj->client_hdl, device_obj->dev_hdl));
+    device_obj->dev_hdl = NULL;
+    device_obj->dev_addr = 0;
+}
+
+static void class_driver_device_handle(usb_device_t *device_obj)
+{
+    uint8_t actions = device_obj->actions;
+    device_obj->actions = 0;
+
+    while (actions)
+    {
+        if (actions & ACTION_OPEN_DEV)
+        {
+            action_open_dev(device_obj);
+        }
+        if (actions & ACTION_GET_DEV_INFO)
+        {
+            action_get_info(device_obj);
+        }
+        if (actions & ACTION_GET_DEV_DESC)
+        {
+            action_get_dev_desc(device_obj);
+        }
+        if (actions & ACTION_GET_CONFIG_DESC)
+        {
+            action_get_config_desc(device_obj);
+        }
+        if (actions & ACTION_GET_STR_DESC)
+        {
+            action_get_str_desc(device_obj);
+        }
+        if (actions & ACTION_CLOSE_DEV)
+        {
+            action_close_dev(device_obj);
+        }
+
+        actions = device_obj->actions;
+        device_obj->actions = 0;
+    }
+}
+
+void class_driver_task(void *arg)
+{
+    class_driver_t driver_obj = {0};
+    usb_host_client_handle_t class_driver_client_hdl = NULL;
+
+    ESP_LOGI(TAG, "Registering Client");
+
+    SemaphoreHandle_t mux_lock = xSemaphoreCreateMutex();
+    if (mux_lock == NULL)
+    {
+        ESP_LOGE(TAG, "Unable to create class driver mutex");
+        vTaskSuspend(NULL);
+        return;
+    }
+
+    usb_host_client_config_t client_config = {
+        .is_synchronous = false, // Synchronous clients currently not supported. Set this to false
+        .max_num_event_msg = CLIENT_NUM_EVENT_MSG,
+        .async = {
+            .client_event_callback = client_event_cb,
+            .callback_arg = (void *)&driver_obj,
+        },
+    };
+    ESP_ERROR_CHECK(usb_host_client_register(&client_config, &class_driver_client_hdl));
+
+    driver_obj.constant.mux_lock = mux_lock;
+    driver_obj.constant.client_hdl = class_driver_client_hdl;
+
+    for (uint8_t i = 0; i < DEV_MAX_COUNT; i++)
+    {
+        driver_obj.mux_protected.device[i].client_hdl = class_driver_client_hdl;
+    }
+
+    s_driver_obj = &driver_obj;
+
+    while (1)
+    {
+        // Driver has unhandled devices, handle all devices first
+        if (driver_obj.mux_protected.flags.unhandled_devices)
+        {
+            xSemaphoreTake(driver_obj.constant.mux_lock, portMAX_DELAY);
+            for (uint8_t i = 0; i < DEV_MAX_COUNT; i++)
+            {
+                if (driver_obj.mux_protected.device[i].actions)
+                {
+                    class_driver_device_handle(&driver_obj.mux_protected.device[i]);
+                }
+            }
+            driver_obj.mux_protected.flags.unhandled_devices = 0;
+            xSemaphoreGive(driver_obj.constant.mux_lock);
+        }
+        else
+        {
+            // Driver is active, handle client events
+            if (driver_obj.mux_protected.flags.shutdown == 0)
+            {
+                usb_host_client_handle_events(class_driver_client_hdl, portMAX_DELAY);
+            }
+            else
+            {
+                // Shutdown the driver
+                break;
+            }
+        }
+    }
+
+    ESP_LOGI(TAG, "Deregistering Class Client");
+    ESP_ERROR_CHECK(usb_host_client_deregister(class_driver_client_hdl));
+    if (mux_lock != NULL)
+    {
+        vSemaphoreDelete(mux_lock);
+    }
+    vTaskSuspend(NULL);
+}
+
+void class_driver_client_deregister(void)
+{
+    // Mark all opened devices
+    xSemaphoreTake(s_driver_obj->constant.mux_lock, portMAX_DELAY);
+    for (uint8_t i = 0; i < DEV_MAX_COUNT; i++)
+    {
+        if (s_driver_obj->mux_protected.device[i].dev_hdl != NULL)
+        {
+            // Mark device to close
+            s_driver_obj->mux_protected.device[i].actions |= ACTION_CLOSE_DEV;
+            // Set flag
+            s_driver_obj->mux_protected.flags.unhandled_devices = 1;
+        }
+    }
+    s_driver_obj->mux_protected.flags.shutdown = 1;
+    xSemaphoreGive(s_driver_obj->constant.mux_lock);
+
+    // Unblock, exit the loop and proceed to deregister client
+    ESP_ERROR_CHECK(usb_host_client_unblock(s_driver_obj->constant.client_hdl));
+}

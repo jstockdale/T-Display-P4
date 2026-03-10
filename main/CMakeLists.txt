@@ -64,7 +64,13 @@ elseif(CONFIG_EXAMPLE_BUILD_BQ25896)
 endif()
         
 idf_component_register(SRC_DIRS ${project_path} 
-                        INCLUDE_DIRS ${project_path})
+                        INCLUDE_DIRS ${project_path}
+                        )
+
+set_source_files_properties(tuner_r82xx.c "class_driver.c"
+    PROPERTIES COMPILE_FLAGS
+    "-Wno-unused-function -Wno-unused-variable -Wno-incompatible-pointer-types"
+)
 
 target_compile_options(
     ${COMPONENT_LIB}

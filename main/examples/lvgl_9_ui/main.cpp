@@ -12,6 +12,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
+#include "freertos/event_groups.h"
 #include "esp_timer.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_mipi_dsi.h"
@@ -19,6 +21,9 @@
 #include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_intr_alloc.h"
+#include "usb/usb_host.h"
+#include "driver/gpio.h"
 #include "lvgl.h"
 #include "t_display_p4_driver.h"
 #include "cpp_bus_driver_library.h"
@@ -43,13 +48,31 @@
 #if CONFIG_ENABLE_USB_DISPLAY == true
 #include "esp_lcd_usb_display.h"
 #else
-#include "tinyusb.h"
-#include "tusb_cdc_acm.h"
+//#include "tinyusb.h"
+//#include "tusb_cdc_acm.h"
 #endif
 #include "app_video.h"
 #include "driver/ppa.h"
 #include "esp_private/esp_cache_private.h"
 #include <fstream>
+
+#include "class_driver.h"
+
+#define CONFIG_APP_QUIT_PIN 0
+#define HOST_LIB_TASK_PRIORITY 2
+#define CLASS_TASK_PRIORITY 3
+#define APP_QUIT_PIN CONFIG_APP_QUIT_PIN
+
+#ifdef CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK
+#define ENABLE_ENUM_FILTER_CALLBACK
+#endif // CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK
+
+extern void class_driver_task(void *arg);
+extern void class_driver_client_deregister(void);
+
+//static const char *TAG = "USB host lib";
+
+QueueHandle_t app_event_queue = NULL;
 
 #define SD_FILE_PATH_MUSIC "/sdcard/t_display_p4_lvgl_9_ui_resource/music/Erik Satie-Gymnopedie 1-Chase Coleman (piano).wav"
 
@@ -433,14 +456,20 @@ auto ESP32P4 = std::make_unique<Cpp_Bus_Driver::Tool>();
 
 #if CONFIG_ENABLE_USB_DISPLAY == true
 #else
+// typedef struct
+// {
+//     uint8_t buf[CONFIG_TINYUSB_CDC_RX_BUFSIZE + PREPEND_LENGTH + 1]; // Data buffer
+//     size_t buf_len;                                                  // Number of bytes received
+//     uint8_t itf;                                                     // Index of CDC device interface
+// } app_message_t;
+
 typedef struct
 {
-    uint8_t buf[CONFIG_TINYUSB_CDC_RX_BUFSIZE + PREPEND_LENGTH + 1]; // Data buffer
-    size_t buf_len;                                                  // Number of bytes received
-    uint8_t itf;                                                     // Index of CDC device interface
+    size_t buf_len;
+    uint8_t itf;
 } app_message_t;
 
-uint8_t rx_buf[CONFIG_TINYUSB_CDC_RX_BUFSIZE + 1];
+// uint8_t rx_buf[CONFIG_TINYUSB_CDC_RX_BUFSIZE + 1];
 #endif
 
 // esp_err_t register_gpio_wakeup(void)
@@ -3832,8 +3861,8 @@ void Esp32c6_At_Init(void)
         printf("wifi_scan fail\n");
     }
 
-    std::string ssid = "xinyuandianzi";
-    std::string password = "AA15994823428";
+    std::string ssid = "Cabbage Tree";
+    std::string password = "MyNecessaryFence+42";
     if (ESP32C6_AT->set_wifi_connect(ssid, password) == true)
     {
         printf("set_wifi_connect success\nconnected to wifi ssid: [%s],password: [%s]\n", ssid.c_str(), password.c_str());
@@ -3922,87 +3951,87 @@ bool Usb_Screen_Init(esp_lcd_panel_handle_t *mipi_dpi_panel)
     return true;
 }
 #else
-void tinyusb_cdc_rx_callback(int itf, cdcacm_event_t *event)
-{
-    /* initialization */
-    size_t rx_size = 0;
+// void tinyusb_cdc_rx_callback(int itf, cdcacm_event_t *event)
+// {
+//     /* initialization */
+//     size_t rx_size = 0;
 
-    /* read */
-    esp_err_t ret = tinyusb_cdcacm_read(itf, rx_buf, CONFIG_TINYUSB_CDC_RX_BUFSIZE, &rx_size);
-    if (ret == ESP_OK)
-    {
-        app_message_t tx_msg = {
-            .buf_len = rx_size + PREPEND_LENGTH,
-            .itf = static_cast<uint8_t>(itf),
-        };
+//     /* read */
+//     esp_err_t ret = tinyusb_cdcacm_read(itf, rx_buf, CONFIG_TINYUSB_CDC_RX_BUFSIZE, &rx_size);
+//     if (ret == ESP_OK)
+//     {
+//         app_message_t tx_msg = {
+//             .buf_len = rx_size + PREPEND_LENGTH,
+//             .itf = static_cast<uint8_t>(itf),
+//         };
 
-        memcpy(tx_msg.buf, PREPEND_STRING, PREPEND_LENGTH);
-        memcpy(tx_msg.buf + PREPEND_LENGTH, rx_buf, rx_size);
-        xQueueSend(app_queue, &tx_msg, 0);
-    }
-    else
-    {
-        printf("tinyusb_cdc_rx_callback read error\n");
-    }
-}
+//         memcpy(tx_msg.buf, PREPEND_STRING, PREPEND_LENGTH);
+//         memcpy(tx_msg.buf + PREPEND_LENGTH, rx_buf, rx_size);
+//         xQueueSend(app_queue, &tx_msg, 0);
+//     }
+//     else
+//     {
+//         printf("tinyusb_cdc_rx_callback read error\n");
+//     }
+// }
 
-void tinyusb_cdc_line_state_changed_callback(int itf, cdcacm_event_t *event)
-{
-    int dtr = event->line_state_changed_data.dtr;
-    int rts = event->line_state_changed_data.rts;
+// void tinyusb_cdc_line_state_changed_callback(int itf, cdcacm_event_t *event)
+// {
+//     int dtr = event->line_state_changed_data.dtr;
+//     int rts = event->line_state_changed_data.rts;
 
-    printf("line state changed on channel %d: dtr:%d, rts:%d\n", itf, dtr, rts);
-}
+//     printf("line state changed on channel %d: dtr:%d, rts:%d\n", itf, dtr, rts);
+// }
 
-void Hardware_Usb_Cdc_Init(void)
-{
-    // Create FreeRTOS primitives
-    app_queue = xQueueCreate(5, sizeof(app_message_t));
-    assert(app_queue);
+// void Hardware_Usb_Cdc_Init(void)
+// {
+//     // Create FreeRTOS primitives
+//     app_queue = xQueueCreate(5, sizeof(app_message_t));
+//     assert(app_queue);
 
-    printf("USB initialization\n");
-    const tinyusb_config_t tusb_cfg = {
-        .device_descriptor = NULL,
-        .string_descriptor = NULL,
-        .external_phy = false,
-#if (TUD_OPT_HIGH_SPEED)
-        .fs_configuration_descriptor = NULL,
-        .hs_configuration_descriptor = NULL,
-        .qualifier_descriptor = NULL,
-#else
-        .configuration_descriptor = NULL,
-#endif // TUD_OPT_HIGH_SPEED
-    };
+//     printf("USB initialization\n");
+//     const tinyusb_config_t tusb_cfg = {
+//         .device_descriptor = NULL,
+//         .string_descriptor = NULL,
+//         .external_phy = false,
+// #if (TUD_OPT_HIGH_SPEED)
+//         .fs_configuration_descriptor = NULL,
+//         .hs_configuration_descriptor = NULL,
+//         .qualifier_descriptor = NULL,
+// #else
+//         .configuration_descriptor = NULL,
+// #endif // TUD_OPT_HIGH_SPEED
+//     };
 
-    ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
+//     ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
 
-    tinyusb_config_cdcacm_t acm_cfg = {
-        .usb_dev = TINYUSB_USBDEV_0,
-        .cdc_port = TINYUSB_CDC_ACM_0,
-        .rx_unread_buf_sz = 64,
-        .callback_rx = &tinyusb_cdc_rx_callback, // the first way to register a callback
-        .callback_rx_wanted_char = NULL,
-        .callback_line_state_changed = NULL,
-        .callback_line_coding_changed = NULL};
+//     tinyusb_config_cdcacm_t acm_cfg = {
+//         .usb_dev = TINYUSB_USBDEV_0,
+//         .cdc_port = TINYUSB_CDC_ACM_0,
+//         .rx_unread_buf_sz = 64,
+//         .callback_rx = &tinyusb_cdc_rx_callback, // the first way to register a callback
+//         .callback_rx_wanted_char = NULL,
+//         .callback_line_state_changed = NULL,
+//         .callback_line_coding_changed = NULL};
 
-    ESP_ERROR_CHECK(tusb_cdc_acm_init(&acm_cfg));
-    /* the second way to register a callback */
-    ESP_ERROR_CHECK(tinyusb_cdcacm_register_callback(
-        TINYUSB_CDC_ACM_0,
-        CDC_EVENT_LINE_STATE_CHANGED,
-        &tinyusb_cdc_line_state_changed_callback));
+//     ESP_ERROR_CHECK(tusb_cdc_acm_init(&acm_cfg));
+//     /* the second way to register a callback */
+//     ESP_ERROR_CHECK(tinyusb_cdcacm_register_callback(
+//         TINYUSB_CDC_ACM_0,
+//         CDC_EVENT_LINE_STATE_CHANGED,
+//         &tinyusb_cdc_line_state_changed_callback));
 
-#if (CONFIG_TINYUSB_CDC_COUNT > 1)
-    acm_cfg.cdc_port = TINYUSB_CDC_ACM_1;
-    ESP_ERROR_CHECK(tusb_cdc_acm_init(&acm_cfg));
-    ESP_ERROR_CHECK(tinyusb_cdcacm_register_callback(
-        TINYUSB_CDC_ACM_1,
-        CDC_EVENT_LINE_STATE_CHANGED,
-        &tinyusb_cdc_line_state_changed_callback));
-#endif
+// #if (CONFIG_TINYUSB_CDC_COUNT > 1)
+//     acm_cfg.cdc_port = TINYUSB_CDC_ACM_1;
+//     ESP_ERROR_CHECK(tusb_cdc_acm_init(&acm_cfg));
+//     ESP_ERROR_CHECK(tinyusb_cdcacm_register_callback(
+//         TINYUSB_CDC_ACM_1,
+//         CDC_EVENT_LINE_STATE_CHANGED,
+//         &tinyusb_cdc_line_state_changed_callback));
+// #endif
 
-    printf("USB initialization DONE\n");
-}
+//     printf("USB initialization DONE\n");
+// }
 
 void hardware_usb_cdc_task(void *arg)
 {
@@ -4018,19 +4047,19 @@ void hardware_usb_cdc_task(void *arg)
                 /* Print received data*/
                 printf("data from channel %d: ", msg.itf);
 
-                for (size_t i = 0; i < msg.buf_len; i++)
-                {
-                    printf("%c", msg.buf[i]);
-                }
-                printf("\n");
+                // for (size_t i = 0; i < msg.buf_len; i++)
+                // {
+                //     printf("%c", msg.buf[i]);
+                // }
+                // printf("\n");
 
                 /* write back */
-                tinyusb_cdcacm_write_queue(msg.itf, msg.buf, msg.buf_len);
-                esp_err_t err = tinyusb_cdcacm_write_flush(msg.itf, 0);
-                if (err != ESP_OK)
-                {
-                    printf("CDC ACM write flush error: %s\n", esp_err_to_name(err));
-                }
+                // tinyusb_cdcacm_write_queue(msg.itf, msg.buf, msg.buf_len);
+                // esp_err_t err = tinyusb_cdcacm_write_flush(msg.itf, 0);
+                // if (err != ESP_OK)
+                // {
+                //     printf("CDC ACM write flush error: %s\n", esp_err_to_name(err));
+                // }
             }
         }
 
@@ -4663,13 +4692,231 @@ void System_Startup_Message_Init(void)
     }
 }
 
+
+
+/**
+ * @brief APP event group
+ *
+ * APP_EVENT            - General event, which is APP_QUIT_PIN press event in this example.
+ */
+typedef enum
+{
+    APP_EVENT = 0,
+} app_event_group_t;
+
+/**
+ * @brief APP event queue
+ *
+ * This event is used for delivering events from callback to a task.
+ */
+typedef struct
+{
+    app_event_group_t event_group;
+} app_event_queue_t;
+
+/**
+ * @brief BOOT button pressed callback
+ *
+ * Signal application to exit the Host lib task
+ *
+ * @param[in] arg Unused
+ */
+static void gpio_cb(void *arg)
+{
+    const app_event_queue_t evt_queue = {
+        .event_group = APP_EVENT,
+    };
+
+    BaseType_t xTaskWoken = pdFALSE;
+
+    if (app_event_queue)
+    {
+        xQueueSendFromISR(app_event_queue, &evt_queue, &xTaskWoken);
+    }
+
+    if (xTaskWoken == pdTRUE)
+    {
+        portYIELD_FROM_ISR();
+    }
+}
+
+/**
+ * @brief Set configuration callback
+ *
+ * Set the USB device configuration during the enumeration process, must be enabled in the menuconfig
+
+ * @note bConfigurationValue starts at index 1
+ *
+ * @param[in] dev_desc device descriptor of the USB device currently being enumerated
+ * @param[out] bConfigurationValue configuration descriptor index, that will be user for enumeration
+ *
+ * @return bool
+ * - true:  USB device will be enumerated
+ * - false: USB device will not be enumerated
+ */
+#ifdef ENABLE_ENUM_FILTER_CALLBACK
+static bool set_config_cb(const usb_device_desc_t *dev_desc, uint8_t *bConfigurationValue)
+{
+    // If the USB device has more than one configuration, set the second configuration
+    if (dev_desc->bNumConfigurations > 1)
+    {
+        *bConfigurationValue = 2;
+    }
+    else
+    {
+        *bConfigurationValue = 1;
+    }
+
+    // Return true to enumerate the USB device
+    return true;
+}
+#endif // ENABLE_ENUM_FILTER_CALLBACK
+
+/**
+ * @brief Start USB Host install and handle common USB host library events while app pin not low
+ *
+ * @param[in] arg  Not used
+ */
+static void usb_host_lib_task(void *arg)
+{
+    ESP_LOGI(TAG, "Installing USB Host Library");
+    usb_host_config_t host_config = {
+        .skip_phy_setup = false,
+        .intr_flags = ESP_INTR_FLAG_LEVEL1,
+#ifdef ENABLE_ENUM_FILTER_CALLBACK
+        .enum_filter_cb = set_config_cb,
+#endif // ENABLE_ENUM_FILTER_CALLBACK
+        // .peripheral_map = BIT0,
+    };
+    ESP_ERROR_CHECK(usb_host_install(&host_config));
+    // ESP_LOGI(TAG, "USB Host installed with peripheral map 0x%x", host_config.peripheral_map);
+
+    // Signalize the app_main, the USB host library has been installed
+    xTaskNotifyGive(arg);
+
+    bool has_clients = true;
+    bool has_devices = false;
+    while (has_clients)
+    {
+        uint32_t event_flags;
+        ESP_ERROR_CHECK(usb_host_lib_handle_events(portMAX_DELAY, &event_flags));
+        if (event_flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS)
+        {
+            ESP_LOGI(TAG, "Get FLAGS_NO_CLIENTS");
+            if (ESP_OK == usb_host_device_free_all())
+            {
+                ESP_LOGI(TAG, "All devices marked as free, no need to wait FLAGS_ALL_FREE event");
+                has_clients = false;
+            }
+            else
+            {
+                ESP_LOGI(TAG, "Wait for the FLAGS_ALL_FREE");
+                has_devices = true;
+            }
+        }
+        if (has_devices && event_flags & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE)
+        {
+            ESP_LOGI(TAG, "Get FLAGS_ALL_FREE");
+            has_clients = false;
+        }
+    }
+    ESP_LOGI(TAG, "No more clients and devices, uninstall USB Host library");
+
+    // Uninstall the USB Host Library
+    ESP_ERROR_CHECK(usb_host_uninstall());
+    vTaskSuspend(NULL);
+}
+
+void rtlsdr_adsb_main(void)
+{
+    ESP_LOGI(TAG, "USB host library example");
+
+    // Init BOOT button: Pressing the button simulates app request to exit
+    // It will uninstall the class driver and USB Host Lib
+    const gpio_config_t input_pin = {
+        .pin_bit_mask = BIT64(APP_QUIT_PIN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .intr_type = GPIO_INTR_NEGEDGE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&input_pin));
+    ESP_ERROR_CHECK(gpio_install_isr_service(ESP_INTR_FLAG_LEVEL1));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(APP_QUIT_PIN, gpio_cb, NULL));
+
+    app_event_queue = xQueueCreate(10, sizeof(app_event_queue_t));
+    app_event_queue_t evt_queue;
+
+    TaskHandle_t host_lib_task_hdl, class_driver_task_hdl;
+
+    // Create usb host lib task
+    BaseType_t task_created;
+    task_created = xTaskCreatePinnedToCore(usb_host_lib_task,
+                                           "usb_host",
+                                           4096,
+                                           xTaskGetCurrentTaskHandle(),
+                                           HOST_LIB_TASK_PRIORITY,
+                                           &host_lib_task_hdl,
+                                           0);
+    assert(task_created == pdTRUE);
+
+    // Wait until the USB host library is installed
+    ulTaskNotifyTake(false, 1000);
+
+    // Create class driver task
+    task_created = xTaskCreatePinnedToCore(class_driver_task,
+                                           "class",
+                                           5 * 1024,
+                                           NULL,
+                                           CLASS_TASK_PRIORITY,
+                                           &class_driver_task_hdl,
+                                           0);
+    assert(task_created == pdTRUE);
+    // Add a short delay to let the tasks run
+    vTaskDelay(10);
+
+    while (1)
+    {
+        if (xQueueReceive(app_event_queue, &evt_queue, portMAX_DELAY))
+        {
+            if (APP_EVENT == evt_queue.event_group)
+            {
+                // User pressed button
+                usb_host_lib_info_t lib_info;
+                ESP_ERROR_CHECK(usb_host_lib_info(&lib_info));
+                if (lib_info.num_devices != 0)
+                {
+                    ESP_LOGW(TAG, "Shutdown with attached devices.");
+                }
+                // End while cycle
+                break;
+            }
+        }
+    }
+
+    // Deregister client
+    class_driver_client_deregister();
+    vTaskDelay(10);
+
+    // Delete the tasks
+    vTaskDelete(class_driver_task_hdl);
+    vTaskDelete(host_lib_task_hdl);
+
+    // Delete interrupt and queue
+    gpio_isr_handler_remove(APP_QUIT_PIN);
+    xQueueReset(app_event_queue);
+    vQueueDelete(app_event_queue);
+    ESP_LOGI(TAG, "End of the example");
+}
+
 extern "C" void app_main(void)
 {
-    printf("Ciallo\n");
+    printf("Hello world!\n");
+
+    esp_intr_dump(stdout);
 
 #if CONFIG_ENABLE_USB_DISPLAY == true
 #else
-    Hardware_Usb_Cdc_Init();
+    //Hardware_Usb_Cdc_Init();
 #endif
 
     XL9535->begin();
@@ -4765,6 +5012,13 @@ extern "C" void app_main(void)
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
+#if CONFIG_ENABLE_USB_DISPLAY == true
+    Usb_Screen_Init(&Screen_Mipi_Dpi_Panel);
+#else
+    esp_intr_dump(stdout);
+    Screen_Init(&Screen_Mipi_Dpi_Panel);
+#endif
+
     if (App_Video_Init() == false)
     {
         printf("App_Video_Init fail\n");
@@ -4787,13 +5041,13 @@ extern "C" void app_main(void)
     }
 #endif
 
-#if CONFIG_ENABLE_USB_DISPLAY == true
-    Usb_Screen_Init(&Screen_Mipi_Dpi_Panel);
-#else
-    Screen_Init(&Screen_Mipi_Dpi_Panel);
-#endif
+    esp_err_t assert = esp_lcd_panel_reset(Screen_Mipi_Dpi_Panel);
+    if (assert != ESP_OK)
+    {
+        printf("esp_lcd_panel_reset fail (error code: %#X)\n", assert);
+    }
 
-    esp_err_t assert = esp_lcd_panel_init(Screen_Mipi_Dpi_Panel);
+    assert = esp_lcd_panel_init(Screen_Mipi_Dpi_Panel);
     if (assert != ESP_OK)
     {
         printf("esp_lcd_panel_init fail (error code: %#X)\n", assert);
@@ -4840,6 +5094,8 @@ extern "C" void app_main(void)
     // {
     //     printf("Sdspi_Init fail\n");
     // }
+
+    rtlsdr_adsb_main();
 
     Lvgl_Init();
     Lvgl_Startup();
@@ -5167,7 +5423,7 @@ extern "C" void app_main(void)
 
 #if CONFIG_ENABLE_USB_DISPLAY == true
 #else
-    xTaskCreate(hardware_usb_cdc_task, "hardware_usb_cdc_task", 4 * 1024, NULL, 3, NULL);
+//    xTaskCreate(hardware_usb_cdc_task, "hardware_usb_cdc_task", 4 * 1024, NULL, 3, NULL);
 #endif
     xTaskCreate(device_vibration_task, "device_vibration_task", 4 * 1024, NULL, 2, &Vibration_Task_Handle);
     xTaskCreate(device_speaker_task, "device_speaker_task", 4 * 1024, NULL, 3, &Speaker_Task_Handle);
@@ -5234,3 +5490,4 @@ extern "C" void app_main(void)
     //         vTaskDelay(pdMS_TO_TICKS(10));
     //     }
 }
+
