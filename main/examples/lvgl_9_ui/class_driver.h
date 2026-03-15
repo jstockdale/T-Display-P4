@@ -11,6 +11,8 @@
 #include "usb/usb_host.h"
 #include "rtl-sdr.h"
 #include "mode-s.h"
+#include "lvgl.h"
+
 
 #define CLIENT_NUM_EVENT_MSG 5
 
@@ -96,6 +98,23 @@ extern void class_driver_task(void *arg);
 extern void class_driver_client_deregister(void);
 
 extern void alloc_adsb_transfer(void);
+
+extern void adsb_update_display(lv_obj_t *table);
+
+// Receiver position — updated by GPS task, read by ADS-B display/logging
+typedef struct {
+    double lat;         // decimal degrees, positive = N
+    double lon;         // decimal degrees, positive = E
+    double alt_m;       // altitude in meters (from GGA, 0 if unavailable)
+    int    fix_valid;   // nonzero when we have a valid fix
+    int    sats;        // satellite count from GGA
+    double hdop;        // horizontal dilution of precision
+    int    fix_quality; // GGA fix quality (0=none, 1=GPS, 2=DGPS)
+} receiver_pos_t;
+
+extern void adsb_set_receiver_pos(double lat, double lon, double alt_m,
+                                  int sats, double hdop, int fix_quality);
+extern receiver_pos_t adsb_get_receiver_pos(void);
 
 #ifdef __cplusplus
 }

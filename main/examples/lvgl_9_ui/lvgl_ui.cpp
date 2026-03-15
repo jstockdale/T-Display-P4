@@ -96,8 +96,9 @@ namespace Lvgl_Ui
             {"firmware build date:\n     ", "202601211405"},
     };
 
-    void System::begin()
+    void System::begin(bool has_sd)
     {
+        _has_sd = has_sd;
 #if defined SCREEN_ROTATION_DIRECTION_0
         _app_style.icon.edge_distance.height = std::min(_width, _height) / 5;
         _app_style.icon.edge_distance.width = _app_style.icon.edge_distance.height / 5;
@@ -417,17 +418,17 @@ namespace Lvgl_Ui
 
 #if defined SCREEN_ROTATION_DIRECTION_0
 #if defined CONFIG_SCREEN_TYPE_HI8561
-        lv_obj_set_style_bg_image_src(_registry.win.home.root, GET_WALLPAPER_PATH("wallpaper_1_540x1168px.png"), (lv_style_selector_t)LV_PART_MAIN);
+        if (_has_sd) lv_obj_set_style_bg_image_src(_registry.win.home.root, GET_WALLPAPER_PATH("wallpaper_1_540x1168px.png"), (lv_style_selector_t)LV_PART_MAIN);
 #elif defined CONFIG_SCREEN_TYPE_RM69A10
-        lv_obj_set_style_bg_image_src(_registry.win.home.root, GET_WALLPAPER_PATH("wallpaper_1_568x1232px.png"), (lv_style_selector_t)LV_PART_MAIN);
+        if (_has_sd) lv_obj_set_style_bg_image_src(_registry.win.home.root, GET_WALLPAPER_PATH("wallpaper_1_568x1232px.png"), (lv_style_selector_t)LV_PART_MAIN);
 #else
 #error "unknown macro definition, please select the correct macro definition."
 #endif
 #elif defined SCREEN_ROTATION_DIRECTION_90
 #if defined CONFIG_SCREEN_TYPE_HI8561
-        lv_obj_set_style_bg_image_src(_registry.win.home.root, GET_WALLPAPER_PATH("wallpaper_1_1168x540px.png"), (lv_style_selector_t)LV_PART_MAIN);
+        if (_has_sd) lv_obj_set_style_bg_image_src(_registry.win.home.root, GET_WALLPAPER_PATH("wallpaper_1_1168x540px.png"), (lv_style_selector_t)LV_PART_MAIN);
 #elif defined CONFIG_SCREEN_TYPE_RM69A10
-        lv_obj_set_style_bg_image_src(_registry.win.home.root, GET_WALLPAPER_PATH("wallpaper_1_1232x568px.png"), (lv_style_selector_t)LV_PART_MAIN);
+        if (_has_sd) lv_obj_set_style_bg_image_src(_registry.win.home.root, GET_WALLPAPER_PATH("wallpaper_1_1232x568px.png"), (lv_style_selector_t)LV_PART_MAIN);
 #else
 #error "unknown macro definition, please select the correct macro definition."
 #endif

@@ -4,6 +4,7 @@
 #include <string.h>
 
 #define RTLSDR_BUF_LEN (16384 + 512)
+#define CTRL_TRANSFER_MAX_SIZE 1024  // largest control transfer for RTL-SDR
 
 class_adsb_dev *adsbdev;
 void init_adsb_dev()
@@ -15,6 +16,19 @@ void init_adsb_dev()
     }
     adsbdev->is_adsb = true;
     adsbdev->transfer = NULL;  // explicitly NULL so alloc_adsb_transfer runs
+
+    // Pre-allocate control transfer buffer once — eliminates the rapid
+    // alloc/free cycle during R820T tuner init that fragments internal
+    // heap and corrupts TLSF metadata.
+    esp_err_t r = usb_host_transfer_alloc(CTRL_TRANSFER_MAX_SIZE, 0, &adsbdev->ctrl_transfer);
+    if (r != ESP_OK) {
+        ESP_LOGE(TAG_ADSB, "ctrl_transfer pre-alloc failed: %d", r);
+        adsbdev->ctrl_transfer = NULL;
+    }
+    adsbdev->response_buf = calloc(CTRL_TRANSFER_MAX_SIZE, sizeof(uint8_t));
+    if (adsbdev->response_buf == NULL) {
+        ESP_LOGE(TAG_ADSB, "response_buf pre-alloc failed");
+    }
 }
 
 void alloc_adsb_transfer(void) {
@@ -111,14 +125,21 @@ int esp_libusb_bulk_transfer(class_driver_t *driver_obj, unsigned char endpoint,
 
 int esp_libusb_control_transfer(class_driver_t *driver_obj, uint8_t bm_req_type, uint8_t b_request, uint16_t wValue, uint16_t wIndex, unsigned char *data, uint16_t wLength, unsigned int timeout)
 {
-    if (adsbdev->ctrl_transfer != NULL) {
-        usb_host_transfer_free(adsbdev->ctrl_transfer);
-        adsbdev->ctrl_transfer = NULL;
-    }
-    free(adsbdev->response_buf);
-
     size_t sizePacket = sizeof(usb_setup_packet_t) + wLength;
-    usb_host_transfer_alloc(sizePacket, 0, &adsbdev->ctrl_transfer);
+
+    // Sanity check — control transfer must fit in pre-allocated buffer
+    if (sizePacket > CTRL_TRANSFER_MAX_SIZE) {
+        ESP_LOGE(TAG_ADSB, "control transfer too large: %u > %d", (unsigned)sizePacket, CTRL_TRANSFER_MAX_SIZE);
+        return -1;
+    }
+    if (adsbdev->ctrl_transfer == NULL || adsbdev->response_buf == NULL) {
+        ESP_LOGE(TAG_ADSB, "control transfer buffers not allocated");
+        return -1;
+    }
+
+    // Reuse pre-allocated ctrl_transfer and response_buf — no alloc/free churn
+    memset(adsbdev->response_buf, 0, sizePacket);
+
     USB_SETUP_PACKET_INIT_CONTROL((usb_setup_packet_t *)adsbdev->ctrl_transfer->data_buffer, bm_req_type, b_request, wValue, wIndex, wLength);
     adsbdev->ctrl_transfer->num_bytes = sizePacket;
     adsbdev->ctrl_transfer->device_handle = driver_obj->dev_hdl;
@@ -126,7 +147,6 @@ int esp_libusb_control_transfer(class_driver_t *driver_obj, uint8_t bm_req_type,
     adsbdev->ctrl_transfer->context = (void *)&driver_obj;
     adsbdev->ctrl_transfer->callback = transfer_read_cb;
     adsbdev->is_done = false;
-    adsbdev->response_buf = calloc(sizePacket, sizeof(uint8_t));
 
     if (bm_req_type == CTRL_OUT)
     {

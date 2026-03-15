@@ -31,7 +31,7 @@ typedef struct
     bool is_success;
     int bytes_transferred;
     usb_transfer_t *transfer;      // bulk transfer - allocated once, never freed
-    usb_transfer_t *ctrl_transfer; // control transfer - allocated/freed per call
+    usb_transfer_t *ctrl_transfer; // control transfer - pre-allocated once in init_adsb_dev
 } class_adsb_dev;
 
 static const char *TAG_ADSB = "ADSB";

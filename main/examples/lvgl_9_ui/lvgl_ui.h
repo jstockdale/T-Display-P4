@@ -75,6 +75,7 @@ namespace Lvgl_Ui
     public:
         uint32_t _width;
         uint32_t _height;
+        bool _has_sd = true;
 
         enum class Current_Win
         {
@@ -621,7 +622,7 @@ namespace Lvgl_Ui
         {
         }
 
-        void begin();
+        void begin(bool has_sd = true);
 
         Current_Win get_current_win(void);
 
