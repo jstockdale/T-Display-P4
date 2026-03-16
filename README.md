@@ -23,7 +23,6 @@ This project turns a LILYGO T-Display-P4 development board into a standalone ADS
 - **GPS time sync** — L76K GNSS sets the system clock with 650ms serial delay compensation, syncs the PCF8563 RTC
 - **Serial output** — clean formatted messages with N/S E/W position indicators, raw hex for each message
 - **ADS-B Scope** — WebSerial-based live map viewer ([adsb-scope.offx1.com](https://adsb-scope.offx1.com))
-- **dump1090 bridge** — Python script feeds standard dump1090/dump1090-fa via AVR format over TCP
 
 ### Known limitations
 
