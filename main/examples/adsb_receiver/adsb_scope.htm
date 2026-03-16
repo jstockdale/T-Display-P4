@@ -52,14 +52,17 @@
   #legend .lrange{display:flex;justify-content:space-between;font-size:9px}
   #gnss-info{position:absolute;top:66px;left:12px;z-index:999;background:rgba(17,24,32,0.9);border:1px solid var(--panel-border);border-radius:6px;padding:8px 12px;font-size:11px;color:var(--text-dim);line-height:1.6}
   #gnss-info .fix{color:var(--accent);font-weight:600}#gnss-info .nofix{color:var(--warning);font-weight:600}
-  #detail-panel{display:none;position:absolute;top:66px;right:12px;z-index:1000;background:rgba(17,24,32,0.95);border:1px solid var(--panel-border);border-radius:6px;padding:12px 16px;font-size:12px;color:var(--text);line-height:1.7;min-width:220px}
-  #detail-panel.visible{display:block}
-  #detail-panel .dh{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;border-bottom:1px solid var(--panel-border);padding-bottom:6px}
+  #sd-info{color:var(--text-dim);font-size:10px;margin-top:4px;padding-top:4px;border-top:1px solid var(--panel-border)}
+  #sd-info .sd-ok{color:var(--accent)}#sd-info .sd-err{color:var(--warning)}#sd-info .sd-wait{color:var(--text-dim)}
+  #detail-wrap{position:absolute;top:66px;right:12px;bottom:40vh;z-index:1000;overflow-y:auto;overflow-x:hidden;display:none;flex-direction:column;gap:8px;width:240px;padding-bottom:8px}
+  #detail-wrap.visible{display:flex}
+  .det-card{background:rgba(17,24,32,0.95);border:1px solid var(--panel-border);border-radius:6px;padding:10px 14px;font-size:12px;color:var(--text);line-height:1.7;flex-shrink:0}
+  .det-card .dh{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;border-bottom:1px solid var(--panel-border);padding-bottom:4px}
   .dh .dcs{font-weight:700;font-size:16px;color:var(--accent)}.dh .dicao{color:var(--blue);font-size:11px}
   .dh .dx{background:none;border:none;color:var(--text-dim);font-size:16px;cursor:pointer;padding:0 4px}.dh .dx:hover{color:var(--text)}
   .dr{display:flex;justify-content:space-between;gap:16px}.dl{color:var(--text-dim);font-size:10px;text-transform:uppercase;letter-spacing:0.5px}
   .dv{font-weight:600}.dv.up{color:var(--accent)}.dv.dn{color:var(--warning)}
-  #log-panel{display:none;position:absolute;top:122px;left:12px;z-index:1001;width:min(640px,calc(100vw - 24px));height:min(350px,calc(100vh - 220px));background:rgba(10,14,20,0.96);border:1px solid var(--panel-border);border-radius:6px;overflow:hidden;flex-direction:column;resize:both}
+  #log-panel{display:none;position:absolute;top:160px;left:12px;z-index:1001;width:min(640px,calc(100vw - 24px));height:min(400px,calc(100vh - 220px));background:rgba(10,14,20,0.96);border:1px solid var(--panel-border);border-radius:6px;overflow:hidden;flex-direction:column;resize:both}
   #log-panel.visible{display:flex}
   #log-header{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid var(--panel-border);font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:0.5px;flex-shrink:0}
   #log-header button{background:none;border:none;color:var(--text-dim);font-size:14px;cursor:pointer;padding:2px 6px}#log-header button:hover{color:var(--text)}
@@ -94,23 +97,16 @@
   <button class="topbtn" id="log-btn" onclick="toggleLog()">Log</button>
   <button id="connect-btn" onclick="toggleSerial()">Connect Serial</button>
 </div>
-<div id="gnss-info">RX: <span id="gnss-status" class="nofix">No fix</span><br><span id="gnss-detail"></span></div>
-<div id="detail-panel">
-  <div class="dh"><div><span class="dcs" id="d-cs">---</span> <span class="dicao" id="d-ic"></span></div><button class="dx" onclick="desel()">✕</button></div>
-  <div class="dr"><span class="dl">Altitude</span><span class="dv" id="d-alt">---</span></div>
-  <div class="dr"><span class="dl">Speed</span><span class="dv" id="d-spd">---</span></div>
-  <div class="dr"><span class="dl">Heading</span><span class="dv" id="d-hdg">---</span></div>
-  <div class="dr"><span class="dl">V/S</span><span class="dv" id="d-vr">---</span></div>
-  <div class="dr"><span class="dl">Position</span><span class="dv" id="d-pos">---</span></div>
-  <div class="dr"><span class="dl">Range</span><span class="dv" id="d-dst">---</span></div>
-  <div class="dr"><span class="dl">Bearing</span><span class="dv" id="d-brg">---</span></div>
+<div id="gnss-info">RX: <span id="gnss-status" class="nofix">No fix</span><br><span id="gnss-detail"></span>
+<div id="sd-info">SD: <span id="sd-status" class="sd-wait">waiting</span></div>
 </div>
+<div id="detail-wrap"></div>
 <div id="log-panel">
   <div id="log-header"><span>Serial Log</span><div style="display:flex;gap:4px"><button onclick="clearLog()">⌫</button><button onclick="toggleLog()">✕</button></div></div>
   <div id="log-controls">
-    <label><input type="checkbox" id="f-a" checked> ADS-B</label>
-    <label><input type="checkbox" id="f-g" checked> GNSS</label>
-    <label><input type="checkbox" id="f-o" checked> Other</label>
+    <label><input type="checkbox" id="f-a" checked onchange="refilterLog()"> ADS-B</label>
+    <label><input type="checkbox" id="f-g" checked onchange="refilterLog()"> GNSS</label>
+    <label><input type="checkbox" id="f-o" checked onchange="refilterLog()"> Other</label>
     <label><input type="checkbox" id="f-s" checked> Live</label>
   </div>
   <div id="log-output"></div>
@@ -133,8 +129,8 @@
   </div>
 </div>
 <script>
-const A=new Map();let rxP=null,map,rxM,rxR=[],rxRL=[],port,reader,conn=false,totM=0,mTs=[],logN=0,selIcao=null,cMode='mono',lMode='alt';
-const EXP=120000,TMAX=60,LMAX=1000;
+const A=new Map();let rxP=null,map,rxM,rxR=[],rxRL=[],port,reader,conn=false,totM=0,mTs=[],logN=0,selSet=new Set(),cMode='mono',lMode='alt';
+const EXP=180000,TMAX=60,LMAX=1000;
 
 // --- Color ---
 function acCol(ic,ac){
@@ -146,7 +142,7 @@ function acCol(ic,ac){
 }
 // Z-index: selected=10000, others sorted by color mode key
 function acZ(ic,ac){
-  if(ic===selIcao)return 10000;
+  if(selSet.has(ic))return 10000;
   if(cMode==='alt')return Math.min(Math.max(ac.alt||0,0),45000)/5;  // 0-9000
   if(cMode==='speed')return Math.min(Math.max(ac.speed||0,0),500)*10;  // 0-5000
   if(cMode==='rainbow'){let h=0;for(let i=0;i<ic.length;i++)h=(h*31+ic.charCodeAt(i))&0xFFFF;return h%1000}
@@ -189,30 +185,63 @@ function initMap(){
 }
 
 // --- Aircraft ---
-function mkIcon(h,c,sel){
-  const s=sel?24:18;
-  const g=sel?`filter:drop-shadow(0 0 8px ${c})drop-shadow(0 0 3px #fff);`:`filter:drop-shadow(0 0 4px ${c}55);`;
-  return L.divIcon({html:`<div style="display:flex;align-items:center;justify-content:center;width:${s}px;height:${s}px;font-size:${s}px;color:${c};${g}"><div style="transform:rotate(${(h||0)-90}deg);line-height:1">✈</div></div>`,iconSize:[s,s],iconAnchor:[s/2,s/2],className:''});
+function acStale(ac){
+  const age=Date.now()-ac.ls;
+  if(age<30000)return{opacity:1,gray:false};      // fresh
+  if(age<60000)return{opacity:0.5,gray:false};     // dimming
+  return{opacity:0.35,gray:true};                   // stale/gray
 }
-function mkLbl(ic,ac,c){
-  const sel=ic===selIcao?'sel':'';
+function mkIcon(h,c,sel,st){
+  const s=sel?24:18;
+  const col=st?.gray?'#667':c;
+  const op=st?st.opacity:1;
+  const g=sel?`filter:drop-shadow(0 0 8px ${col})drop-shadow(0 0 3px #fff);`:`filter:drop-shadow(0 0 4px ${col}55);`;
+  if(h==null){
+    // No heading data — show a dot instead of a misleading arrow
+    return L.divIcon({html:`<div style="display:flex;align-items:center;justify-content:center;width:${s}px;height:${s}px;font-size:${Math.round(s*0.5)}px;color:${col};opacity:${op};${g}">●</div>`,iconSize:[s,s],iconAnchor:[s/2,s/2],className:''});
+  }
+  return L.divIcon({html:`<div style="display:flex;align-items:center;justify-content:center;width:${s}px;height:${s}px;font-size:${s}px;color:${col};opacity:${op};${g}"><div style="transform:rotate(${h-90}deg);line-height:1">✈</div></div>`,iconSize:[s,s],iconAnchor:[s/2,s/2],className:''});
+}
+function mkLbl(ic,ac,c,st){
+  const sel=selSet.has(ic)?'sel':'';
+  const col=st?.gray?'#667':c;
+  const op=st?st.opacity:1;
   const info=lMode==='dist'?(ac.dist!=null?ac.dist.toFixed(1)+'nm':''):(ac.alt?ac.alt+'ft':'');
   const name=ac.cs||ic;
-  return L.divIcon({html:`<div class="ac-label ${sel}" style="color:${c}" onclick="sel0('${ic}')">${name}${info?' '+info:''}</div>`,iconSize:[0,0],iconAnchor:[-14,6],className:''});
+  return L.divIcon({html:`<div class="ac-label ${sel}" style="color:${col};opacity:${op}" onclick="sel0('${ic}',event)">${name}${info?' '+info:''}</div>`,iconSize:[0,0],iconAnchor:[-14,6],className:''});
 }
+// Compute heading from last two trail points when ADS-B heading is unavailable
+function trailHdg(ac){
+  if(!ac.tr)return null;
+  const pts=ac.tr.getLatLngs();
+  if(pts.length<2)return null;
+  const a=pts[pts.length-2],b=pts[pts.length-1];
+  const dLon=(b.lng-a.lng)*Math.PI/180;
+  const lat1=a.lat*Math.PI/180,lat2=b.lat*Math.PI/180;
+  const y=Math.sin(dLon)*Math.cos(lat2);
+  const x=Math.cos(lat1)*Math.sin(lat2)-Math.sin(lat1)*Math.cos(lat2)*Math.cos(dLon);
+  const brg=(Math.atan2(y,x)*180/Math.PI+360)%360;
+  return Math.round(brg);
+}
+
 function updAc(ic,ac){
   if(!ac.hasPos)return;
-  const c=acCol(ic,ac),sel=ic===selIcao,tw=sel?2.5:1.5,to=sel?1:0.6;
+  const st=acStale(ac);
+  const c=acCol(ic,ac),sel=selSet.has(ic),tw=sel?2.5:1.5;
+  const to=sel?Math.max(st.opacity,0.8):(st.gray?0.2:st.opacity*0.6);
+  const trailCol=st.gray?'#556':c;
+  // Use ADS-B heading if available, otherwise compute from trail
+  const hdg=ac.hdg!=null?ac.hdg:trailHdg(ac);
   if(!ac.mk){
-    ac.mk=L.marker([ac.lat,ac.lon],{icon:mkIcon(ac.hdg,c,sel)}).addTo(map);
-    ac.tr=L.polyline([],{color:c,weight:tw,opacity:to}).addTo(map);
-    ac.lb=L.marker([ac.lat,ac.lon],{icon:mkLbl(ic,ac,c),interactive:true}).addTo(map);
-    ac.lb.on('click',()=>sel0(ic));
-    ac.mk.on('click',()=>sel0(ic));
+    ac.mk=L.marker([ac.lat,ac.lon],{icon:mkIcon(hdg,c,sel,st)}).addTo(map);
+    ac.tr=L.polyline([],{color:trailCol,weight:tw,opacity:to}).addTo(map);
+    ac.lb=L.marker([ac.lat,ac.lon],{icon:mkLbl(ic,ac,c,st),interactive:true}).addTo(map);
+    ac.lb.on('click',(e)=>sel0(ic,e.originalEvent));
+    ac.mk.on('click',(e)=>sel0(ic,e.originalEvent));
   }else{
-    ac.mk.setLatLng([ac.lat,ac.lon]).setIcon(mkIcon(ac.hdg,c,sel));
-    ac.lb.setLatLng([ac.lat,ac.lon]).setIcon(mkLbl(ic,ac,c));
-    ac.tr.setStyle({color:c,weight:tw,opacity:to});
+    ac.mk.setLatLng([ac.lat,ac.lon]).setIcon(mkIcon(hdg,c,sel,st));
+    ac.lb.setLatLng([ac.lat,ac.lon]).setIcon(mkLbl(ic,ac,c,st));
+    ac.tr.setStyle({color:trailCol,weight:tw,opacity:to});
   }
   // Z-order: selected on top, others sorted by color mode key
   const z=acZ(ic,ac);
@@ -224,21 +253,40 @@ function updAc(ic,ac){
 function rmAc(ac){if(ac.mk)map.removeLayer(ac.mk);if(ac.lb)map.removeLayer(ac.lb);if(ac.tr)map.removeLayer(ac.tr)}
 
 // --- Selection ---
-function sel0(ic){selIcao=ic;for(const[i,a]of A)updAc(i,a);updDet();document.getElementById('detail-panel').classList.add('visible')}
-function desel(){selIcao=null;document.getElementById('detail-panel').classList.remove('visible');for(const[i,a]of A)updAc(i,a)}
+function sel0(ic,ev){
+  const multi=ev&&(ev.metaKey||ev.shiftKey||ev.ctrlKey);
+  if(multi){
+    if(selSet.has(ic))selSet.delete(ic);else selSet.add(ic);
+  }else{
+    selSet.clear();selSet.add(ic);
+  }
+  for(const[i,a]of A)updAc(i,a);
+  updDet();
+}
+function deselOne(ic){selSet.delete(ic);for(const[i,a]of A)updAc(i,a);updDet()}
+function desel(){selSet.clear();updDet();for(const[i,a]of A)updAc(i,a)}
 function updDet(){
-  if(!selIcao)return;const ac=A.get(selIcao);if(!ac){desel();return}
-  document.getElementById('d-cs').textContent=ac.cs||'---';
-  document.getElementById('d-ic').textContent=selIcao;
-  document.getElementById('d-alt').textContent=ac.alt!=null?ac.alt.toLocaleString()+' ft':'---';
-  document.getElementById('d-spd').textContent=ac.speed?ac.speed+' kt':'---';
-  document.getElementById('d-hdg').textContent=ac.hdg!=null?ac.hdg+'°':'---';
-  const vr=document.getElementById('d-vr');
-  vr.textContent=ac.vr?(ac.vr>0?'+':'')+ac.vr+' fpm':'---';
-  vr.className='dv'+(ac.vr>0?' up':ac.vr<0?' dn':'');
-  document.getElementById('d-pos').textContent=ac.hasPos?`${Math.abs(ac.lat).toFixed(4)}°${ac.lat>=0?'N':'S'} ${Math.abs(ac.lon).toFixed(4)}°${ac.lon>=0?'E':'W'}`:'---';
-  document.getElementById('d-dst').textContent=ac.dist!=null?ac.dist.toFixed(1)+' nm':'---';
-  document.getElementById('d-brg').textContent=ac.brg!=null?ac.brg+'°':'---';
+  const wrap=document.getElementById('detail-wrap');
+  wrap.classList.toggle('visible',selSet.size>0);
+  if(!selSet.size){wrap.innerHTML='';return}
+  wrap.innerHTML=[...selSet].map(ic=>{
+    const ac=A.get(ic);
+    if(!ac){selSet.delete(ic);return''}
+    const c=acCol(ic,ac);
+    const vrText=ac.vr?(ac.vr>0?'+':'')+ac.vr+' fpm':'---';
+    const vrCls=ac.vr>0?'up':ac.vr<0?'dn':'';
+    const pos=ac.hasPos?`${Math.abs(ac.lat).toFixed(4)}°${ac.lat>=0?'N':'S'} ${Math.abs(ac.lon).toFixed(4)}°${ac.lon>=0?'E':'W'}`:'---';
+    return`<div class="det-card">
+      <div class="dh"><div><span class="dcs" style="color:${c}">${ac.cs||'---'}</span> <span class="dicao">${ic}</span></div><button class="dx" onclick="deselOne('${ic}')">✕</button></div>
+      <div class="dr"><span class="dl">Altitude</span><span class="dv">${ac.alt!=null?ac.alt.toLocaleString()+' ft':'---'}</span></div>
+      <div class="dr"><span class="dl">Speed</span><span class="dv">${ac.speed?ac.speed+' kt':'---'}</span></div>
+      <div class="dr"><span class="dl">Heading</span><span class="dv">${ac.hdg!=null?ac.hdg+'°':'---'}</span></div>
+      <div class="dr"><span class="dl">V/S</span><span class="dv ${vrCls}">${vrText}</span></div>
+      <div class="dr"><span class="dl">Position</span><span class="dv">${pos}</span></div>
+      <div class="dr"><span class="dl">Range</span><span class="dv">${ac.dist!=null?ac.dist.toFixed(1)+' nm':'---'}</span></div>
+      <div class="dr"><span class="dl">Bearing</span><span class="dv">${ac.brg!=null?ac.brg+'°':'---'}</span></div>
+    </div>`;
+  }).join('');
 }
 
 // --- Parse ---
@@ -248,6 +296,28 @@ const AR=/\s(-?\d+)ft/,SR=/\s(\d+)kt\s+(\d+)°/,VR=/\s([+-]\d+)fpm/;
 const PR=/\((\d+\.\d+)([NS]),(\d+\.\d+)([EW])\)/,DR=/(\d+\.\d+)nm@(\d+)°/;
 
 function parse(l){
+  // SD card status — check failures first (some contain substrings of success patterns)
+  if(/Failed to reopen/.test(l)){
+    // Had a log, lost it (e.g. card removed mid-write)
+    const fn=l.match(/(\/\S+\.csv)/);
+    updSD('lost',fn?fn[1]:null);
+  }else if(/Failed.*open SD log/.test(l)){
+    // Never opened — card not mounted or filesystem issue
+    updSD('no-card',null);
+  }else if(/failed to mount filesystem|sdmmc_card_init failed|Sdmmc_Init fail/.test(l)){
+    updSD('no-card',null);
+  }else if(/SD mount attempt (\d+) failed/.test(l)){
+    const m=l.match(/attempt (\d+)/);
+    updSD('retrying',m?m[1]:null);
+  }else if(/SD log renamed:/.test(l)){
+    const fn=l.match(/→ (\/\S+)/);
+    updSD(true,fn?fn[1]:null);
+  }else if(/SD log: \//.test(l)){
+    const fn=l.match(/SD log: (\/\S+)/);
+    updSD(true,fn?fn[1]:null);
+  }else if(/filesystem mounted/.test(l)){
+    updSD('mounted',null);
+  }
   const gm=GR.exec(l);
   if(gm){const la=parseFloat(gm[2]),lo=parseFloat(gm[3]);if(gm[1]==='A'&&la&&lo){rxP={lat:la,lon:lo,sats:parseInt(gm[4]),hdop:parseFloat(gm[5]),fix:true};updRx();if(!map._p){map.setView([la,lo],11);map._p=true}}updGnss();return}
   const mm=MR.exec(l);if(!mm)return;
@@ -269,7 +339,7 @@ function parse(l){
     }
   }
   if(m=DR.exec(l)){ac.dist=parseFloat(m[1]);ac.brg=parseInt(m[2])}
-  updAc(ic,ac);if(ic===selIcao)updDet();
+  updAc(ic,ac);if(selSet.has(ic))updDet();
   const n=Date.now();mTs.push(n);while(mTs.length&&mTs[0]<n-5000)mTs.shift();
 }
 
@@ -305,27 +375,67 @@ function updGnss(){
   else{s.textContent='No fix';s.className='nofix';d.textContent='Acquiring...'}
 }
 
+function updSD(ok,path){
+  const el=document.getElementById('sd-status');
+  if(ok===true){
+    const short=path?path.replace('/sdcard/',''):'logging';
+    el.textContent='● '+short;el.className='sd-ok';
+  }else if(ok==='mounted'){
+    el.textContent='mounted, waiting for log';el.className='sd-wait';
+  }else if(ok==='retrying'){
+    el.textContent='✕ mount retry #'+path;el.className='sd-err';
+  }else if(ok==='no-card'){
+    el.textContent='✕ no card / mount failed';el.className='sd-err';
+  }else if(ok==='lost'){
+    const short=path?path.replace('/sdcard/',''):'log lost';
+    el.textContent='✕ '+short+' (lost)';el.className='sd-err';
+  }else{
+    el.textContent='✕ write failed';el.className='sd-err';
+  }
+}
+
 // --- Log ---
 let logPaused=[];  // buffer lines while paused
+function logType(l){
+  if(/^\[scope\]/.test(l))return 'scope';
+  if(/\[GNSS\]/.test(l))return 'gnss';
+  if(/\[[\dA-Fa-f]{14,28}\]/.test(l))return 'adsb';
+  if(/error|fail/i.test(l))return 'error';
+  return 'other';
+}
+const logCls={adsb:'log-adsb',gnss:'log-gnss',scope:'log-scope',error:'log-error',other:'log-info'};
+
 function addLog(l){
-  const autoScroll=document.getElementById('f-s').checked;
-  // When paused, buffer lines but don't touch the DOM so user can inspect/copy
-  if(!autoScroll){logPaused.push(l);if(logPaused.length>LMAX)logPaused.shift();return}
+  const live=document.getElementById('f-s').checked;
+  if(!live){logPaused.push(l);if(logPaused.length>LMAX)logPaused.shift();return}
   const el=document.getElementById('log-output');
-  // Flush any buffered lines first
   if(logPaused.length){for(const pl of logPaused)appendLogLine(el,pl);logPaused=[];}
   appendLogLine(el,l);
   el.scrollTop=el.scrollHeight;
 }
 function appendLogLine(el,l){
-  let c='log-info',isA=false,isG=false,isS=false;
-  if(/^\[scope\]/.test(l)){c='log-scope';isS=true}else if(/\[GNSS\]/.test(l)){c='log-gnss';isG=true}
-  else if(/\[[\dA-Fa-f]{14,28}\]/.test(l)){c='log-adsb';isA=true}else if(/error|fail/i.test(l))c='log-error';
-  if(isA&&!document.getElementById('f-a').checked)return;
-  if(isG&&!document.getElementById('f-g').checked)return;
-  if(!isA&&!isG&&!isS&&!document.getElementById('f-o').checked)return;
-  const d=document.createElement('div');d.className=c;d.textContent=l;el.appendChild(d);logN++;
+  const t=logType(l);
+  const d=document.createElement('div');
+  d.className=logCls[t]||'log-info';
+  d.dataset.lt=t;
+  d.textContent=l;
+  d.style.display=isTypeVisible(t)?'':'none';
+  el.appendChild(d);logN++;
   while(logN>LMAX&&el.firstChild){el.removeChild(el.firstChild);logN--}
+}
+function isTypeVisible(t){
+  if(t==='adsb')return document.getElementById('f-a').checked;
+  if(t==='gnss')return document.getElementById('f-g').checked;
+  if(t==='scope')return true;
+  if(t==='error')return true;
+  return document.getElementById('f-o').checked;
+}
+function refilterLog(){
+  const lines=document.getElementById('log-output').children;
+  for(let i=0;i<lines.length;i++){
+    const t=lines[i].dataset.lt;
+    lines[i].style.display=isTypeVisible(t)?'':'none';
+  }
 }
 function clearLog(){document.getElementById('log-output').innerHTML='';logN=0;logPaused=[]}
 function toggleLog(){document.getElementById('log-panel').classList.toggle('visible');document.getElementById('log-btn').classList.toggle('active')}
@@ -333,16 +443,21 @@ function toggleLog(){document.getElementById('log-panel').classList.toggle('visi
 // --- Tick ---
 function tick(){
   const n=Date.now();
-  for(const[ic,ac]of A){if(n-ac.ls>EXP){if(ic===selIcao)desel();rmAc(ac);A.delete(ic)}}
+  for(const[ic,ac]of A){if(n-ac.ls>EXP&&!selSet.has(ic)){rmAc(ac);A.delete(ic)}}
+  // Refresh map visuals for staleness transitions
+  for(const[ic,ac]of A)updAc(ic,ac);
   document.getElementById('ac-count').textContent=A.size;
   document.getElementById('msg-count').textContent=totM.toLocaleString();
   document.getElementById('msg-rate').textContent=(mTs.length/5).toFixed(1);
-  if(selIcao)updDet();
+  if(selSet.size)updDet();
   const tb=document.getElementById('ac-tbody');
   const so=[...A.entries()].sort((a,b)=>(a[1].dist||999)-(b[1].dist||999));
   tb.innerHTML=so.map(([ic,ac])=>{
-    const age=Math.round((n-ac.ls)/1000),vc=ac.vr>0?'climbing':ac.vr<0?'descending':'',sel=ic===selIcao?' selected':'',c=acCol(ic,ac);
-    return`<tr class="${sel}" onclick="sel0('${ic}')"><td class="col-icao" style="color:${c}">${ic}</td><td class="col-cs">${ac.cs||'---'}</td><td class="col-alt">${ac.alt!=null?ac.alt.toLocaleString():'---'}</td><td>${ac.speed||'---'}</td><td>${ac.hdg!=null?ac.hdg+'°':'---'}</td><td class="col-vr ${vc}">${ac.vr?(ac.vr>0?'+':'')+ac.vr:'---'}</td><td class="col-dist">${ac.dist!=null?ac.dist.toFixed(1)+'nm':'---'}</td><td class="col-dist">${ac.brg!=null?ac.brg+'°':'---'}</td><td class="col-dist">${age}s</td></tr>`;
+    const age=Math.round((n-ac.ls)/1000),vc=ac.vr>0?'climbing':ac.vr<0?'descending':'',sel=selSet.has(ic)?' selected':'',c=acCol(ic,ac);
+    const st=acStale(ac);
+    const rowOp=st.gray?'opacity:0.35':st.opacity<1?'opacity:0.5':'';
+    const icCol=st.gray?'#667':c;
+    return`<tr class="${sel}" style="${rowOp}" onclick="sel0('${ic}',event)"><td class="col-icao" style="color:${icCol}">${ic}</td><td class="col-cs">${ac.cs||'---'}</td><td class="col-alt">${ac.alt!=null?ac.alt.toLocaleString():'---'}</td><td>${ac.speed||'---'}</td><td>${ac.hdg!=null?ac.hdg+'°':'---'}</td><td class="col-vr ${vc}">${ac.vr?(ac.vr>0?'+':'')+ac.vr:'---'}</td><td class="col-dist">${ac.dist!=null?ac.dist.toFixed(1)+'nm':'---'}</td><td class="col-dist">${ac.brg!=null?ac.brg+'°':'---'}</td><td class="col-dist">${age}s</td></tr>`;
   }).join('');
 }
 function togglePanel(){const p=document.getElementById('panel');if(p.classList.contains('collapsed')){p.classList.remove('collapsed');p.style.height=panelH+'px'}else{p.classList.add('collapsed')}}

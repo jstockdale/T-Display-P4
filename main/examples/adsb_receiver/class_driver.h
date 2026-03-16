@@ -100,6 +100,7 @@ extern void class_driver_client_deregister(void);
 extern void alloc_adsb_transfer(void);
 
 extern void adsb_update_display(lv_obj_t *table);
+extern void sd_log_rename_with_time(void);
 
 // Receiver position — updated by GPS task, read by ADS-B display/logging
 typedef struct {

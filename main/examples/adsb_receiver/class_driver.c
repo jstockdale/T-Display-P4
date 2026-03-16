@@ -254,6 +254,7 @@ static void haversine(double lat1, double lon1, double lat2, double lon2,
 // ============================================================
 
 static FILE *sd_log = NULL;
+static char sd_log_filename[64] = {0};  // current log path for rename
 
 static void sd_log_open(void) {
     time_t now;
@@ -261,31 +262,69 @@ static void sd_log_open(void) {
     time(&now);
     gmtime_r(&now, &timeinfo);
 
-    char filename[64];
-
     // Sanity check: if time is before 2024-01-01 the RTC hasn't been set
     if (now < 1704067200LL) {
-        snprintf(filename, sizeof(filename),
+        snprintf(sd_log_filename, sizeof(sd_log_filename),
             "/sdcard/adsb_boot%llu.csv",
             (unsigned long long)(esp_timer_get_time() / 1000));
     } else {
-        strftime(filename, sizeof(filename),
+        strftime(sd_log_filename, sizeof(sd_log_filename),
             "/sdcard/adsb_%Y-%m-%dT%H%M%SZ.csv", &timeinfo);
     }
 
-    sd_log = fopen(filename, "w");
+    sd_log = fopen(sd_log_filename, "w");
     if (sd_log) {
         fprintf(sd_log, "timestamp_utc,raw_msg,icao,callsign,altitude_ft,speed_kt,"
                         "heading_deg,vrate_fpm,lat,lon,squawk,"
-                        "rx_lat,rx_lon,range_km,bearing_deg\n");
+                        "rx_lat,rx_lon,range_km,bearing_deg,"
+                        "rx_sats,rx_hdop\n");
         fflush(sd_log);
         fsync(fileno(sd_log));
     }
 
     if (sd_log) {
-        ESP_LOGI(TAG, "SD log: %s", filename);
+        ESP_LOGI(TAG, "SD log: %s", sd_log_filename);
     } else {
-        ESP_LOGW(TAG, "Failed to open SD log: %s", filename);
+        ESP_LOGW(TAG, "Failed to open SD log: %s", sd_log_filename);
+    }
+}
+
+// Rename the current log file from boot-numbered to UTC-timestamped.
+// Called once from the GPS task when the system clock is first set.
+void sd_log_rename_with_time(void) {
+    if (!sd_log) return;
+
+    // Only rename if current name is a boot-numbered file
+    if (strstr(sd_log_filename, "adsb_boot") == NULL) return;
+
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    gmtime_r(&now, &timeinfo);
+
+    // Don't rename if clock still isn't set
+    if (now < 1704067200LL) return;
+
+    char new_filename[64];
+    strftime(new_filename, sizeof(new_filename),
+        "/sdcard/adsb_%Y-%m-%dT%H%M%SZ.csv", &timeinfo);
+
+    // Close, rename, reopen in append mode
+    fflush(sd_log);
+    fsync(fileno(sd_log));
+    fclose(sd_log);
+    sd_log = NULL;
+
+    if (rename(sd_log_filename, new_filename) == 0) {
+        ESP_LOGI(TAG, "SD log renamed: %s → %s", sd_log_filename, new_filename);
+        strncpy(sd_log_filename, new_filename, sizeof(sd_log_filename));
+    } else {
+        ESP_LOGW(TAG, "SD log rename failed, reopening original");
+    }
+
+    sd_log = fopen(sd_log_filename, "a");
+    if (!sd_log) {
+        ESP_LOGE(TAG, "Failed to reopen SD log: %s", sd_log_filename);
     }
 }
 

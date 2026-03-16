@@ -24,7 +24,6 @@
 #include "esp_log.h"
 #include "esp_intr_alloc.h"
 #include "usb/usb_host.h"
-#include "hal/usb_serial_jtag_ll.h"
 #include "driver/gpio.h"
 #include "lvgl.h"
 #include "t_display_p4_driver.h"
@@ -1044,6 +1043,13 @@ void device_gps_task(void *arg)
                                     drift_s, utc_year, utc_mon, utc_day,
                                     utc_hour, utc_min, utc_sec,
                                     GPS_SERIAL_DELAY_US / 1000);
+
+                                // Rename boot-numbered SD log to UTC timestamp
+                                static bool log_renamed = false;
+                                if (!log_renamed) {
+                                    sd_log_rename_with_time();
+                                    log_renamed = true;
+                                }
                             }
 
                             // --- Set PCF8563 RTC at first fix, then every 60s ---
@@ -3108,11 +3114,6 @@ void rtlsdr_adsb_start(void)
 
 extern "C" void app_main(void)
 {
-    // Disable USB-JTAG bridge so DTR/RTS toggles from serial tools
-    // (WebSerial, screen, idf.py monitor) don't trigger a chip reset.
-    // Note: after this, flashing requires manual BOOT+RESET to enter download mode.
-    usb_serial_jtag_ll_phy_set_jtag_bridge(false);
-
     printf("Hello world!\n");
     printf("[MEM] boot start: internal=%u PSRAM=%u\n",
            heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
