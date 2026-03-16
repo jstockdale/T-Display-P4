@@ -1,13 +1,190 @@
 <!--
- * @Description: None
- * @Author: LILYGO_L
+ * @Description: ADS-B Receiver on LILYGO T-Display-P4
+ * @Author: John Stockdale / Off by One (fork of LILYGO_L original)
  * @Date: 2025-06-13 15:12:02
- * @LastEditTime: 2026-02-25 11:35:15
+ * @LastEditTime: 2026-03-16
  * @License: GPL 3.0
 -->
-<h1 align = "center">T-Display-P4</h1>
+<h1 align="center">ADS-B Receiver — T-Display-P4</h1>
 
-## **English | [中文](./README_CN.md)**
+<p align="center">
+  A portable 1090 MHz ADS-B receiver built on the LILYGO T-Display-P4, using an RTL-SDR USB dongle for RF reception and the ESP32-P4's dual RISC-V cores for real-time Mode-S decoding.
+</p>
+
+## Overview
+
+This project turns a LILYGO T-Display-P4 development board into a standalone ADS-B receiver. An RTL-SDR dongle connected via USB Host receives 1090 MHz transponder signals, which are decoded in real-time on the ESP32-P4. Decoded aircraft are logged to SD card with full positional data and can be viewed live on a map via the companion web app, ADS-B Scope.
+
+### What works today
+
+- **Real-time ADS-B reception** — 15–30 messages/second, 12–30+ simultaneous aircraft tracked
+- **~30 nm range** from Oakland, CA with a 7" telescopic antenna on RTL-SDR
+- **SD card CSV logging** — UTC timestamps, raw Mode-S hex, decoded fields (ICAO, callsign, altitude, speed, heading, vertical rate, position, squawk), receiver GPS metadata (sats, HDOP)
+- **GPS time sync** — L76K GNSS sets the system clock with 650ms serial delay compensation, syncs the PCF8563 RTC
+- **Serial output** — clean formatted messages with N/S E/W position indicators, raw hex for each message
+- **ADS-B Scope** — WebSerial-based live map viewer ([adsb-scope.offx1.com](https://adsb-scope.offx1.com))
+- **dump1090 bridge** — Python script feeds standard dump1090/dump1090-fa via AVR format over TCP
+
+### Known limitations
+
+- **Screen is black** — LVGL initializes successfully but display output is not rendering; under investigation
+- **WiFi disabled** — ESP-Hosted SDIO DMA corrupts internal RAM heap metadata (Espressif Issue #17889); WiFi/NTP unavailable until resolved or AT firmware is deployed on the C6
+- **LVGL display updates disabled** — `adsb_update_display()` is a no-op to work around USB DMA heap corruption; aircraft data is only on serial + SD card + ADS-B Scope
+- **WebSerial triggers device reboot** — USB-JTAG auto-reset circuit fires on DTR toggle during port open; investigation in progress
+
+## ADS-B Scope
+
+A self-contained HTML file that connects to the receiver over WebSerial and plots aircraft on a live map.
+
+**Live version:** [adsb-scope.offx1.com](https://adsb-scope.offx1.com)
+
+Features:
+- Dark radar-scope aesthetic with Leaflet/CartoDB dark tiles
+- Aircraft icons with correct heading rotation and position trails
+- Range rings at 10, 25, and 50 nm
+- GNSS receiver status display
+- Aircraft detail panel on selection (click icon or label)
+- Sortable aircraft table with drag-resizable panel
+- Color modes: MONO (terminal green), RAINBOW (by ICAO hash), ALT (altitude heatmap), SPD (speed heatmap)
+- Serial log panel with ADS-B/GNSS/Other filters and pause-to-inspect
+- DTR/RTS deasserted on connect to minimize resets
+
+Requirements: Chrome or Edge (WebSerial API). Connect via USB, click "Connect Serial", select the ESP32-P4 port.
+
+## dump1090 Bridge
+
+`serial_to_dump1090.py` reads serial output, extracts raw Mode-S hex from `[brackets]`, and feeds dump1090 in AVR format (`*HEX;\n`) over TCP port 30001.
+
+```bash
+# Terminal 1
+dump1090-fa --net-only --net-ri-port 30001
+
+# Terminal 2
+pip install pyserial
+python3 serial_to_dump1090.py /dev/tty.usbmodem* -v
+```
+
+Then open `http://localhost:8080` for dump1090's built-in map UI. DTR/RTS are disabled on connect to prevent device reboot.
+
+## CSV Log Format
+
+Logged to `/sdcard/adsb_YYYY-MM-DDTHHMMSSZ.csv` (or `adsb_bootNNNN.csv` before GPS fix):
+
+```
+timestamp_utc,raw_msg,icao,callsign,altitude_ft,speed_kt,heading_deg,vrate_fpm,lat,lon,squawk,rx_lat,rx_lon,range_km,bearing_deg,rx_sats,rx_hdop
+2026-03-16T04:13:35.123Z,8DA105E8582594BADAC53333EE95,A105E8,SKW5567,6425,285,109,-128,37.72680,-122.44730,0000,37.83328,-122.27379,11.0,233,5,2.7
+```
+
+Timestamps are ISO-8601 UTC with millisecond resolution. Raw Mode-S hex is the second column for easy replay. Every row includes receiver GPS sats/HDOP for data quality assessment.
+
+## Hardware
+
+### Board: LILYGO T-Display-P4 V1.0
+
+| Component | Detail |
+|---|---|
+| **SoC** | ESP32-P4, 360 MHz dual RISC-V, 32 MB PSRAM, 16 MB flash |
+| **Coprocessor** | ESP32-C6-MINI-1U (WiFi 6 / BLE 5 via SDIO) |
+| **Display** | HI8561 4.05" MIPI touchscreen, 540×1168, 326 PPI |
+| **GPS** | Quectel L76K (UART, 9600→115200 baud auto-detect) |
+| **RTC** | PCF8563 (I²C, stores UTC+8 for LilyGo UI convention) |
+| **LoRa** | SX1262 via SPI (HPD16A module) |
+| **Audio** | ES8311 DAC + NS4150B amplifier + electret mic |
+| **IMU** | ICM20948 9-axis (I²C) |
+| **Battery** | BQ27220 gauge + LGS4056H charger |
+| **Camera** | OV2710 MIPI-CSI |
+| **IO Expander** | XL9535 (I²C) |
+| **Storage** | SD card (SDMMC, 4-bit) |
+
+### External: RTL-SDR USB Dongle
+
+Connected via the ESP32-P4's USB 2.0 Host port. The firmware implements a custom USB host driver that initializes the RTL2832U + R820T tuner, tunes to 1090 MHz at 2 MS/s, and reads IQ samples via USB bulk transfers.
+
+## Architecture
+
+```
+RTL-SDR (1090 MHz, 2 MS/s IQ)
+    │ USB bulk transfer
+    ▼
+ESP32-P4 USB Host Driver (class_driver.c)
+    │ magnitude → Mode-S demodulator (mode-s.c)
+    ▼
+Aircraft Table (64 slots, 60s expiry)
+    │
+    ├──→ Serial output (printf, formatted + raw hex)
+    ├──→ SD card CSV log (fsync every write)
+    └──→ LVGL table (disabled — heap corruption workaround)
+
+L76K GPS (UART, 1 Hz NMEA)
+    │
+    ├──→ Receiver position → range/bearing calculation
+    ├──→ System clock (settimeofday + 650ms serial delay compensation)
+    └──→ PCF8563 RTC (UTC+8, every 60s)
+```
+
+## Memory Budget
+
+| Stage | Internal RAM Free |
+|---|---|
+| Boot | 271 KB |
+| After SD mount | 226 KB |
+| After USB host install | 226 KB |
+| Before LVGL | 217 KB |
+| After UI + all tasks | ~131 KB |
+| PSRAM free | ~20 MB |
+
+## Building
+
+### Prerequisites
+
+- ESP-IDF v5.4.1
+- Visual Studio Code + ESP-IDF extension (recommended)
+
+### Build & Flash
+
+```bash
+git clone --recursive https://github.com/Xinyuan-LilyGO/T-Display-P4.git
+cd T-Display-P4
+
+# Select the lvgl_9_ui example in SDK Configuration Editor
+idf.py set-target esp32p4
+idf.py build
+idf.py flash
+```
+
+If auto-reset doesn't work (USB-JTAG bridge disabled in firmware), hold BOOT + tap RESET, then flash.
+
+### Configuration Notes
+
+- `CONFIG_HEAP_POISONING_LIGHT=y` — enabled for heap corruption debugging
+- ESP-Hosted and esp_wifi_remote are commented out in `idf_component.yml`
+- `CPP_BUS_DRIVER_LOG_LEVEL_DEBUG` is commented out in `config.h` to suppress raw NMEA dumps
+
+## Pending Work
+
+1. **Fix USB DMA heap corruption** — root cause of LVGL crash; USB bulk transfers corrupt internal RAM heap metadata
+2. **Re-enable LVGL aircraft display** — blocked by #1
+3. **Fix screen** — display hardware initializes but screen is black; may be wallpaper/draw buffer issue
+4. **Restore WiFi** — either fix ESP-Hosted SDIO DMA or flash C6 with AT firmware
+5. **Investigate WebSerial reset** — DTR→reset path may be in ROM code, not disableable from app_main
+
+## Credits
+
+- **Hardware & base firmware:** [LILYGO](https://github.com/Xinyuan-LilyGO/T-Display-P4)
+- **Mode-S decoder:** Based on [dump1090](https://github.com/antirez/dump1090) by Salvatore Sanfilippo
+- **ADS-B Scope:** [adsb-scope.offx1.com](https://adsb-scope.offx1.com) — Off by One
+- **RTL-SDR driver:** Custom ESP32-P4 USB host implementation based on librtlsdr
+
+## License
+
+GPL 3.0 (inherited from LILYGO base project)
+
+---
+
+## Original LilyGo Documentation
+
+<details>
+<summary>Click to expand original T-Display-P4 hardware documentation</summary>
 
 ## VersionIteration:
 | Version                               | Update date                       |Update description|
@@ -20,47 +197,6 @@
 | Product                     | SOC           |  FLASH  |  PSRAM   | Link                   |
 | :------------------------: | :-----------: |:-------: | :---------: | :------------------: |
 | T-Display-P4_V1.0   | NULL |   NULL   | NULL |  [NULL]()   |
-
-## Directory
-- [Describe](#describe)
-- [Preview](#preview)
-- [Module](#module)
-- [SoftwareDeployment](#SoftwareDeployment)
-- [PinOverview](#pinoverview)
-- [RelatedTests](#RelatedTests)
-- [FAQ](#faq)
-- [Project](#project)
-
-## Describe
-
-The T-Display-P4 is a versatile development board based on the ESP32-P4 core. Its features include:  
-
-1. **High Processing Power**: Equipped with the high-performance ESP32-P4 core processor, it can handle more complex graphics and video tasks, delivering smoother display performance.  
-2. **Low Power Design**: Offers multiple selectable power modes to effectively reduce energy consumption and extend battery life.  
-3. **High-Resolution Display**: Supports high resolution (default with a large MIPI interface screen at 540x1168px), providing sharp and clear visuals.  
-4. **Rich Peripheral Support**: Onboard peripherals include an HD MIPI touchscreen, ESP32-C6 module, speaker, microphone, LoRa module, GPS module, Ethernet, a linear vibration motor, an independent battery gauge for monitoring battery health and percentage, and an MIPI camera. Multiple GPIOs of both the ESP32-P4 and ESP32-C6 are exposed, enhancing the device's expandability.  
-
-## Preview
-### Beta version test images
-
-<p align="center" width="100%">
-    <img src="image/4.jpg" alt="">
-</p>
-
----
-
-<p align="center" width="100%">
-    <img src="image/5.jpg" alt="">
-</p>
-
----
-
-<p align="center" width="100%">
-    <img src="image/6.jpg" alt="">
-</p>
-
-
-### Actual Product Image
 
 ## Module
 
@@ -106,34 +242,6 @@ The T-Display-P4 is a versatile development board based on the ESP32-P4 core. It
 > * Related Documents:  
 >    >[HI8561](./information/HI8561_Preliminary%20_DS_V0.00_20230511.pdf)  
 
-> #### Model: H0410S001AMT001-V0
-> * Display Size (Diagonal): 4.1 inch  
-> * LCD Type: α-Si AMOLED
-> * Resolution: 568(H) × 1232(V) px  
-> * Active Area: 43.55(H) × 94.47(V) mm  
-> * Module Dimensions: 45.6(H) × 97.22(V) × 0.7(T) mm  
-> * Display Colors: 16.7M  
-> * Display Interface: MIPI  
-> * Touch Interface: IIC
-> * Display Driver IC: RM69A10
-> * Touch Driver IC: GT9895
-> * Maximum touch points: 10-point touch
-> * Luminance on surface: 500 cd/m²
-> * View Direction: All
-> * Contrast ratio: 20000:1
-> * Color gamut: 100%
-> * PPI: 190
-> * Window effect: No all-black  
-> * Cover plate surface effect: No AF/AG
-> * Operating Temperature: -20～70  ºC
-> * Storage Temperature: -30～80 ºC
-> * Related Documents:  
->    >[RM69A10](./information/RM69A10_DataSheet_V0.2_20230330 (Public version).pdf)  
->    >[GT9895](./information/GT9895_Datasheet_V1.1.pdf)
-
-* Dependent Libraries:  
-    >[cpp_bus_driver](https://github.com/Llgok/cpp_bus_driver)  
-
 ### 4. Speaker & Microphone  
 
 * DAC Chip: ES8311  
@@ -143,19 +251,8 @@ The T-Display-P4 is a versatile development board based on the ESP32-P4 core. It
 * Related Documents:  
     >[ES8311](./information/ES8311.pdf)  
     >[NS4150B](./information/NS4150B.pdf)
-* Dependent Libraries:  
-    >[cpp_bus_driver](https://github.com/Llgok/cpp_bus_driver)  
 
-### 5. Vibration  
-
-* Driver IC: AW86224AFCR  
-* Communication Protocol: IIC
-* Related Documents:  
-    >[AW86224](./information/AW86224AFCR.pdf)  
-* Dependent Libraries:  
-    >[cpp_bus_driver](https://github.com/Llgok/cpp_bus_driver)  
-
-### 6. LoRa  
+### 5. LoRa  
 
 * Module: HPD16A  
 * Chip: SX1262, SKY13453-385LF
@@ -166,7 +263,7 @@ The T-Display-P4 is a versatile development board based on the ESP32-P4 core. It
 * Dependent Libraries:  
     >[cpp_bus_driver](https://github.com/Llgok/cpp_bus_driver)  
 
-### 7. GPS  
+### 6. GPS  
 
 * Module: L76K  
 * Communication Protocol: Uart
@@ -175,7 +272,7 @@ The T-Display-P4 is a versatile development board based on the ESP32-P4 core. It
 * Dependent Libraries:  
     >[cpp_bus_driver](https://github.com/Llgok/cpp_bus_driver)  
 
-### 8. RTC  
+### 7. RTC  
 
 * Chip: PCF8563  
 * Communication Protocol: IIC
@@ -184,14 +281,7 @@ The T-Display-P4 is a versatile development board based on the ESP32-P4 core. It
 * Dependent Libraries:  
     >[cpp_bus_driver](https://github.com/Llgok/cpp_bus_driver)  
 
-### 9. Charging IC  
-
-* Chip: LGS4056H  
-* Additional Notes: The NTC pin of the 3-wire battery is connected to the LGS4056H charging IC. Over-temperature protection during charging is automatically controlled by the chip.  
-* Related Documents:  
-    >[LGS4056H](./information/LGS4056H.pdf)  
-
-### 10. Battery Gauge  
+### 8. Battery Gauge  
 
 * Chip: BQ27220  
 * Communication Protocol: IIC
@@ -200,103 +290,28 @@ The T-Display-P4 is a versatile development board based on the ESP32-P4 core. It
 * Dependent Libraries:  
     >[cpp_bus_driver](https://github.com/Llgok/cpp_bus_driver)  
 
-### 11. Camera  
+### 9. Camera  
 
-> #### Model: OV2710  
-> * Interface: MIPI  
-> * Related Documents:  
->    >[OV2710](./information/OV2710_CSP3_DS_2.0_KING%20HORN%20ENTERPRISES%20Ltd..pdf)  
+* Model: OV2710  
+* Interface: MIPI  
+* Related Documents:  
+    >[OV2710](./information/OV2710_CSP3_DS_2.0_KING%20HORN%20ENTERPRISES%20Ltd..pdf)  
 
-### 12. IMU
+### 10. IMU
 
 * Chip: ICM20948
 * Communication Protocol: IIC
 * Related Documents:  
     >[ICM20948](./information/ICM20948.pdf)
-* Dependent Libraries:  
-    >[arduino_cpp_bus_driver](https://github.com/Llgok/arduino_cpp_bus_driver)  
-    >[cpp_bus_driver](https://github.com/Llgok/cpp_bus_driver)  
-    >[ICM20948_WE](https://github.com/Llgok/ICM20948_WE)
 
-### 13. IO Expansion
+### 11. IO Expansion
 
 * Chip: XL9535
 * Communication Protocol: IIC
 * Related Materials:
     > [XL9535](./information/XL95x5.pdf)
-* Dependent Libraries:
-    > [cpp_bus_driver](https://github.com/Llgok/cpp_bus_driver)
 
-### T-Display-P4-Keyboard Section
-### 1. Keyboard Driver
-
-* Chip: TCA8418
-* Communication Protocol: IIC
-* Related Materials:
-    > [TCA8418](./information/tca8418.pdf)
-* Dependent Libraries:
-    > [cpp_bus_driver](https://github.com/Llgok/cpp_bus_driver)
-
-### 2. Keyboard Backlight Driver
-
-* Chip: SY7200A
-* Communication Protocol: PWM
-* Related Materials:
-    > [SY7200A](./information/SY7200AABC.pdf)
-
-### 3. IO Expansion
-
-* Chip: XL9555
-* Communication Protocol: IIC
-* Related Materials:
-    > [XL9555](./information/XL95x5.pdf)
-* Dependent Libraries:
-    > [cpp_bus_driver](https://github.com/Llgok/cpp_bus_driver)
-
-### 4. CC1101
-
-* Module: T-MixRF
-* Chip: CC1101
-* Communication Protocol: Standard SPI
-* Other Notes: The T-MixRF module on the T-Display-P4-Keyboard board will not use the LR1121 chip
-* Related Materials:
-    > [CC1101](./information/cc1101.pdf)
-* Dependent Libraries:
-    > [cpp_bus_driver](https://github.com/Llgok/cpp_bus_driver)  
-    > [RadioLib](https://github.com/jgromes/RadioLib)
-
-### 5. NRF24L01
-
-* Module: T-MixRF
-* Chip: NRF24L01
-* Communication Protocol: Standard SPI
-* Other Notes: The T-MixRF module on the T-Display-P4-Keyboard board will not use the LR1121 chip
-* Related Materials:
-    > [NRF24L01](./information/NRF24L01P-R.pdf)
-* Dependent Libraries:
-    > [cpp_bus_driver](https://github.com/Llgok/cpp_bus_driver)  
-    > [RadioLib](https://github.com/jgromes/RadioLib)
-
-### 6. NFC
-
-* Module: T-MixRF
-* Chip: ST25R3916
-* Communication Protocol: Standard SPI
-* Other Notes: The T-MixRF module on the T-Display-P4-Keyboard board will not use the LR1121 chip
-* Related Materials:
-    > [ST25R3916](./information/st25r3916.pdf)
-* Dependent Libraries:
-    > [arduino_cpp_bus_driver](https://github.com/Llgok/arduino_cpp_bus_driver)  
-    > [cpp_bus_driver](https://github.com/Llgok/cpp_bus_driver)  
-    > [ST25R3916](https://github.com/stm32duino/ST25R3916)  
-    > [NFC-RFAL](https://github.com/stm32duino/NFC-RFAL)
-
-### 7. Charging IC
-
-* Chip: BQ25896
-* Communication Protocol: IIC
-* Related Materials:
-    > [BQ25896](./information/bq25896.pdf)
+</details>
 
 ## SoftwareDeployment
 
@@ -317,7 +332,7 @@ The T-Display-P4 is a versatile development board based on the ESP32-P4 core. It
 | [icm20948](./main/examples/icm20948) |  <p align="center">![alt text][supported] | | |
 | [iic_scan](./main/examples/iic_scan) |  <p align="center">![alt text][supported] | | |
 | [l76k](./main/examples/l76k) |  <p align="center">![alt text][supported] | | |
-| [lvgl_9_ui](./main/examples/lvgl_9_ui) |  <p align="center">![alt text][supported] |factory example | |
+| [lvgl_9_ui](./main/examples/lvgl_9_ui) |  <p align="center">![alt text][supported] |factory example / ADS-B receiver | |
 | [pcf8563](./main/examples/pcf8563) |  <p align="center">![alt text][supported] | | |
 | [radiolib_sx1262_send_receive](./main/examples/radiolib_sx1262_send_receive) |  <p align="center">![alt text][supported] | | |
 | [screen_camera](./main/examples/screen_camera) |  <p align="center">![alt text][supported] | | |
@@ -331,65 +346,13 @@ The T-Display-P4 is a versatile development board based on the ESP32-P4 core. It
 | [xl9535](./main/examples/Vibration_Motor) |  <p align="center">![alt text][supported] | | |
 | [xiaozhi](https://github.com/78/xiaozhi-esp32) |  <p align="center">![alt text][supported] | | |
 
-#### T-Display-P4-Keyboard Examples
-| example | `[vscode][esp-idf-v5.4.0]` | description | picture |
-| ------  | ------ | ------ | ------ | 
-| [radiolib_cc1101_send_receive](./main/keyboard_examples/radiolib_cc1101_send_receive) |  <p align="center">![alt text][supported] | | |
-| [radiolib_nrf24l01_send_receive](./main/keyboard_examples/radiolib_nrf24l01_send_receive) |  <p align="center">![alt text][supported] | | |
-| [screen_tca8418_lvgl_touch_draw](./main/keyboard_examples/screen_tca8418_lvgl_touch_draw) |  <p align="center">![alt text][supported] | | |
-| [st25r3916](./main/keyboard_examples/st25r3916) |  <p align="center">![alt text][supported] | | |
-| [tca8418](./main/keyboard_examples/tca8418) |  <p align="center">![alt text][supported] | | |
-| [xl9555](./main/keyboard_examples/xl9555) |  <p align="center">![alt text][supported] | | |
-| [bq25896](./main/keyboard_examples/bq25896) |  <p align="center">![alt text][supported] | | |
-
 [supported]: https://img.shields.io/badge/-supported-green "example"
 
 | firmware | description | picture |
 | ------  | ------  | ------ |
 | [t_display_p4_lvgl_9_ui](./firmware/[T-Display-P4][lvgl_9_ui]) | factory program |  |
-| [t_display_p4_keyboard_lvgl_9_ui](./firmware/[T-Display-P4-Keyboard][lvgl_9_ui]) | keyboard expansion board factory program |  |
 | [esp32c6_at](./firmware/[T-Display-P4][esp32c6_at_slave]) | esp32c6-at factory program |  |
 | [esp32c6_slave_esp_hosted_mcu_network_adapter](./firmware/[T-Display-P4][esp32c6_slave_esp_hosted_mcu_network_adapter]) |  |  |
-| [t_display_p4_xiaozhi](./firmware/[T-Display-P4][xiaozhi]) |  |  |
-
-### ESP-IDF Visual Studio Code  
-1. Install [Visual Studio Code](https://code.visualstudio.com/Download) by selecting the appropriate version for your operating system.  
-
-2. Open the "Extensions" sidebar in Visual Studio Code (or use <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd> to open extensions), search for the "ESP-IDF" extension, and install it.  
-
-3. While the extension is installing, use the git command to clone the repository:  
-
-        git clone --recursive https://github.com/Xinyuan-LilyGO/T-Display-P4.git  
-
-    Ensure you include the `--recursive` flag during cloning. If you forget to include it, you will need to initialize the submodules later by running:  
-
-        git submodule update --init --recursive  
-
-4. Download and install [ESP-IDF v5.4.1](https://dl.espressif.cn/dl/esp-idf/?idf=4.4). Take note of the installation path. Open the previously installed "ESP-IDF" extension and select "Configure ESP-IDF Extension." Choose the "USE EXISTING SETUP" menu, then select "Search ESP-IDF in system." Correctly configure the installation path you noted earlier:  
-   - **Enter ESP-IDF directory (IDF_PATH):** `Your installation path xxx\Espressif\frameworks\esp-idf-v5.4`  
-   - **Enter ESP-IDF Tools directory (IDF_TOOLS_PATH):** `Your installation path xxx\Espressif`  
-    Click the "Install" button at the bottom right to proceed with the framework installation.  
-
-5. Click the "SDK Configuration Editor" in the ESP-IDF extension menu at the bottom of Visual Studio Code. In the search bar, look for the field "Select the example to build" and choose the project you want to compile. Then, search for "Select the camera type" and select the camera model integrated on your board. Save the settings.  
-
-6. Click "Set Espressif Device Target" in the bottom menu bar of Visual Studio Code and select **ESP32P4**. Next, click "Build Project" in the bottom menu bar and wait for the build to complete. Then, click "Select Port to Use," followed by "Flash Project" to upload the program.  
-
-<p align="center" width="100%">
-    <img src="image/1.jpg" alt="example">
-</p>
-
-### firmware download
-1. Open the project file "tools" and locate the ESP32 burning tool. Open it.
-
-2. Select the correct burning chip and burning method, then click "OK." As shown in the picture, follow steps 1->2->3->4->5 to burn the program. If the burning is not successful, press and hold the "BOOT-0" button and then download and burn again.
-
-3. Burn the file in the root directory of the project file "[firmware](./firmware/)" file,There is a description of the firmware file version inside, just choose the appropriate version to download.
-
-<p align="center" width="100%">
-    <img src="image/10.png" alt="example">
-    <img src="image/11.png" alt="example">
-</p>
-
 
 ## PinOverview
 
@@ -397,20 +360,6 @@ For pin definitions, please refer to the configuration file:
 <br />
 
 [t_display_p4_config.h](./components/private_library/t_display_p4_config.h)  
-[t_display_p4_keyboard_config.h](./components/private_library/t_display_p4_keyboard_config.h)
-
-## RelatedTests
-
-### Power Consumption
-| firmware | program | description | picture |
-| ------  | ------  | ------ | ------ | 
-| [deep_sleep(single_board)](./firmware/sleep/[T-Display-P4][deep_sleep][single_board]_firmware_202505301450.bin) |[deep_sleep](./main/examples/deep_sleep/)| Average current consumption: 1.2mA. For more details, please refer to the [Power Consumption Test Log](./relevant_test/PowerConsumptionTestLog_[T-Display-P4_V1.0]_20250605.pdf).| |
-
-### Camera
-| program | description | picture |
-| ------  | ------ | ------ | 
-| [uvc_sc2336](./debug/examples/uvc_sc2336/)| Original image and screenshot effect of taking a picture on the screen. | <p align="center"> <img src="image/2.jpg" alt="example" width="100%"> </p> |
-| [uvc_ov2710](./debug/examples/uvc_ov2710/)| Original image and screenshot effect of taking a picture on the screen. | <p align="center"> <img src="image/3.jpg" alt="example" width="100%"> </p> |
 
 ## FAQ
 
@@ -424,19 +373,15 @@ For pin definitions, please refer to the configuration file:
 
 <br />
 
-* Q. Why do I encounter configuration failures with the following errors when selecting the target compilation chip or configuring menuconfig in the ESP-IDF framework?
+* Q. Why does the device reboot every time I connect a serial monitor?
+* A. The ESP32-P4's USB-JTAG peripheral has an auto-reset circuit that triggers when DTR/RTS are toggled during port open. The firmware attempts to disable this via `usb_serial_jtag_ll_phy_set_jtag_bridge(false)`. If the device still resets, use tools that suppress DTR/RTS (e.g., `pyserial` with `dtr=False, rts=False`), or use ADS-B Scope which deasserts control lines immediately after connecting.
 
-        asyncio.exceptions.LimitOverrunError: Separator is found, but chunk is longer than limit
+<br />
 
-        ValueError: Separator is found, but chunk is longer than limit
+* Q. Why is WiFi not working?
+* A. ESP-Hosted SDIO DMA on the ESP32-P4 corrupts internal RAM heap metadata. This is tracked in [Espressif Issue #17889](https://github.com/espressif/esp-hosted/issues/17889). WiFi components are commented out in `idf_component.yml`. The planned fix is to flash the ESP32-C6 with AT firmware for synchronous WiFi.
 
-* A. This is a bug in ESP-IDF framework versions v5.4 to v5.5. Modify line 351 in the file located at `esp-idf-v5.x\tools\idf_py_actions\tools.py` as follows:
+<br />
 
-        Original code:
-        p = await asyncio.create_subprocess_exec(*cmd, env=env_copy, limit=1024 * 256, cwd=self.cwd, stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)
-        Modified code:
-        p = await asyncio.create_subprocess_exec(*cmd, env=env_copy, limit=1024 * 512, cwd=self.cwd, stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)
-
-## Project
-* []()
-
+* Q. Why is the screen black?
+* A. The MIPI DSI panel and LVGL both initialize successfully, but display output is not rendering. This may be related to wallpaper loading, draw buffer configuration, or a side effect of the USB DMA workaround. Testing with an unmodified LilyGo build is the next diagnostic step.
