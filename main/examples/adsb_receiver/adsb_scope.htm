@@ -23,8 +23,9 @@
   #connect-btn{margin-left:auto;background:var(--accent);color:var(--bg);border:none;padding:6px 16px;border-radius:4px;font-family:inherit;font-size:12px;font-weight:700;cursor:pointer;text-transform:uppercase;letter-spacing:0.5px}
   #connect-btn:hover{filter:brightness(1.15)}#connect-btn.connected{background:transparent;color:var(--accent);border:1px solid var(--accent)}
   #color-modes{display:flex;gap:3px}
-  #color-modes button{background:transparent;color:var(--text-dim);border:1px solid var(--panel-border);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:10px;cursor:pointer;font-weight:600}
-  #color-modes button:hover{border-color:var(--text-dim)}#color-modes button.active{border-color:var(--accent);color:var(--accent)}
+  #label-modes{display:flex;gap:3px}
+  #color-modes button,#label-modes button{background:transparent;color:var(--text-dim);border:1px solid var(--panel-border);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:10px;cursor:pointer;font-weight:600}
+  #color-modes button:hover,#label-modes button:hover{border-color:var(--text-dim)}#color-modes button.active,#label-modes button.active{border-color:var(--accent);color:var(--accent)}
   #panel{position:absolute;bottom:0;left:0;right:0;z-index:1000;background:linear-gradient(0deg,rgba(10,14,20,0.97),rgba(10,14,20,0.85));backdrop-filter:blur(10px);border-top:1px solid var(--panel-border);height:35vh;overflow:hidden;display:flex;flex-direction:column}
   #panel.collapsed{height:32px}
   #panel-drag{height:6px;cursor:ns-resize;flex-shrink:0;display:flex;align-items:center;justify-content:center}
@@ -86,6 +87,10 @@
     <button onclick="setCM('alt')" id="cm-alt" title="Color by altitude">ALT</button>
     <button onclick="setCM('speed')" id="cm-speed" title="Color by speed">SPD</button>
   </div>
+  <div id="label-modes">
+    <button class="active" onclick="setLM('alt')" id="lm-alt" title="Show altitude on labels">↕ ALT</button>
+    <button onclick="setLM('dist')" id="lm-dist" title="Show distance on labels">↔ DIST</button>
+  </div>
   <button class="topbtn" id="log-btn" onclick="toggleLog()">Log</button>
   <button id="connect-btn" onclick="toggleSerial()">Connect Serial</button>
 </div>
@@ -128,7 +133,7 @@
   </div>
 </div>
 <script>
-const A=new Map();let rxP=null,map,rxM,rxR=[],port,reader,conn=false,totM=0,mTs=[],logN=0,selIcao=null,cMode='mono';
+const A=new Map();let rxP=null,map,rxM,rxR=[],rxRL=[],port,reader,conn=false,totM=0,mTs=[],logN=0,selIcao=null,cMode='mono',lMode='alt';
 const EXP=120000,TMAX=60,LMAX=1000;
 
 // --- Color ---
@@ -170,6 +175,13 @@ function setCM(m){
   for(const[i,a]of A)updAc(i,a);
 }
 
+function setLM(m){
+  lMode=m;
+  document.querySelectorAll('#label-modes button').forEach(b=>b.classList.remove('active'));
+  document.getElementById('lm-'+m)?.classList.add('active');
+  for(const[i,a]of A)updAc(i,a);
+}
+
 // --- Map ---
 function initMap(){
   map=L.map('map',{center:[37.83,-122.27],zoom:11,zoomControl:false,attributionControl:false});
@@ -184,7 +196,9 @@ function mkIcon(h,c,sel){
 }
 function mkLbl(ic,ac,c){
   const sel=ic===selIcao?'sel':'';
-  return L.divIcon({html:`<div class="ac-label ${sel}" style="color:${c}" onclick="sel0('${ic}')">${ac.cs||ic} ${ac.alt?ac.alt+'ft':''}</div>`,iconSize:[0,0],iconAnchor:[-14,6],className:''});
+  const info=lMode==='dist'?(ac.dist!=null?ac.dist.toFixed(1)+'nm':''):(ac.alt?ac.alt+'ft':'');
+  const name=ac.cs||ic;
+  return L.divIcon({html:`<div class="ac-label ${sel}" style="color:${c}" onclick="sel0('${ic}')">${name}${info?' '+info:''}</div>`,iconSize:[0,0],iconAnchor:[-14,6],className:''});
 }
 function updAc(ic,ac){
   if(!ac.hasPos)return;
@@ -264,8 +278,26 @@ function updRx(){
   if(!rxP)return;
   if(!rxM){
     rxM=L.circleMarker([rxP.lat,rxP.lon],{radius:7,color:'#00e5a0',fillColor:'#00e5a0',fillOpacity:0.8,weight:2}).addTo(map).bindPopup('Receiver');
-    [10,25,50].forEach(nm=>rxR.push(L.circle([rxP.lat,rxP.lon],{radius:nm*1852,color:'rgba(0,229,160,0.15)',fillColor:'transparent',weight:1,dashArray:'4 6'}).addTo(map)));
-  }else{rxM.setLatLng([rxP.lat,rxP.lon]);rxR.forEach(r=>r.setLatLng([rxP.lat,rxP.lon]))}
+    [10,25,50].forEach(nm=>{
+      rxR.push(L.circle([rxP.lat,rxP.lon],{radius:nm*1852,color:'rgba(0,229,160,0.35)',fillColor:'transparent',weight:1.5}).addTo(map));
+      // Label at top of each ring
+      const latOffset=nm*1852/111320;
+      const lbl=L.marker([rxP.lat+latOffset,rxP.lon],{interactive:false,icon:L.divIcon({
+        html:`<div style="color:rgba(0,229,160,0.5);font-family:JetBrains Mono,monospace;font-size:10px;white-space:nowrap;text-align:center;pointer-events:none">${nm} nm</div>`,
+        iconSize:[0,0],iconAnchor:[0,12],className:''
+      })}).addTo(map);
+      rxRL.push(lbl);
+    });
+  }else{
+    rxM.setLatLng([rxP.lat,rxP.lon]);
+    let ri=0;
+    [10,25,50].forEach(nm=>{
+      rxR[ri].setLatLng([rxP.lat,rxP.lon]);
+      const latOffset=nm*1852/111320;
+      rxRL[ri].setLatLng([rxP.lat+latOffset,rxP.lon]);
+      ri++;
+    });
+  }
 }
 function updGnss(){
   const s=document.getElementById('gnss-status'),d=document.getElementById('gnss-detail');
