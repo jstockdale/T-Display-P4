@@ -24,6 +24,7 @@
 #include "esp_log.h"
 #include "esp_intr_alloc.h"
 #include "usb/usb_host.h"
+#include "hal/usb_serial_jtag_ll.h"
 #include "driver/gpio.h"
 #include "lvgl.h"
 #include "t_display_p4_driver.h"
@@ -991,11 +992,11 @@ void device_gps_task(void *arg)
                     // ------------------------------------------------
                     // GPS → system clock + RTC sync
                     // Priority: RTC < GPS serial << WiFi NTP
-                    // GPS serial has ~100-500ms lag (no PPS on this
-                    // board — L76K pin 5 is RESERVED / not routed).
-                    // Only correct the system clock when it drifts
-                    // >500ms from GPS time.  This avoids fighting NTP
-                    // when WiFi is running (NTP keeps <50ms accuracy).
+                    // GPS serial has only whole-second resolution (no PPS
+                    // on this board — L76K pin 5 is RESERVED / not routed),
+                    // plus ~500ms serial latency.  Only correct when drift
+                    // exceeds 1s to avoid oscillation from sub-second jitter.
+                    // NTP (when available) keeps <50ms so GPS won't interfere.
                     // ------------------------------------------------
                     static size_t last_rtc_write = 0;
 
@@ -1020,18 +1021,29 @@ void device_gps_task(void *arg)
                         time_t gps_epoch = mktime(&tm_gps);  // ESP32 default TZ is UTC
 
                         if (gps_epoch > 1704067200) {  // sanity: after 2024-01-01
-                            // Compare against current system clock
+                            // The RMC timestamp is the actual UTC fix time, but
+                            // arrives ~650ms later over serial (UART TX + library
+                            // buffering).  Compensate so the system clock is set
+                            // to (gps_epoch + 650ms) rather than exactly on the
+                            // second boundary.  Measured from observed jitter:
+                            // serial delay ranges 530–780ms, median ~650ms.
+                            static const long GPS_SERIAL_DELAY_US = 650000;  // 650ms
+
                             struct timeval tv_sys;
                             gettimeofday(&tv_sys, NULL);
-                            long long drift_ms = (long long)(gps_epoch - tv_sys.tv_sec) * 1000
-                                               - (long long)(tv_sys.tv_usec / 1000);
+                            long long drift_s = (long long)(gps_epoch - tv_sys.tv_sec);
 
-                            // Only step the clock if off by more than 500ms
-                            if (drift_ms > 500 || drift_ms < -500) {
-                                struct timeval tv_now = { .tv_sec = gps_epoch, .tv_usec = 0 };
+                            // Only step if off by more than 1 second
+                            if (drift_s > 1 || drift_s < -1) {
+                                struct timeval tv_now = {
+                                    .tv_sec = gps_epoch,
+                                    .tv_usec = GPS_SERIAL_DELAY_US
+                                };
                                 settimeofday(&tv_now, NULL);
-                                printf("[GNSS] Clock corrected by %+lldms → %04d-%02d-%02d %02d:%02d:%02d UTC\n",
-                                    drift_ms, utc_year, utc_mon, utc_day, utc_hour, utc_min, utc_sec);
+                                printf("[GNSS] Clock corrected by %+llds → %04d-%02d-%02d %02d:%02d:%02d.%03ld UTC\n",
+                                    drift_s, utc_year, utc_mon, utc_day,
+                                    utc_hour, utc_min, utc_sec,
+                                    GPS_SERIAL_DELAY_US / 1000);
                             }
 
                             // --- Set PCF8563 RTC at first fix, then every 60s ---
@@ -3096,6 +3108,11 @@ void rtlsdr_adsb_start(void)
 
 extern "C" void app_main(void)
 {
+    // Disable USB-JTAG bridge so DTR/RTS toggles from serial tools
+    // (WebSerial, screen, idf.py monitor) don't trigger a chip reset.
+    // Note: after this, flashing requires manual BOOT+RESET to enter download mode.
+    usb_serial_jtag_ll_phy_set_jtag_bridge(false);
+
     printf("Hello world!\n");
     printf("[MEM] boot start: internal=%u PSRAM=%u\n",
            heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
