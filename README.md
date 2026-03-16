@@ -23,7 +23,6 @@ This project turns a LILYGO T-Display-P4 development board into a standalone ADS
 - **GPS time sync** – L76K GNSS sets the system clock with 650ms serial delay compensation, syncs the PCF8563 RTC
 - **Serial output** – clean formatted messages with N/S E/W position indicators, raw hex for each message
 - **ADS-B Scope** – WebSerial-based live map viewer ([adsb-scope.offx1.com](https://adsb-scope.offx1.com))
-- **dump1090 bridge** – Python script feeds standard dump1090/dump1090-fa via AVR format over TCP
 
 ### Known limitations
 
@@ -50,21 +49,6 @@ Features:
 - DTR/RTS deasserted on connect to minimize resets
 
 Requirements: Chrome or Edge (WebSerial API). Connect via USB, click "Connect Serial", select the ESP32-P4 port.
-
-## dump1090 Bridge
-
-`serial_to_dump1090.py` reads serial output, extracts raw Mode-S hex from `[brackets]`, and feeds dump1090 in AVR format (`*HEX;\n`) over TCP port 30001.
-
-```bash
-# Terminal 1
-dump1090-fa --net-only --net-ri-port 30001
-
-# Terminal 2
-pip install pyserial
-python3 serial_to_dump1090.py /dev/tty.usbmodem* -v
-```
-
-Then open `http://localhost:8080` for dump1090's built-in map UI. DTR/RTS are disabled on connect to prevent device reboot.
 
 ## CSV Log Format
 
