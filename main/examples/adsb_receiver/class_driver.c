@@ -4,6 +4,7 @@
  */
 
 #include "class_driver.h"
+#include "serial_console.h"
 #include <math.h>
 #include <stdio.h>
 #include <time.h>
@@ -255,6 +256,10 @@ static void haversine(double lat1, double lon1, double lat2, double lon2,
 
 static FILE *sd_log = NULL;
 static char sd_log_filename[64] = {0};  // current log path for rename
+static int64_t sd_log_last_sync = 0;    // last close/reopen timestamp (us)
+static int sd_log_writes = 0;           // writes since last close/reopen
+#define SD_SYNC_INTERVAL_US  30000000LL // close/reopen every 30s
+#define SD_SYNC_WRITE_COUNT  100        // or every 100 writes
 
 static void sd_log_open(void) {
     time_t now;
@@ -280,6 +285,8 @@ static void sd_log_open(void) {
                         "rx_sats,rx_hdop\n");
         fflush(sd_log);
         fsync(fileno(sd_log));
+        sd_log_last_sync = esp_timer_get_time();
+        sd_log_writes = 0;
     }
 
     if (sd_log) {
@@ -287,6 +294,37 @@ static void sd_log_open(void) {
     } else {
         ESP_LOGW(TAG, "Failed to open SD log: %s", sd_log_filename);
     }
+}
+
+// Close and reopen the log file in append mode.
+// This forces the FAT directory entry (file size, cluster chain) to disk,
+// making the filesystem consistent. A crash after fclose loses no data;
+// a crash with the file open only risks the writes since the last sync.
+static void sd_log_sync(void) {
+    if (!sd_log || sd_log_filename[0] == '\0') return;
+
+    fflush(sd_log);
+    fsync(fileno(sd_log));
+    fclose(sd_log);
+    sd_log = NULL;
+
+    sd_log = fopen(sd_log_filename, "a");
+    if (sd_log) {
+        sd_log_last_sync = esp_timer_get_time();
+        sd_log_writes = 0;
+    } else {
+        ESP_LOGW(TAG, "Failed to reopen SD log: %s", sd_log_filename);
+    }
+}
+
+// Close the log file permanently (for clean shutdown/unmount).
+void sd_log_close(void) {
+    if (!sd_log) return;
+    fflush(sd_log);
+    fsync(fileno(sd_log));
+    fclose(sd_log);
+    sd_log = NULL;
+    ESP_LOGI(TAG, "SD log closed: %s", sd_log_filename);
 }
 
 // Rename the current log file from boot-numbered to UTC-timestamped.
@@ -323,7 +361,10 @@ void sd_log_rename_with_time(void) {
     }
 
     sd_log = fopen(sd_log_filename, "a");
-    if (!sd_log) {
+    if (sd_log) {
+        sd_log_last_sync = esp_timer_get_time();
+        sd_log_writes = 0;
+    } else {
         ESP_LOGE(TAG, "Failed to reopen SD log: %s", sd_log_filename);
     }
 }
@@ -397,8 +438,17 @@ static void sd_log_aircraft(aircraft_t *ac, const struct mode_s_msg *mm) {
     );
 
     fflush(sd_log);
-    fsync(fileno(sd_log));
+    sd_log_writes++;
+
+    // Periodic close/reopen to commit FAT metadata to disk.
+    // This ensures filesystem consistency if the device crashes.
+    int64_t sync_now = esp_timer_get_time();
+    if (sd_log_writes >= SD_SYNC_WRITE_COUNT ||
+        (sync_now - sd_log_last_sync) > SD_SYNC_INTERVAL_US) {
+        sd_log_sync();
+    }
 }
+// ============================================================
 
 // ============================================================
 // LVGL display
@@ -482,6 +532,8 @@ void on_msg(mode_s_t *self, struct mode_s_msg *mm)
     }
 
     // --- Print one-line summary with full known state ---
+    // Only print when serial console is in LOG mode
+    if (serial_console_log_enabled()) {
 
     // Timestamp
     struct timeval tv;
@@ -535,6 +587,8 @@ void on_msg(mode_s_t *self, struct mode_s_msg *mm)
     for (int i = 0; i < msglen; i++)
         fprintf(stdout, "%02X", mm->msg[i]);
     fprintf(stdout, "]\n");
+
+    } // end serial_console_log_enabled()
 
     sd_log_aircraft(ac, mm);
 

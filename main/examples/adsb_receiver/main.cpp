@@ -58,6 +58,7 @@
 #include <fstream>
 
 #include "class_driver.h"
+#include "serial_console.h"
 // WiFi disabled — Espressif Issue #17889 (SDMMC controller DMA conflict)
 // WiFi disabled — esp_hosted and esp_wifi_remote removed from build
 // to prevent SDIO auto-init that fragments internal heap (Issue #17889)
@@ -1039,7 +1040,7 @@ void device_gps_task(void *arg)
                                     .tv_usec = GPS_SERIAL_DELAY_US
                                 };
                                 settimeofday(&tv_now, NULL);
-                                printf("[GNSS] Clock corrected by %+llds → %04d-%02d-%02d %02d:%02d:%02d.%03ld UTC\n",
+                                serial_console_print("[GNSS] Clock corrected by %+llds → %04d-%02d-%02d %02d:%02d:%02d.%03ld UTC\n",
                                     drift_s, utc_year, utc_mon, utc_day,
                                     utc_hour, utc_min, utc_sec,
                                     GPS_SERIAL_DELAY_US / 1000);
@@ -1081,7 +1082,7 @@ void device_gps_task(void *arg)
                                 };
                                 PCF8563->set_time(t);
 
-                                printf("[GNSS] RTC set: %04d-%02d-%02d %02d:%02d:%02d UTC+8\n",
+                                serial_console_print("[GNSS] RTC set: %04d-%02d-%02d %02d:%02d:%02d UTC+8\n",
                                     tm_local.tm_year + 1900, tm_local.tm_mon + 1, tm_local.tm_mday,
                                     tm_local.tm_hour, tm_local.tm_min, tm_local.tm_sec);
 
@@ -1107,7 +1108,7 @@ void device_gps_task(void *arg)
                         double hdop = gga_ok ? (double)gga.hdop : 99.9;
                         int fix_q  = gga_ok ? gga.gps_mode_status : -1;
 
-                        printf("[GNSS] fix=%s lat=%.6f lon=%.6f sats=%d hdop=%.1f q=%d\n",
+                        serial_console_print("[GNSS] fix=%s lat=%.6f lon=%.6f sats=%d hdop=%.1f q=%d\n",
                             rmc.location_status.c_str(), lat, lon, sats, hdop, fix_q);
 
                         last_summary_time = now_ms + 5000;
@@ -2035,6 +2036,8 @@ bool Set_T_Mixrf_Lr1121_Sleep()
 
 #endif
 
+static sdmmc_card_t *sd_card_handle = NULL;
+
 bool Sdmmc_Init(const char *base_path)
 {
     esp_vfs_fat_sdmmc_mount_config_t mount_config =
@@ -2088,7 +2091,19 @@ bool Sdmmc_Init(const char *base_path)
     printf("filesystem mounted\n");
     printf("[MEM] after SD mount: internal=%u\n", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     sdmmc_card_print_info(stdout, card);
+    sd_card_handle = card;
     return true;
+}
+
+// Clean SD shutdown: close log file, unmount FATFS so dirty bit is cleared.
+// Called from shutdown handler and reboot command.
+extern "C" void sd_safe_shutdown(void) {
+    sd_log_close();
+    if (sd_card_handle) {
+        esp_vfs_fat_sdcard_unmount("/sdcard", sd_card_handle);
+        sd_card_handle = NULL;
+        printf("[SD] Filesystem unmounted cleanly\n");
+    }
 }
 
 void System_Ui_Callback_Init(void)
@@ -3260,6 +3275,8 @@ extern "C" void app_main(void)
     bool sd_mounted = Sdmmc_Init(SD_BASE_PATH);
     if (!sd_mounted)
         printf("Sdmmc_Init fail -- wallpaper resources unavailable\n");
+    else
+        esp_register_shutdown_handler(sd_safe_shutdown);
 
     // ---------------------------------------------------------------
     // RTL-SDR / ADS-B USB host moved to after WiFi init — both need
@@ -3601,6 +3618,9 @@ extern "C" void app_main(void)
     System_Ui->set_vibration();
 
     System_Startup_Message_Init();
+
+    // Start serial console (Ctrl+C for command mode)
+    serial_console_init();
 
     // ---------------------------------------------------------------
     // WiFi disabled — Espressif Issue #17889 (SDMMC controller
