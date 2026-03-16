@@ -225,7 +225,7 @@ function trailHdg(ac){
 }
 
 function updAc(ic,ac){
-  if(!ac.hasPos)return;
+  if(!ac.hasPos||ac.expired)return;
   const st=acStale(ac);
   const c=acCol(ic,ac),sel=selSet.has(ic),tw=sel?2.5:1.5;
   const to=sel?Math.max(st.opacity,0.8):(st.gray?0.2:st.opacity*0.6);
@@ -296,6 +296,13 @@ const AR=/\s(-?\d+)ft/,SR=/\s(\d+)kt\s+(\d+)°/,VR=/\s([+-]\d+)fpm/;
 const PR=/\((\d+\.\d+)([NS]),(\d+\.\d+)([EW])\)/,DR=/(\d+\.\d+)nm@(\d+)°/;
 
 function parse(l){
+  // Detect device reboot — reset all status indicators, expire all aircraft
+  if(/^ESP-ROM:|^rst:0x/.test(l)){
+    updSD('wait',null);
+    rxP=null;updGnss();
+    for(const[ic,ac]of A){if(!ac.expired){rmAc(ac);ac.expired=true}}
+    selSet.clear();
+  }
   // SD card status — check failures first (some contain substrings of success patterns)
   if(/Failed to reopen/.test(l)){
     // Had a log, lost it (e.g. card removed mid-write)
@@ -324,8 +331,10 @@ function parse(l){
   const ic=mm[1],af=l.substring(mm[0].length),cm=af.match(/^([\w]{2,8})\s/),cs=(cm&&/[A-Z]/.test(cm[1]))?cm[1]:null;
   totM++;
   let ac=A.get(ic);
-  if(!ac){ac={cs:null,alt:null,speed:null,hdg:null,vr:null,lat:null,lon:null,hasPos:false,dist:null,brg:null,ls:Date.now(),mk:null,lb:null,tr:null};A.set(ic,ac)}
+  if(!ac){ac={cs:null,alt:null,speed:null,hdg:null,vr:null,lat:null,lon:null,hasPos:false,expired:false,dist:null,brg:null,ls:Date.now(),mk:null,lb:null,tr:null};A.set(ic,ac)}
   ac.ls=Date.now();if(cs)ac.cs=cs;
+  // Revive if expired — new message means it's back
+  if(ac.expired){ac.expired=false;ac.mk=null;ac.lb=null;ac.tr=null;}
   let m;
   if(m=AR.exec(l))ac.alt=parseInt(m[1]);
   if(m=SR.exec(l)){ac.speed=parseInt(m[1]);ac.hdg=parseInt(m[2])}
@@ -380,6 +389,8 @@ function updSD(ok,path){
   if(ok===true){
     const short=path?path.replace('/sdcard/',''):'logging';
     el.textContent='● '+short;el.className='sd-ok';
+  }else if(ok==='wait'){
+    el.textContent='waiting';el.className='sd-wait';
   }else if(ok==='mounted'){
     el.textContent='mounted, waiting for log';el.className='sd-wait';
   }else if(ok==='retrying'){
@@ -443,17 +454,39 @@ function toggleLog(){document.getElementById('log-panel').classList.toggle('visi
 // --- Tick ---
 function tick(){
   const n=Date.now();
-  for(const[ic,ac]of A){if(n-ac.ls>EXP&&!selSet.has(ic)){rmAc(ac);A.delete(ic)}}
-  // Refresh map visuals for staleness transitions
-  for(const[ic,ac]of A)updAc(ic,ac);
-  document.getElementById('ac-count').textContent=A.size;
+  // Only expire when connected — freeze state when disconnected
+  if(conn){
+    for(const[ic,ac]of A){
+      const age=n-ac.ls;
+      if(age>EXP&&!ac.expired){
+        // Remove from map but keep in table
+        rmAc(ac);
+        ac.expired=true;
+        selSet.delete(ic);
+      }
+    }
+  }
+  // Refresh map visuals for staleness transitions (only non-expired)
+  for(const[ic,ac]of A){if(!ac.expired)updAc(ic,ac)}
+  const liveCount=[...A.values()].filter(ac=>!ac.expired).length;
+  document.getElementById('ac-count').textContent=liveCount;
   document.getElementById('msg-count').textContent=totM.toLocaleString();
   document.getElementById('msg-rate').textContent=(mTs.length/5).toFixed(1);
   if(selSet.size)updDet();
   const tb=document.getElementById('ac-tbody');
-  const so=[...A.entries()].sort((a,b)=>(a[1].dist||999)-(b[1].dist||999));
+  // Sort: live aircraft by distance first, then expired at the bottom
+  const so=[...A.entries()].sort((a,b)=>{
+    if(a[1].expired!==b[1].expired)return a[1].expired?1:-1;
+    return(a[1].dist||999)-(b[1].dist||999);
+  });
   tb.innerHTML=so.map(([ic,ac])=>{
-    const age=Math.round((n-ac.ls)/1000),vc=ac.vr>0?'climbing':ac.vr<0?'descending':'',sel=selSet.has(ic)?' selected':'',c=acCol(ic,ac);
+    const age=Math.round((n-ac.ls)/1000);
+    const vc=ac.vr>0?'climbing':ac.vr<0?'descending':'';
+    const sel=selSet.has(ic)?' selected':'';
+    const c=acCol(ic,ac);
+    if(ac.expired){
+      return`<tr style="opacity:0.25" onclick="sel0('${ic}',event)"><td class="col-icao" style="color:#556">${ic}</td><td class="col-cs" style="color:#556">${ac.cs||'---'}</td><td style="color:#556">${ac.alt!=null?ac.alt.toLocaleString():'---'}</td><td style="color:#556">${ac.speed||'---'}</td><td style="color:#556">${ac.hdg!=null?ac.hdg+'°':'---'}</td><td style="color:#556">${ac.vr?(ac.vr>0?'+':'')+ac.vr:'---'}</td><td style="color:#556">${ac.dist!=null?ac.dist.toFixed(1)+'nm':'---'}</td><td style="color:#556">${ac.brg!=null?ac.brg+'°':'---'}</td><td style="color:#556">${age}s</td></tr>`;
+    }
     const st=acStale(ac);
     const rowOp=st.gray?'opacity:0.35':st.opacity<1?'opacity:0.5':'';
     const icCol=st.gray?'#667':c;

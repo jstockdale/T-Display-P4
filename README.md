@@ -5,7 +5,7 @@
  * @LastEditTime: 2026-03-16
  * @License: GPL 3.0
 -->
-<h1 align="center">ADS-B Receiver — T-Display-P4</h1>
+<h1 align="center">ADS-B Receiver – T-Display-P4</h1>
 
 <p align="center">
   A portable 1090 MHz ADS-B receiver built on the LILYGO T-Display-P4, using an RTL-SDR USB dongle for RF reception and the ESP32-P4's dual RISC-V cores for real-time Mode-S decoding.
@@ -17,19 +17,20 @@ This project turns a LILYGO T-Display-P4 development board into a standalone ADS
 
 ### What works today
 
-- **Real-time ADS-B reception** — 15–30 messages/second, 12–30+ simultaneous aircraft tracked
+- **Real-time ADS-B reception** – 15–30 messages/second, 12–30+ simultaneous aircraft tracked
 - **~30 nm range** from Oakland, CA with a 7" telescopic antenna on RTL-SDR
-- **SD card CSV logging** — UTC timestamps, raw Mode-S hex, decoded fields (ICAO, callsign, altitude, speed, heading, vertical rate, position, squawk), receiver GPS metadata (sats, HDOP)
-- **GPS time sync** — L76K GNSS sets the system clock with 650ms serial delay compensation, syncs the PCF8563 RTC
-- **Serial output** — clean formatted messages with N/S E/W position indicators, raw hex for each message
-- **ADS-B Scope** — WebSerial-based live map viewer ([adsb-scope.offx1.com](https://adsb-scope.offx1.com))
+- **SD card CSV logging** – UTC timestamps, raw Mode-S hex, decoded fields (ICAO, callsign, altitude, speed, heading, vertical rate, position, squawk), receiver GPS metadata (sats, HDOP)
+- **GPS time sync** – L76K GNSS sets the system clock with 650ms serial delay compensation, syncs the PCF8563 RTC
+- **Serial output** – clean formatted messages with N/S E/W position indicators, raw hex for each message
+- **ADS-B Scope** – WebSerial-based live map viewer ([adsb-scope.offx1.com](https://adsb-scope.offx1.com))
+- **dump1090 bridge** – Python script feeds standard dump1090/dump1090-fa via AVR format over TCP
 
 ### Known limitations
 
-- **Screen is black** — LVGL initializes successfully but display output is not rendering; under investigation
-- **WiFi disabled** — ESP-Hosted SDIO DMA corrupts internal RAM heap metadata (Espressif Issue #17889); WiFi/NTP unavailable until resolved or AT firmware is deployed on the C6
-- **LVGL display updates disabled** — `adsb_update_display()` is a no-op to work around USB DMA heap corruption; aircraft data is only on serial + SD card + ADS-B Scope
-- **WebSerial triggers device reboot** — USB-JTAG auto-reset circuit fires on DTR toggle during port open; investigation in progress
+- **Screen is black** – LVGL initializes successfully but display output is not rendering; under investigation
+- **WiFi disabled** – ESP-Hosted SDIO DMA corrupts internal RAM heap metadata (Espressif Issue #17889); WiFi/NTP unavailable until resolved or AT firmware is deployed on the C6
+- **LVGL display updates disabled** – `adsb_update_display()` is a no-op to work around USB DMA heap corruption; aircraft data is only on serial + SD card + ADS-B Scope
+- **WebSerial triggers device reboot** – USB-JTAG auto-reset circuit fires on DTR toggle during port open; investigation in progress
 
 ## ADS-B Scope
 
@@ -112,7 +113,7 @@ Aircraft Table (64 slots, 60s expiry)
     │
     ├──→ Serial output (printf, formatted + raw hex)
     ├──→ SD card CSV log (fsync every write)
-    └──→ LVGL table (disabled — heap corruption workaround)
+    └──→ LVGL table (disabled – heap corruption workaround)
 
 L76K GPS (UART, 1 Hz NMEA)
     │
@@ -132,7 +133,34 @@ L76K GPS (UART, 1 Hz NMEA)
 | After UI + all tasks | ~131 KB |
 | PSRAM free | ~20 MB |
 
-## Building
+## Quick Start – Pre-built Binary
+
+If you just want to flash and go, a pre-built binary is available in the `firmware/` directory. No build environment needed – just `esptool.py`.
+
+### Requirements
+
+- [esptool.py](https://github.com/espressif/esptool) (`pip install esptool`)
+- USB cable to the T-Display-P4
+- Hold **BOOT** + tap **RESET** to enter download mode
+
+### Flash
+
+```bash
+esptool.py --chip esp32p4 --port /dev/tty.usbmodem* \
+    write_flash 0x0 jstockdale-adsb_receiver-t_display_p4-260315.bin
+```
+
+On Windows, replace `/dev/tty.usbmodem*` with the appropriate COM port (e.g., `COM3`).
+
+After flashing, press RESET. The device will boot, initialize all peripherals, and begin scanning 1090 MHz as soon as an RTL-SDR dongle is connected to the USB Host port. Connect to [adsb-scope.offx1.com](https://adsb-scope.offx1.com) via Chrome WebSerial to see aircraft on a live map.
+
+### Hardware needed
+
+- LILYGO T-Display-P4 V1.0
+- RTL-SDR USB dongle (RTL2832U + R820T/R820T2)
+- Antenna – the included telescopic whip works, ~30 nm range from a window
+
+## Building from Source
 
 ### Prerequisites
 
@@ -155,23 +183,23 @@ If auto-reset doesn't work (USB-JTAG bridge disabled in firmware), hold BOOT + t
 
 ### Configuration Notes
 
-- `CONFIG_HEAP_POISONING_LIGHT=y` — enabled for heap corruption debugging
+- `CONFIG_HEAP_POISONING_LIGHT=y` – enabled for heap corruption debugging
 - ESP-Hosted and esp_wifi_remote are commented out in `idf_component.yml`
 - `CPP_BUS_DRIVER_LOG_LEVEL_DEBUG` is commented out in `config.h` to suppress raw NMEA dumps
 
 ## Pending Work
 
-1. **Fix USB DMA heap corruption** — root cause of LVGL crash; USB bulk transfers corrupt internal RAM heap metadata
-2. **Re-enable LVGL aircraft display** — blocked by #1
-3. **Fix screen** — display hardware initializes but screen is black; may be wallpaper/draw buffer issue
-4. **Restore WiFi** — either fix ESP-Hosted SDIO DMA or flash C6 with AT firmware
-5. **Investigate WebSerial reset** — DTR→reset path may be in ROM code, not disableable from app_main
+1. **Fix USB DMA heap corruption** – root cause of LVGL crash; USB bulk transfers corrupt internal RAM heap metadata
+2. **Re-enable LVGL aircraft display** – blocked by #1
+3. **Fix screen** – display hardware initializes but screen is black; may be wallpaper/draw buffer issue
+4. **Restore WiFi** – either fix ESP-Hosted SDIO DMA or flash C6 with AT firmware
+5. **Investigate WebSerial reset** – DTR→reset path may be in ROM code, not disableable from app_main
 
 ## Credits
 
 - **Hardware & base firmware:** [LILYGO](https://github.com/Xinyuan-LilyGO/T-Display-P4)
 - **Mode-S decoder:** Based on [dump1090](https://github.com/antirez/dump1090) by Salvatore Sanfilippo
-- **ADS-B Scope:** [adsb-scope.offx1.com](https://adsb-scope.offx1.com) — Off by One
+- **ADS-B Scope:** [adsb-scope.offx1.com](https://adsb-scope.offx1.com) – Off by One
 - **RTL-SDR driver:** Custom ESP32-P4 USB host implementation based on librtlsdr
 
 ## License
@@ -384,3 +412,4 @@ For pin definitions, please refer to the configuration file:
 
 * Q. Why is the screen black?
 * A. The MIPI DSI panel and LVGL both initialize successfully, but display output is not rendering. This may be related to wallpaper loading, draw buffer configuration, or a side effect of the USB DMA workaround. Testing with an unmodified LilyGo build is the next diagnostic step.
+
