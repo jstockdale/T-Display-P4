@@ -44,6 +44,13 @@ static volatile uint8_t s_new_dev_addr = 0;
 // Pre-allocated demodulation magnitude buffer (allocated once in reader task)
 static uint16_t *s_mag_buf = NULL;
 
+// ADS-B statistics — updated by on_msg, read by adsb_get_stats
+static volatile uint32_t s_total_messages = 0;
+static volatile uint32_t s_msg_count_window = 0;  // messages in current 1s window
+static volatile float    s_msg_rate = 0.0f;       // messages per second
+static volatile int64_t  s_msg_window_start = 0;  // start of current rate window
+static volatile bool     s_rtlsdr_connected = false;
+
 // ============================================================
 // CPR cache with timestamps — linear-probed hash table
 // ============================================================
@@ -228,6 +235,60 @@ receiver_pos_t adsb_get_receiver_pos(void) {
     p = s_rx_pos;
     xSemaphoreGive(s_rx_pos_mutex);
     return p;
+}
+
+// Forward declaration — defined below
+static void haversine(double lat1, double lon1, double lat2, double lon2,
+                      double *out_dist_km, double *out_bearing_deg);
+
+adsb_stats_t adsb_get_stats(void) {
+    adsb_stats_t stats = {0};
+    stats.total_messages = s_total_messages;
+    stats.msg_rate = s_msg_rate;
+    stats.rtlsdr_connected = s_rtlsdr_connected;
+
+    // Count active aircraft
+    int count = 0;
+    int64_t now = esp_timer_get_time();
+    if (aircraft_mutex) {
+        xSemaphoreTake(aircraft_mutex, portMAX_DELAY);
+        for (int i = 0; i < AIRCRAFT_TABLE_SIZE; i++) {
+            if (aircraft_table[i].active &&
+                (now - aircraft_table[i].last_seen) <= AIRCRAFT_MAX_AGE_US)
+                count++;
+        }
+        xSemaphoreGive(aircraft_mutex);
+    }
+    stats.active_aircraft = count;
+
+    // Find nearest aircraft
+    stats.nearest_icao = 0;
+    stats.nearest_dist_nm = 0;
+    receiver_pos_t rx = adsb_get_receiver_pos();
+    if (rx.fix_valid && aircraft_mutex) {
+        double best_dist = 1e9;
+        xSemaphoreTake(aircraft_mutex, portMAX_DELAY);
+        for (int i = 0; i < AIRCRAFT_TABLE_SIZE; i++) {
+            if (!aircraft_table[i].active) continue;
+            if (!aircraft_table[i].has_position) continue;
+            if ((now - aircraft_table[i].last_seen) > AIRCRAFT_MAX_AGE_US) continue;
+            double dist_km, brg;
+            haversine(rx.lat, rx.lon, aircraft_table[i].lat, aircraft_table[i].lon, &dist_km, &brg);
+            if (dist_km < best_dist) {
+                best_dist = dist_km;
+                stats.nearest_icao = aircraft_table[i].icao;
+                stats.nearest_dist_nm = dist_km * 0.539957;
+                stats.nearest_alt = aircraft_table[i].altitude;
+                if (aircraft_table[i].callsign[0]) {
+                    strncpy(stats.nearest_callsign, aircraft_table[i].callsign, 8);
+                    stats.nearest_callsign[8] = '\0';
+                }
+            }
+        }
+        xSemaphoreGive(aircraft_mutex);
+    }
+
+    return stats;
 }
 
 // Great-circle distance (km) and initial bearing (degrees) using haversine
@@ -688,6 +749,17 @@ void on_msg(mode_s_t *self, struct mode_s_msg *mm)
 
     sd_log_aircraft(ac, mm);
 
+    // Update message statistics
+    s_total_messages++;
+    s_msg_count_window++;
+    int64_t now_us = esp_timer_get_time();
+    int64_t elapsed = now_us - s_msg_window_start;
+    if (elapsed >= 1000000LL) {  // 1 second window
+        s_msg_rate = (float)s_msg_count_window * 1000000.0f / (float)elapsed;
+        s_msg_count_window = 0;
+        s_msg_window_start = now_us;
+    }
+
     xSemaphoreGive(aircraft_mutex);
 }
 
@@ -743,6 +815,8 @@ static void adsb_reader_task(void *arg)
     ESP_LOGI(TAG, "[APP] Free memory: %ld bytes", esp_get_free_heap_size());
     mode_s_init(&state);
     sd_log_create();
+    s_rtlsdr_connected = true;
+    s_msg_window_start = esp_timer_get_time();
 
     // Allocate read buffers and magnitude buffer once — in PSRAM to
     // preserve internal RAM for SDMMC DMA, LVGL, and wallpaper decoding.
@@ -796,6 +870,7 @@ static void adsb_reader_task(void *arg)
     free(buffer);
 
 done:
+    s_rtlsdr_connected = false;
     sd_log_close();
     // Release USB event pumping back to class_driver_task
     s_reader_owns_events = false;

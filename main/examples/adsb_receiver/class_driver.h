@@ -5,6 +5,8 @@
  */
 
 #include <stdlib.h>
+#include <stdbool.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
@@ -119,6 +121,20 @@ typedef struct {
 extern void adsb_set_receiver_pos(double lat, double lon, double alt_m,
                                   int sats, double hdop, int fix_quality);
 extern receiver_pos_t adsb_get_receiver_pos(void);
+
+// ADS-B statistics — updated by on_msg, read by CIT test / status bar
+typedef struct {
+    uint32_t total_messages;
+    float    msg_rate;          // messages per second
+    int      active_aircraft;   // aircraft seen within expiry window
+    bool     rtlsdr_connected;  // true while reader task is running
+    uint32_t nearest_icao;      // ICAO of nearest aircraft (0 if none)
+    double   nearest_dist_nm;   // distance to nearest in nautical miles
+    int      nearest_alt;       // altitude of nearest aircraft
+    char     nearest_callsign[9]; // callsign of nearest (empty string if none)
+} adsb_stats_t;
+
+extern adsb_stats_t adsb_get_stats(void);
 
 #ifdef __cplusplus
 }

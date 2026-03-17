@@ -1443,18 +1443,10 @@ function posTopbar(){
   const tb=document.getElementById('topbar').offsetHeight;
   const tl=document.getElementById('timeline');
   tl.style.top=tb+'px';
-  const gi=document.getElementById('gnss-info');
-  const dw=document.getElementById('detail-wrap');
-  // On mobile, GNSS info is positioned from the bottom by CSS — clear inline top.
-  // Detail wrap stays at top on all screen sizes.
   const tlH=tl.classList.contains('visible')?tl.offsetHeight:0;
   const top=(tb+tlH+8)+'px';
-  dw.style.top=top;
-  if(window.innerWidth<=768){
-    gi.style.top='';
-  }else{
-    gi.style.top=top;
-  }
+  document.getElementById('gnss-info').style.top=top;
+  document.getElementById('detail-wrap').style.top=top;
 }
 posZoom();posTopbar();
 new MutationObserver(posZoom).observe(document.getElementById('panel'),{attributes:true,attributeFilter:['style','class']});

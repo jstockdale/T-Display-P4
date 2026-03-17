@@ -833,8 +833,27 @@ void device_battery_health_task(void *arg)
 
             System_Ui->set_battery_level(battery_level);
 
+            // Update all status bar indicators (runs every 1s)
+            {
+                // GPS status
+                receiver_pos_t rx = adsb_get_receiver_pos();
+                System_Ui->set_gps_status(rx.fix_valid, rx.sats);
+
+                // ADS-B status
+                adsb_stats_t stats = adsb_get_stats();
+                System_Ui->set_adsb_status(stats.rtlsdr_connected, stats.active_aircraft);
+
+                // SD card status
+                extern bool sd_is_mounted(void);
+                extern bool sd_is_logging(void);
+                System_Ui->set_sd_status(sd_is_mounted(), sd_is_logging());
+            }
+
             _lock_acquire(&lvgl_api_lock);
             System_Ui->status_bar_battery_level_update();
+            System_Ui->status_bar_gps_update();
+            System_Ui->status_bar_adsb_update();
+            System_Ui->status_bar_sd_update();
             _lock_release(&lvgl_api_lock);
 
             switch (System_Ui->get_current_win())
@@ -1326,29 +1345,61 @@ void device_at_task(void *arg)
         {
             if (esp_log_timestamp() > cycle_time)
             {
-                // AT commands replaced by ESP-Hosted WiFi — show WiFi/time status instead
+                // ADS-B status display (repurposed from AT test)
+                adsb_stats_t stats = adsb_get_stats();
+                receiver_pos_t rx = adsb_get_receiver_pos();
+
+                std::string status_str = "ADS-B Receiver Status\n\n";
+
+                // RTL-SDR connection
+                status_str += "RTL-SDR: ";
+                status_str += stats.rtlsdr_connected ? "\xE2\x9C\x93 connected\n" : "\xE2\x9C\x97 not connected\n";
+
+                // Message stats
+                char buf[128];
+                snprintf(buf, sizeof(buf), "\nMessages: %lu\nRate: %.1f msg/s\n",
+                    (unsigned long)stats.total_messages, stats.msg_rate);
+                status_str += buf;
+
+                // Aircraft count
+                snprintf(buf, sizeof(buf), "\nAircraft tracked: %d\n", stats.active_aircraft);
+                status_str += buf;
+
+                // Nearest aircraft
+                if (stats.nearest_icao) {
+                    snprintf(buf, sizeof(buf), "\nNearest aircraft:\n  %06lX %s\n  %.1f nm, %d ft\n",
+                        (unsigned long)stats.nearest_icao,
+                        stats.nearest_callsign[0] ? stats.nearest_callsign : "----",
+                        stats.nearest_dist_nm,
+                        stats.nearest_alt);
+                    status_str += buf;
+                }
+
+                // GPS status
+                status_str += "\nReceiver GPS: ";
+                if (rx.fix_valid) {
+                    snprintf(buf, sizeof(buf), "fix (%d sats)\n  %.4f, %.4f\n  HDOP: %.1f\n",
+                        rx.sats, rx.lat, rx.lon, rx.hdop);
+                    status_str += buf;
+                } else {
+                    status_str += "no fix\n";
+                }
+
+                // UTC time
                 struct timeval tv;
                 gettimeofday(&tv, NULL);
                 struct tm tm_info;
                 gmtime_r(&tv.tv_sec, &tm_info);
-
-                std::string status_str = "ESP-Hosted WiFi Status:\n";
-                status_str += Sys_Status.esp32c6.wifi_connect_status ? "Connected\n\n" : "Disconnected\n\n";
-
                 if (tm_info.tm_year + 1900 >= 2024) {
-                    char tbuf[64];
-                    snprintf(tbuf, sizeof(tbuf), "UTC: %04d-%02d-%02d\nTime: %02d:%02d:%02d\n",
+                    snprintf(buf, sizeof(buf), "\nUTC: %04d-%02d-%02d %02d:%02d:%02d\n",
                         tm_info.tm_year + 1900, tm_info.tm_mon + 1, tm_info.tm_mday,
                         tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec);
-                    status_str += tbuf;
-                } else {
-                    status_str += "Time: waiting for SNTP...\n";
+                    status_str += buf;
                 }
 
                 _lock_acquire(&lvgl_api_lock);
                 if (System_Ui->_registry.win.cit.esp32c6_at_test.data_label)
                     lv_label_set_text(System_Ui->_registry.win.cit.esp32c6_at_test.data_label, status_str.c_str());
-                System_Ui->status_bar_wifi_connect_status_update();
                 _lock_release(&lvgl_api_lock);
 
                 cycle_time = esp_log_timestamp() + 1000;
@@ -2152,6 +2203,17 @@ extern "C" bool sd_remount(void) {
     return ok;
 }
 
+extern "C" bool sd_is_mounted(void) {
+    return sd_card_handle != NULL;
+}
+
+extern "C" bool sd_is_logging(void) {
+    // We're logging if SD is mounted and the RTL-SDR reader task is running
+    // (sd_log_create is called when the reader task starts)
+    adsb_stats_t stats = adsb_get_stats();
+    return sd_card_handle != NULL && stats.rtlsdr_connected;
+}
+
 void System_Ui_Callback_Init(void)
 {
     System_Ui->_device_vibration_callback = [](uint8_t vibration_count)
@@ -2225,7 +2287,16 @@ void System_Ui_Callback_Init(void)
 
     System_Ui->_win_cit_esp32c6_at_test_callback = [](bool status)
     {
-        // AT commands replaced by ESP-Hosted WiFi — CIT AT test disabled
+        // Repurposed: shows ADS-B receiver status instead of AT test
+        if (status == true)
+        {
+            Esp32c6_At_Mode = At_Mode::TEST;
+            vTaskResume(At_Task_Handle);
+        }
+        else
+        {
+            vTaskSuspend(At_Task_Handle);
+        }
     };
 
     System_Ui->_win_camera_status_callback = [](bool status)
@@ -3274,12 +3345,9 @@ extern "C" void app_main(void)
     Init_Ldo_Channel_Power(3, 1830);
     vTaskDelay(pdMS_TO_TICKS(100));
 
-#if CONFIG_ENABLE_USB_DISPLAY == true
-    Usb_Screen_Init(&Screen_Mipi_Dpi_Panel);
-#else
-    Screen_Init(&Screen_Mipi_Dpi_Panel);
-#endif
-
+    // App_Video_Init must run BEFORE Screen_Init — camera creates its own
+    // MIPI-CSI panel and must complete before the DSI panel is configured.
+    // This matches the stock LILYGO init order.
     if (App_Video_Init() == false)
     {
         printf("App_Video_Init fail\n");
@@ -3298,14 +3366,17 @@ extern "C" void app_main(void)
         printf("Ppa_Screen_Rotation_init success\n");
 #endif
 
-    esp_err_t assert = esp_lcd_panel_reset(Screen_Mipi_Dpi_Panel);
-    if (assert != ESP_OK) printf("esp_lcd_panel_reset fail (error code: %#X)\n", assert);
+#if CONFIG_ENABLE_USB_DISPLAY == true
+    Usb_Screen_Init(&Screen_Mipi_Dpi_Panel);
+#else
+    Screen_Init(&Screen_Mipi_Dpi_Panel);
+#endif
 
-    assert = esp_lcd_panel_init(Screen_Mipi_Dpi_Panel);
+    // Stock LilyGO init sequence: Screen_Init() → esp_lcd_panel_init() only.
+    // Do NOT call esp_lcd_panel_reset() or esp_lcd_panel_disp_on_off() here —
+    // reset wipes the DSI lane config and panel commands that Screen_Init() sent.
+    esp_err_t assert = esp_lcd_panel_init(Screen_Mipi_Dpi_Panel);
     if (assert != ESP_OK) printf("esp_lcd_panel_init fail (error code: %#X)\n", assert);
-
-    assert = esp_lcd_panel_disp_on_off(Screen_Mipi_Dpi_Panel, true);
-    if (assert != ESP_OK) printf("esp_lcd_panel_disp_on_off fail (error code: %#X)\n", assert);
 
 #if defined CONFIG_SCREEN_TYPE_HI8561
     HI8561_T_IIC_Bus->set_bus_handle(XL9535_IIC_Bus->get_bus_handle());

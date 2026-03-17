@@ -52,6 +52,7 @@
 #include <math.h>
 
 #include "class_driver.h"  // for adsb_get_receiver_pos, aircraft count
+#include "tz_lookup.h"     // for timezone lookup and manual override
 
 static const char *CONSOLE_TAG = "CONSOLE";
 
@@ -207,6 +208,7 @@ static void cmd_help(void) {
         "  \033[32mdf\033[0m                show SD card free space\n"
         "  \033[32mstatus\033[0m            show receiver status\n"
         "  \033[32mversion\033[0m           show firmware version\n"
+        "  \033[32mtimezone\033[0m [auto|UTC±N] show or set timezone\n"
         "  \033[32mmount\033[0m             mount SD card\n"
         "  \033[32munmount\033[0m           safely unmount SD card\n"
         "  \033[32mreboot\033[0m            software reset\n"
@@ -535,6 +537,60 @@ static void dispatch_command(char *line) {
         sd_safe_shutdown();
         printf("  SD card safely unmounted. You can remove it now.\n");
         printf("  (Logging will stop until reboot)\n");
+    } else if (strcmp(cmd, "timezone") == 0 || strcmp(cmd, "tz") == 0) {
+        if (!arg1) {
+            // Show current timezone status
+            receiver_pos_t rx = adsb_get_receiver_pos();
+            if (tz_is_manual()) {
+                printf("  Mode: manual\n");
+            } else {
+                printf("  Mode: auto (GPS)\n");
+            }
+            if (rx.fix_valid) {
+                struct timeval tv;
+                gettimeofday(&tv, NULL);
+                struct tm tm_utc;
+                gmtime_r(&tv.tv_sec, &tm_utc);
+                tz_result_t tz = tz_lookup(rx.lat, rx.lon,
+                    tm_utc.tm_year + 1900, tm_utc.tm_mon + 1, tm_utc.tm_mday);
+                int off_h = tz.total_offset_min / 60;
+                int off_m = abs(tz.total_offset_min) % 60;
+                printf("  Position: %.4f, %.4f\n", rx.lat, rx.lon);
+                printf("  Offset:   UTC%+d", off_h);
+                if (off_m) printf(":%02d", off_m);
+                printf(" (%d min)\n", tz.total_offset_min);
+                printf("  Std:      UTC%+d (%d min)\n", tz.std_offset_min / 60, tz.std_offset_min);
+                if (tz.has_dst)
+                    printf("  DST:      %s (%+d min)\n", tz.dst_active ? "ACTIVE" : "inactive", tz.dst_offset_min);
+                else
+                    printf("  DST:      not observed\n");
+            } else {
+                printf("  No GPS fix — cannot compute timezone\n");
+            }
+        } else if (strcmp(arg1, "auto") == 0) {
+            tz_set_auto();
+            printf("  Timezone set to automatic (GPS-based)\n");
+        } else {
+            // Parse UTC±N or UTC±N:MM
+            const char *p = arg1;
+            if (strncasecmp(p, "UTC", 3) == 0) p += 3;
+            int hours = 0, minutes = 0;
+            char sign = '+';
+            if (*p == '+' || *p == '-') { sign = *p; p++; }
+            hours = atoi(p);
+            const char *colon = strchr(p, ':');
+            if (colon) minutes = atoi(colon + 1);
+            int total = hours * 60 + minutes;
+            if (sign == '-') total = -total;
+            if (total < -720 || total > 840) {
+                printf("  Invalid offset (range: UTC-12 to UTC+14)\n");
+            } else {
+                tz_set_manual_offset((int16_t)total);
+                printf("  Timezone set to UTC%c%d", total >= 0 ? '+' : '-', abs(total) / 60);
+                if (abs(total) % 60) printf(":%02d", abs(total) % 60);
+                printf(" (manual)\n");
+            }
+        }
     } else if (strcmp(cmd, "reboot") == 0) {
         printf("  Shutting down SD card...\n");
         extern void sd_safe_shutdown(void);

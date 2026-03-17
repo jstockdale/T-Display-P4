@@ -146,6 +146,9 @@ namespace Lvgl_Ui
                 lv_obj_t *time_label;
                 lv_obj_t *battery_icon;
                 lv_obj_t *wifi_signal_icon;
+                lv_obj_t *gps_icon;
+                lv_obj_t *adsb_icon;
+                lv_obj_t *sd_icon;
             } status_bar;
 
             struct
@@ -493,6 +496,18 @@ namespace Lvgl_Ui
 
         bool _wifi_connect_status = false;
 
+        // GPS status
+        bool _gps_fix_valid = false;
+        int  _gps_sats = 0;
+
+        // ADS-B status
+        bool _adsb_connected = false;
+        int  _adsb_aircraft_count = 0;
+
+        // SD card status
+        bool _sd_mounted = false;
+        bool _sd_logging = false;
+
         std::unique_ptr<lv_color_t[]> _lv_color_win_draw_buf = std::make_unique<lv_color_t[]>(_width * _height);
 
         Registry _registry;
@@ -629,6 +644,9 @@ namespace Lvgl_Ui
         void set_time(Pcf8563x::Time time);
         void set_battery_level(uint16_t battery_level);
         void set_wifi_connect_status(bool status);
+        void set_gps_status(bool fix_valid, int sats);
+        void set_adsb_status(bool connected, int aircraft_count);
+        void set_sd_status(bool mounted, bool logging);
 
         void add_event_cb_win_return_to_cit(lv_obj_t *obj);
 
@@ -651,6 +669,9 @@ namespace Lvgl_Ui
         void status_bar_time_update(void);
         void status_bar_battery_level_update(void);
         void status_bar_wifi_connect_status_update(void);
+        void status_bar_gps_update(void);
+        void status_bar_adsb_update(void);
+        void status_bar_sd_update(void);
 
         void win_home_time_update(void);
 

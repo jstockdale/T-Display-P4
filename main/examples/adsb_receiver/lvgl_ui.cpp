@@ -39,7 +39,7 @@ namespace Lvgl_Ui
             {"gps test", LV_SYMBOL_WARNING, 0xFFA500},
             {"ethernet test", LV_SYMBOL_WARNING, 0xFFA500},
             {"rtc test", LV_SYMBOL_WARNING, 0xFFA500},
-            {"esp32c6 at test", LV_SYMBOL_WARNING, 0xFFA500},
+            {"adsb test", LV_SYMBOL_WARNING, 0xFFA500},
 // {"sleep test", LV_SYMBOL_WARNING, 0xFFA500},
 #if defined CONFIG_BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
             {"keyboard test", LV_SYMBOL_WARNING, 0xFFA500},
@@ -754,6 +754,79 @@ namespace Lvgl_Ui
         }
     }
 
+    void System::set_gps_status(bool fix_valid, int sats)
+    {
+        _gps_fix_valid = fix_valid;
+        _gps_sats = sats;
+    }
+
+    void System::status_bar_gps_update(void)
+    {
+        char buf[16];
+        if (_gps_fix_valid && _gps_sats > 0) {
+            // Green — have GPS fix with satellite count
+            snprintf(buf, sizeof(buf), "%d " LV_SYMBOL_GPS, _gps_sats);
+            lv_obj_set_style_text_color(_registry.status_bar.gps_icon, lv_color_hex(0x00CC00), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
+        } else if (_gps_sats > 0) {
+            // Yellow — searching, can see satellites
+            snprintf(buf, sizeof(buf), "%d " LV_SYMBOL_GPS, _gps_sats);
+            lv_obj_set_style_text_color(_registry.status_bar.gps_icon, lv_color_hex(0xFFAA00), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
+        } else {
+            // Gray — no GPS data
+            snprintf(buf, sizeof(buf), LV_SYMBOL_GPS);
+            lv_obj_set_style_text_color(_registry.status_bar.gps_icon, lv_color_hex(0x666666), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
+        }
+        lv_label_set_text(_registry.status_bar.gps_icon, buf);
+    }
+
+    void System::set_adsb_status(bool connected, int aircraft_count)
+    {
+        _adsb_connected = connected;
+        _adsb_aircraft_count = aircraft_count;
+    }
+
+    void System::status_bar_adsb_update(void)
+    {
+        char buf[16];
+        if (_adsb_connected && _adsb_aircraft_count > 0) {
+            // Green — receiving aircraft
+            snprintf(buf, sizeof(buf), "%d " LV_SYMBOL_UP, _adsb_aircraft_count);
+            lv_obj_set_style_text_color(_registry.status_bar.adsb_icon, lv_color_hex(0x00CC00), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
+        } else if (_adsb_connected) {
+            // White — connected but no aircraft
+            snprintf(buf, sizeof(buf), "0 " LV_SYMBOL_UP);
+            lv_obj_set_style_text_color(_registry.status_bar.adsb_icon, lv_color_white(), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
+        } else {
+            // Gray — RTL-SDR not connected
+            snprintf(buf, sizeof(buf), LV_SYMBOL_UP);
+            lv_obj_set_style_text_color(_registry.status_bar.adsb_icon, lv_color_hex(0x666666), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
+        }
+        lv_label_set_text(_registry.status_bar.adsb_icon, buf);
+    }
+
+    void System::set_sd_status(bool mounted, bool logging)
+    {
+        _sd_mounted = mounted;
+        _sd_logging = logging;
+    }
+
+    void System::status_bar_sd_update(void)
+    {
+        if (_sd_logging) {
+            // Green — actively logging
+            lv_label_set_text(_registry.status_bar.sd_icon, LV_SYMBOL_SD_CARD);
+            lv_obj_set_style_text_color(_registry.status_bar.sd_icon, lv_color_hex(0x00CC00), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
+        } else if (_sd_mounted) {
+            // Yellow — mounted but not logging
+            lv_label_set_text(_registry.status_bar.sd_icon, LV_SYMBOL_SD_CARD);
+            lv_obj_set_style_text_color(_registry.status_bar.sd_icon, lv_color_hex(0xCC0000), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
+        } else {
+            // Gray — no SD card
+            lv_label_set_text(_registry.status_bar.sd_icon, LV_SYMBOL_SD_CARD);
+            lv_obj_set_style_text_color(_registry.status_bar.sd_icon, lv_color_hex(0x666666), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
+        }
+    }
+
     void System::win_home_time_update(void)
     {
         char buffer_time[10];
@@ -819,7 +892,6 @@ namespace Lvgl_Ui
         lv_obj_set_style_bg_color(_registry.status_bar.root, lv_color_black(), (lv_style_selector_t)LV_PART_MAIN); // 设置背景颜色
         lv_obj_set_style_border_width(_registry.status_bar.root, 0, (lv_style_selector_t)LV_PART_MAIN);            // 移除边框
         lv_obj_align(_registry.status_bar.root, LV_ALIGN_TOP_MID, 0, 0);                                           // 将状态栏对齐到顶部中间
-        // lv_obj_set_scrollbar_mode(_registry.status_bar.root, LV_SCROLLBAR_MODE_OFF);
         lv_obj_remove_flag(_registry.status_bar.root, LV_OBJ_FLAG_SCROLLABLE); // 禁止滚动
         lv_obj_remove_flag(_registry.status_bar.root, LV_OBJ_FLAG_CLICKABLE);  // 禁止触摸
 
@@ -832,19 +904,37 @@ namespace Lvgl_Ui
         lv_label_set_text(_registry.status_bar.time_label, buffer_time);
         lv_obj_align(_registry.status_bar.time_label, LV_ALIGN_LEFT_MID, 0, 0);
 
-        // 创建电池图标
+        // 创建电池图标 (rightmost)
         _registry.status_bar.battery_icon = lv_label_create(_registry.status_bar.root);
         lv_obj_set_style_text_color(_registry.status_bar.battery_icon, lv_color_white(), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
         lv_obj_set_style_text_font(_registry.status_bar.battery_icon, &lv_font_montserrat_22, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
         status_bar_battery_level_update();
-        lv_obj_align(_registry.status_bar.battery_icon, LV_ALIGN_RIGHT_MID, 0, 0); // 将电池图标对齐到右中间
+        lv_obj_align(_registry.status_bar.battery_icon, LV_ALIGN_RIGHT_MID, 0, 0);
+
+        // SD card status icon
+        _registry.status_bar.sd_icon = lv_label_create(_registry.status_bar.root);
+        lv_obj_set_style_text_font(_registry.status_bar.sd_icon, &lv_font_montserrat_18, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
+        lv_obj_align(_registry.status_bar.sd_icon, LV_ALIGN_RIGHT_MID, -35, 0);
+        status_bar_sd_update();
+
+        // ADS-B aircraft count icon
+        _registry.status_bar.adsb_icon = lv_label_create(_registry.status_bar.root);
+        lv_obj_set_style_text_font(_registry.status_bar.adsb_icon, &lv_font_montserrat_18, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
+        lv_obj_align(_registry.status_bar.adsb_icon, LV_ALIGN_RIGHT_MID, -68, 0);
+        status_bar_adsb_update();
+
+        // GPS status icon
+        _registry.status_bar.gps_icon = lv_label_create(_registry.status_bar.root);
+        lv_obj_set_style_text_font(_registry.status_bar.gps_icon, &lv_font_montserrat_18, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
+        lv_obj_align(_registry.status_bar.gps_icon, LV_ALIGN_RIGHT_MID, -115, 0);
+        status_bar_gps_update();
 
         // 创建wifi信号强度图标
         _registry.status_bar.wifi_signal_icon = lv_label_create(_registry.status_bar.root);
         lv_obj_set_style_text_color(_registry.status_bar.wifi_signal_icon, lv_color_white(), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
         lv_obj_set_style_text_font(_registry.status_bar.wifi_signal_icon, &lv_font_montserrat_22, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
         lv_label_set_text(_registry.status_bar.wifi_signal_icon, LV_SYMBOL_WIFI);
-        lv_obj_align(_registry.status_bar.wifi_signal_icon, LV_ALIGN_RIGHT_MID, -40, 0); // 将信号强度图标对齐到右中间
+        lv_obj_align(_registry.status_bar.wifi_signal_icon, LV_ALIGN_RIGHT_MID, -155, 0);
         status_bar_wifi_connect_status_update();
     }
 
@@ -2395,7 +2485,7 @@ namespace Lvgl_Ui
 
         // 创建标题
         lv_obj_t *title_label = lv_label_create(_registry.win.cit.esp32c6_at_test.root);
-        lv_label_set_text(title_label, "Esp32c6 At");
+        lv_label_set_text(title_label, "ADS-B");
         lv_obj_set_style_text_color(title_label, lv_color_white(), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
         lv_obj_set_style_text_align(title_label, LV_TEXT_ALIGN_LEFT, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
         lv_obj_set_style_text_font(title_label, &lv_font_montserrat_48, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
@@ -2415,7 +2505,7 @@ namespace Lvgl_Ui
         _registry.win.cit.esp32c6_at_test.data_label = lv_label_create(container);
         lv_obj_set_style_text_color(_registry.win.cit.esp32c6_at_test.data_label, lv_color_black(), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
         lv_obj_set_style_text_font(_registry.win.cit.esp32c6_at_test.data_label, &lv_font_montserrat_24, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
-        lv_label_set_text(_registry.win.cit.esp32c6_at_test.data_label, "esp32c6 at time data:");
+        lv_label_set_text(_registry.win.cit.esp32c6_at_test.data_label, "ADS-B receiver status:");
         lv_obj_align(_registry.win.cit.esp32c6_at_test.data_label, LV_ALIGN_CENTER, 0, 0);
 
         // 创建一个容器来存放两个按键
