@@ -605,13 +605,18 @@ namespace Lvgl_Ui
 
         Rf_Chip_Type _rf_chip_type = Rf_Chip_Type::SX1262;
 
-#if defined CONFIG_SCREEN_TYPE_HI8561
-        Hi8561_Touch::Touch_Point _touch_point;
-#elif defined CONFIG_SCREEN_TYPE_RM69A10
-        Gt9895::Touch_Point _touch_point;
-#else
-#error "unknown macro definition, please select the correct macro definition."
-#endif
+        // Generic touch point — compatible with both Hi8561_Touch and Gt9895
+        struct TouchInfo {
+            uint16_t x = 0;
+            uint16_t y = 0;
+            uint16_t pressure_value = 0;
+        };
+        struct TouchPoint {
+            uint8_t finger_count = 0;
+            bool edge_touch_flag = false;
+            std::vector<TouchInfo> info;
+        };
+        TouchPoint _touch_point;
 
         bool _edge_touch_flag = false;
 
@@ -654,6 +659,12 @@ namespace Lvgl_Ui
         System(uint32_t width, uint32_t height)
             : _width(width), _height(height)
         {
+        }
+
+        // Update screen dimensions after runtime detection, before begin()
+        void set_screen_size(uint32_t width, uint32_t height) {
+            _width = width;
+            _height = height;
         }
 
         void begin(bool has_sd = true);

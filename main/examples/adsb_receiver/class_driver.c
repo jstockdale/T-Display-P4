@@ -20,7 +20,7 @@
 #define CLIENT_NUM_EVENT_MSG  5
 #define CPR_MAX_AGE_US        10000000LL   // 10 seconds
 #define CPR_CACHE_SIZE        256
-#define AIRCRAFT_TABLE_SIZE   64
+#define AIRCRAFT_TABLE_SIZE   256
 #define AIRCRAFT_MAX_AGE_US   60000000LL   // 60 seconds
 
 #define ADSB_READER_TASK_STACK  (8 * 1024)

@@ -10,6 +10,7 @@
 #include "cpp_bus_driver_library.h"
 #include "t_display_p4_driver.h"
 #include "esp_ldo_regulator.h"
+#include "screen_detect.h"
 
 bool Mipi_Dsi_Init(uint8_t num_data_lanes, uint32_t lane_bit_rate_mbps, uint32_t dpi_clock_freq_mhz, lcd_color_rgb_pixel_format_t color_rgb_pixel_format, uint8_t num_fbs, uint32_t width, uint32_t height,
                    uint32_t mipi_dsi_hsync, uint32_t mipi_dsi_hbp, uint32_t mipi_dsi_hfp, uint32_t mipi_dsi_vsync, uint32_t mipi_dsi_vbp, uint32_t mipi_dsi_vfp,
@@ -68,47 +69,46 @@ bool Mipi_Dsi_Init(uint8_t num_data_lanes, uint32_t lane_bit_rate_mbps, uint32_t
             .use_dma2d = true, // use DMA2D to copy draw buffer into frame buffer
         }};
 
-#if defined CONFIG_SCREEN_TYPE_HI8561
-    hi8561_vendor_config_t vendor_config = {
-        .mipi_config = {
-            .dsi_bus = mipi_dsi_bus,
-            .dpi_config = &dpi_config,
-        },
-    };
-    esp_lcd_panel_dev_config_t dev_config = {
-        .reset_gpio_num = -1,
-        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
-        .bits_per_pixel = bits_per_pixel,
-        .vendor_config = &vendor_config,
-    };
-    assert = esp_lcd_new_panel_hi8561(mipi_dbi_io, &dev_config, mipi_dpi_panel);
-    if (assert != ESP_OK)
-    {
-        cpp_assert->assert_log(Cpp_Bus_Driver::Tool::Log_Level::INFO, __FILE__, __LINE__, "esp_lcd_new_panel_hi8561 fail (error code: %#X)\n", assert);
-        return false;
+    // Runtime panel creation — both paths always compiled
+    if (screen_is_rm69a10()) {
+        rm69a10_vendor_config_t vendor_config = {
+            .mipi_config = {
+                .dsi_bus = mipi_dsi_bus,
+                .dpi_config = &dpi_config,
+            },
+        };
+        esp_lcd_panel_dev_config_t dev_config = {
+            .reset_gpio_num = -1,
+            .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
+            .bits_per_pixel = bits_per_pixel,
+            .vendor_config = &vendor_config,
+        };
+        assert = esp_lcd_new_panel_rm69a10(mipi_dbi_io, &dev_config, mipi_dpi_panel);
+        if (assert != ESP_OK)
+        {
+            cpp_assert->assert_log(Cpp_Bus_Driver::Tool::Log_Level::INFO, __FILE__, __LINE__, "esp_lcd_new_panel_rm69a10 fail (error code: %#X)\n", assert);
+            return false;
+        }
+    } else {
+        hi8561_vendor_config_t vendor_config = {
+            .mipi_config = {
+                .dsi_bus = mipi_dsi_bus,
+                .dpi_config = &dpi_config,
+            },
+        };
+        esp_lcd_panel_dev_config_t dev_config = {
+            .reset_gpio_num = -1,
+            .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
+            .bits_per_pixel = bits_per_pixel,
+            .vendor_config = &vendor_config,
+        };
+        assert = esp_lcd_new_panel_hi8561(mipi_dbi_io, &dev_config, mipi_dpi_panel);
+        if (assert != ESP_OK)
+        {
+            cpp_assert->assert_log(Cpp_Bus_Driver::Tool::Log_Level::INFO, __FILE__, __LINE__, "esp_lcd_new_panel_hi8561 fail (error code: %#X)\n", assert);
+            return false;
+        }
     }
-#elif defined CONFIG_SCREEN_TYPE_RM69A10
-    rm69a10_vendor_config_t vendor_config = {
-        .mipi_config = {
-            .dsi_bus = mipi_dsi_bus,
-            .dpi_config = &dpi_config,
-        },
-    };
-    esp_lcd_panel_dev_config_t dev_config = {
-        .reset_gpio_num = -1,
-        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
-        .bits_per_pixel = bits_per_pixel,
-        .vendor_config = &vendor_config,
-    };
-    assert = esp_lcd_new_panel_rm69a10(mipi_dbi_io, &dev_config, mipi_dpi_panel);
-    if (assert != ESP_OK)
-    {
-        cpp_assert->assert_log(Cpp_Bus_Driver::Tool::Log_Level::INFO, __FILE__, __LINE__, "esp_lcd_new_panel_rm69a10 fail (error code: %#X)\n", assert);
-        return false;
-    }
-#else
-#error "unknown macro definition, please select the correct macro definition."
-#endif
 
     return true;
 }
@@ -124,6 +124,37 @@ bool Screen_Init(esp_lcd_panel_handle_t *mipi_dpi_panel)
         return false;
     }
 
+    return true;
+}
+
+bool Screen_Init_Runtime(esp_lcd_panel_handle_t *mipi_dpi_panel)
+{
+    // Use runtime-detected screen parameters instead of compile-time macros
+    if (screen_is_rm69a10()) {
+        if (Mipi_Dsi_Init(RM69A10_SCREEN_DATA_LANE_NUM, RM69A10_SCREEN_LANE_BIT_RATE_MBPS,
+                          RM69A10_SCREEN_MIPI_DSI_DPI_CLK_MHZ, SCREEN_COLOR_RGB_PIXEL_FORMAT,
+                          0, RM69A10_SCREEN_WIDTH, RM69A10_SCREEN_HEIGHT,
+                          RM69A10_SCREEN_MIPI_DSI_HSYNC, RM69A10_SCREEN_MIPI_DSI_HBP,
+                          RM69A10_SCREEN_MIPI_DSI_HFP, RM69A10_SCREEN_MIPI_DSI_VSYNC,
+                          RM69A10_SCREEN_MIPI_DSI_VBP, RM69A10_SCREEN_MIPI_DSI_VFP,
+                          SCREEN_BITS_PER_PIXEL, mipi_dpi_panel) == false)
+        {
+            printf("Mipi_Dsi_Init fail (RM69A10)\n");
+            return false;
+        }
+    } else {
+        if (Mipi_Dsi_Init(HI8561_SCREEN_DATA_LANE_NUM, HI8561_SCREEN_LANE_BIT_RATE_MBPS,
+                          HI8561_SCREEN_MIPI_DSI_DPI_CLK_MHZ, SCREEN_COLOR_RGB_PIXEL_FORMAT,
+                          0, HI8561_SCREEN_WIDTH, HI8561_SCREEN_HEIGHT,
+                          HI8561_SCREEN_MIPI_DSI_HSYNC, HI8561_SCREEN_MIPI_DSI_HBP,
+                          HI8561_SCREEN_MIPI_DSI_HFP, HI8561_SCREEN_MIPI_DSI_VSYNC,
+                          HI8561_SCREEN_MIPI_DSI_VBP, HI8561_SCREEN_MIPI_DSI_VFP,
+                          SCREEN_BITS_PER_PIXEL, mipi_dpi_panel) == false)
+        {
+            printf("Mipi_Dsi_Init fail (HI8561)\n");
+            return false;
+        }
+    }
     return true;
 }
 

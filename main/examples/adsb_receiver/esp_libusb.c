@@ -1,6 +1,7 @@
 #include "usb/usb_host.h"
 #include "esp_log.h"
 #include "esp_libusb.h"
+#include "esp_heap_caps.h"
 #include <string.h>
 
 #define RTLSDR_BUF_LEN (16384 + 512)
@@ -15,7 +16,6 @@ void init_adsb_dev()
         return;
     }
     adsbdev->is_adsb = true;
-    adsbdev->transfer = NULL;  // explicitly NULL so alloc_adsb_transfer runs
 
     // Pre-allocate control transfer buffer once — eliminates the rapid
     // alloc/free cycle during R820T tuner init that fragments internal
@@ -29,16 +29,34 @@ void init_adsb_dev()
     if (adsbdev->response_buf == NULL) {
         ESP_LOGE(TAG_ADSB, "response_buf pre-alloc failed");
     }
+
+    // Pre-allocate bulk transfer buffer NOW, before R820T tuner init
+    // fragments internal DMA-capable RAM.  On RM69A10 (AMOLED) builds
+    // there's ~10 KB less internal RAM, so allocating after tuner init
+    // fails with ESP_ERR_NO_MEM due to fragmentation.
+    r = usb_host_transfer_alloc(RTLSDR_BUF_LEN + 512, 0, &adsbdev->transfer);
+    if (r != ESP_OK) {
+        ESP_LOGE(TAG_ADSB, "bulk transfer pre-alloc failed: %d", r);
+        adsbdev->transfer = NULL;
+    } else {
+        ESP_LOGI(TAG_ADSB, "bulk transfer pre-alloc success");
+    }
 }
 
 void alloc_adsb_transfer(void) {
-    if (adsbdev != NULL && adsbdev->transfer == NULL) {
-        esp_err_t r = usb_host_transfer_alloc(RTLSDR_BUF_LEN + 512, 0, &adsbdev->transfer);
-        if (r != ESP_OK) {
-            ESP_LOGE(TAG_ADSB, "transfer alloc failed: %d", r);
-        } else {
-            ESP_LOGI(TAG_ADSB, "transfer alloc success");
-        }
+    if (adsbdev == NULL) return;
+    if (adsbdev->transfer != NULL) {
+        ESP_LOGI(TAG_ADSB, "transfer alloc: already pre-allocated");
+        return;
+    }
+    // Fallback: try late allocation if pre-alloc failed
+    ESP_LOGW(TAG_ADSB, "transfer alloc: pre-alloc missed, trying late alloc");
+    esp_err_t r = usb_host_transfer_alloc(RTLSDR_BUF_LEN + 512, 0, &adsbdev->transfer);
+    if (r != ESP_OK) {
+        ESP_LOGE(TAG_ADSB, "transfer alloc failed: %d (internal free: %ld)",
+                 r, (long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    } else {
+        ESP_LOGI(TAG_ADSB, "transfer late alloc success");
     }
 }
 

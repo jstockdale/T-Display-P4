@@ -325,24 +325,27 @@ auto ESP32C6_AT = std::make_unique<Cpp_Bus_Driver::Esp_At>(ESP32C6_AT_SDIO_Bus,
 auto SX1262 = std::make_unique<Cpp_Bus_Driver::Sx126x>(SX1262_SPI_Bus, Cpp_Bus_Driver::Sx126x::Chip_Type::SX1262, SX1262_BUSY,
                                                        SX1262_CS, DEFAULT_CPP_BUS_DRIVER_VALUE);
 
+// Screen detection globals — set by detect_screen_type() before display init
+#include "screen_detect.h"
+screen_type_t g_screen_type = SCREEN_TYPE_UNKNOWN;
+uint32_t g_screen_width = HI8561_SCREEN_WIDTH;   // default until detected
+uint32_t g_screen_height = HI8561_SCREEN_HEIGHT;
+
 #if defined SCREEN_ROTATION_DIRECTION_0
-auto System_Ui = std::make_unique<Lvgl_Ui::System>(SCREEN_WIDTH, SCREEN_HEIGHT);
+auto System_Ui = std::make_unique<Lvgl_Ui::System>(SCREEN_WIDTH_MAX, SCREEN_HEIGHT_MAX);
 #elif defined SCREEN_ROTATION_DIRECTION_90
-auto System_Ui = std::make_unique<Lvgl_Ui::System>(SCREEN_HEIGHT, SCREEN_WIDTH);
+auto System_Ui = std::make_unique<Lvgl_Ui::System>(SCREEN_HEIGHT_MAX, SCREEN_WIDTH_MAX);
 #else
 #error "unknown macro definition, please select the correct macro definition."
 #endif
 
-#if defined CONFIG_SCREEN_TYPE_HI8561
+// Both touch drivers always constructed — only the detected one gets begin()
 auto HI8561_T_IIC_Bus = std::make_shared<Cpp_Bus_Driver::Hardware_Iic_1>(HI8561_TOUCH_SDA, HI8561_TOUCH_SCL, I2C_NUM_0);
 auto HI8561_T = std::make_unique<Cpp_Bus_Driver::Hi8561_Touch>(HI8561_T_IIC_Bus, HI8561_TOUCH_IIC_ADDRESS, DEFAULT_CPP_BUS_DRIVER_VALUE);
-#elif defined CONFIG_SCREEN_TYPE_RM69A10
+
 auto GT9895_IIC_Bus = std::make_shared<Cpp_Bus_Driver::Hardware_Iic_1>(GT9895_TOUCH_SDA, GT9895_TOUCH_SCL, I2C_NUM_0);
 auto GT9895 = std::make_unique<Cpp_Bus_Driver::Gt9895>(GT9895_IIC_Bus, GT9895_IIC_ADDRESS, GT9895_X_SCALE_FACTOR, GT9895_Y_SCALE_FACTOR,
                                                        DEFAULT_CPP_BUS_DRIVER_VALUE);
-#else
-#error "unknown macro definition, please select the correct macro definition."
-#endif
 
 #if defined CONFIG_BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
 
@@ -1977,48 +1980,33 @@ void my_touchpad_read(lv_indev_t *indev, lv_indev_data_t *data)
         }
     }
 
-#if defined CONFIG_SCREEN_TYPE_HI8561
+    // --- Unified touch input: runtime screen type detection ---
+    bool got_touch = false;
+    Lvgl_Ui::System::TouchPoint tp;
 
-    Cpp_Bus_Driver::Hi8561_Touch::Touch_Point tp;
-
-    if (HI8561_T->get_multiple_touch_point(tp) == true)
-    {
-        if (System_Ui->get_current_win() == Lvgl_Ui::System::Current_Win::CIT_TOUCH_TEST)
-        {
-            data->point.x = tp.info[0].x;
-            data->point.y = tp.info[0].y;
-            data->state = LV_INDEV_STATE_PR;
+    if (screen_is_rm69a10()) {
+        Cpp_Bus_Driver::Gt9895::Touch_Point raw;
+        if (GT9895->get_multiple_touch_point(raw)) {
+            tp.finger_count = raw.finger_count;
+            tp.edge_touch_flag = raw.edge_touch_flag;
+            for (auto &pt : raw.info)
+                tp.info.push_back({pt.x, pt.y, pt.pressure_value});
+            got_touch = true;
+            raw.info.clear();
         }
-        else
-        {
-            if ((tp.finger_count == 1) && (tp.info[0].x != static_cast<uint16_t>(-1)) && (tp.info[0].y != static_cast<uint16_t>(-1)) && (tp.info[0].pressure_value != 0))
-            {
-                data->point.x = tp.info[0].x;
-                data->point.y = tp.info[0].y;
-                data->state = LV_INDEV_STATE_PR;
-            }
-            else
-                data->state = LV_INDEV_STATE_REL;
+    } else {
+        Cpp_Bus_Driver::Hi8561_Touch::Touch_Point raw;
+        if (HI8561_T->get_multiple_touch_point(raw)) {
+            tp.finger_count = raw.finger_count;
+            tp.edge_touch_flag = raw.edge_touch_flag;
+            for (auto &pt : raw.info)
+                tp.info.push_back({pt.x, pt.y, pt.pressure_value});
+            got_touch = true;
+            raw.info.clear();
         }
-
-        if (tp.edge_touch_flag == true)
-        {
-            System_Ui->_edge_touch_flag = true;
-            edge_touch_scheduled_shutdown_time = esp_log_timestamp() + 100;
-            edge_touch_scheduled_shutdown_lock = true;
-        }
-
-        System_Ui->_touch_point = tp;
-        tp.info.clear();
     }
-    else
-        data->state = LV_INDEV_STATE_REL;
 
-#elif defined CONFIG_SCREEN_TYPE_RM69A10
-
-    Cpp_Bus_Driver::Gt9895::Touch_Point tp;
-
-    if (GT9895->get_multiple_touch_point(tp) == true)
+    if (got_touch)
     {
         if (System_Ui->get_current_win() == Lvgl_Ui::System::Current_Win::CIT_TOUCH_TEST)
         {
@@ -2046,26 +2034,19 @@ void my_touchpad_read(lv_indev_t *indev, lv_indev_data_t *data)
             edge_touch_scheduled_shutdown_lock = true;
         }
 #elif defined CONFIG_BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
-        if ((tp.info[0].y < 20) || ((tp.info[0].y > SCREEN_HEIGHT - 20) && (tp.info[0].y <= SCREEN_HEIGHT)))
+        if ((tp.info[0].y < 20) || ((tp.info[0].y > g_screen_height - 20) && (tp.info[0].y <= g_screen_height)))
         {
             tp.edge_touch_flag = true;
             System_Ui->_edge_touch_flag = true;
             edge_touch_scheduled_shutdown_time = esp_log_timestamp() + 200;
             edge_touch_scheduled_shutdown_lock = true;
         }
-#else
-#error "unknown macro definition, please select the correct macro definition."
 #endif
 
         System_Ui->_touch_point = tp;
-        tp.info.clear();
     }
     else
         data->state = LV_INDEV_STATE_REL;
-
-#else
-#error "unknown macro definition, please select the correct macro definition."
-#endif
 }
 
 #if defined CONFIG_BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
@@ -2630,12 +2611,13 @@ void Lvgl_Init(void)
 
     lv_init();
 
-    lv_display_t *display = lv_display_create(SCREEN_WIDTH, SCREEN_HEIGHT);
+    lv_display_t *display = lv_display_create(g_screen_width, g_screen_height);
     lv_display_set_user_data(display, Screen_Mipi_Dpi_Panel);
     lv_display_set_color_format(display, LVGL_COLOR_FORMAT);
 
     printf("allocate separate lvgl draw buffers\n");
-    size_t draw_buffer_sz = SCREEN_WIDTH * SCREEN_HEIGHT * sizeof(lv_color_t);
+    // Allocate for max screen size so buffer works for either variant
+    size_t draw_buffer_sz = SCREEN_WIDTH_MAX * SCREEN_HEIGHT_MAX * sizeof(lv_color_t);
     void *buf1 = heap_caps_malloc(draw_buffer_sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT | MALLOC_CAP_DMA);
     assert(buf1);
     lv_display_set_buffers(display, buf1, NULL, draw_buffer_sz, LV_DISPLAY_RENDER_MODE_PARTIAL);
@@ -2705,24 +2687,24 @@ void Lvgl_Init(void)
                                     switch (rotation)
                                     {
                                     case LV_DISPLAY_ROTATION_90:
-                                        rx1 = offsety1; ry1 = SCREEN_HEIGHT - offsetx2 - 1;
-                                        rx2 = offsety2; ry2 = SCREEN_HEIGHT - offsetx1 - 1;
+                                        rx1 = offsety1; ry1 = (int32_t)g_screen_height - offsetx2 - 1;
+                                        rx2 = offsety2; ry2 = (int32_t)g_screen_height - offsetx1 - 1;
                                         break;
                                     case LV_DISPLAY_ROTATION_180:
-                                        rx1 = SCREEN_WIDTH - offsetx2 - 1; ry1 = SCREEN_HEIGHT - offsety2 - 1;
-                                        rx2 = SCREEN_WIDTH - offsetx1 - 1; ry2 = SCREEN_HEIGHT - offsety1 - 1;
+                                        rx1 = (int32_t)g_screen_width - offsetx2 - 1; ry1 = (int32_t)g_screen_height - offsety2 - 1;
+                                        rx2 = (int32_t)g_screen_width - offsetx1 - 1; ry2 = (int32_t)g_screen_height - offsety1 - 1;
                                         break;
                                     case LV_DISPLAY_ROTATION_270:
-                                        rx1 = SCREEN_WIDTH - offsety2 - 1; ry1 = offsetx1;
-                                        rx2 = SCREEN_WIDTH - offsety1 - 1; ry2 = offsetx2;
+                                        rx1 = (int32_t)g_screen_width - offsety2 - 1; ry1 = offsetx1;
+                                        rx2 = (int32_t)g_screen_width - offsety1 - 1; ry2 = offsetx2;
                                         break;
                                     default: break;
                                     }
 
                                     rx1 = (rx1 < 0) ? 0 : rx1;
                                     ry1 = (ry1 < 0) ? 0 : ry1;
-                                    rx2 = (rx2 >= SCREEN_WIDTH)  ? SCREEN_WIDTH  - 1 : rx2;
-                                    ry2 = (ry2 >= SCREEN_HEIGHT) ? SCREEN_HEIGHT - 1 : ry2;
+                                    rx2 = (rx2 >= (int32_t)g_screen_width)  ? (int32_t)g_screen_width  - 1 : rx2;
+                                    ry2 = (ry2 >= (int32_t)g_screen_height) ? (int32_t)g_screen_height - 1 : ry2;
                                     if (rx1 > rx2) { int32_t t = rx1; rx1 = rx2; rx2 = t; }
                                     if (ry1 > ry2) { int32_t t = ry1; ry1 = ry2; ry2 = t; }
 
@@ -2738,7 +2720,7 @@ void Lvgl_Init(void)
                                     uint32_t dest_stride = lv_draw_buf_width_to_stride(lv_area_get_width(&rotated_area), cf);
                                     int32_t src_w = lv_area_get_width(area);
                                     int32_t src_h = lv_area_get_height(area);
-                                    auto rotated_buf = std::make_unique<uint8_t[]>(SCREEN_WIDTH * SCREEN_HEIGHT * (SCREEN_BITS_PER_PIXEL / 8));
+                                    auto rotated_buf = std::make_unique<uint8_t[]>(g_screen_width * g_screen_height * (SCREEN_BITS_PER_PIXEL / 8));
                                     lv_draw_sw_rotate(px_map, rotated_buf.get(), src_w, src_h, src_stride, dest_stride, rotation, cf);
                                     area = &rotated_area;
                                     px_map = rotated_buf.get();
@@ -3049,8 +3031,8 @@ void camera_video_frame_operation(uint8_t *camera_buf, uint8_t camera_buf_index,
         printf("camera_buf_hes: %lu, camera_buf_ves: %lu, camera_buf_len: %d KB\n", camera_buf_hes, camera_buf_ves, camera_buf_len / 1024);
     }
 
-    uint32_t input_img_block_width = (camera_buf_hes - SCREEN_WIDTH) / 2;
-    uint32_t input_img_width = SCREEN_WIDTH;
+    uint32_t input_img_block_width = (camera_buf_hes - g_screen_width) / 2;
+    uint32_t input_img_width = g_screen_width;
     uint32_t input_img_height = camera_buf_ves;
     uint32_t output_img_width = input_img_width;
     uint32_t output_img_height = input_img_height;
@@ -3089,11 +3071,7 @@ void camera_video_frame_operation(uint8_t *camera_buf, uint8_t camera_buf_index,
             .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
             .scale_x = 1, .scale_y = 1, .mirror_x = false,
 #if defined SCREEN_ROTATION_DIRECTION_0
-#if defined CONFIG_SCREEN_TYPE_HI8561
-            .mirror_y = true,
-#elif defined CONFIG_SCREEN_TYPE_RM69A10
-            .mirror_y = false,
-#endif
+            .mirror_y = screen_is_hi8561(),  // HI8561 needs Y mirror in portrait
 #elif defined SCREEN_ROTATION_DIRECTION_90
             .mirror_y = false,
 #endif
@@ -3110,8 +3088,8 @@ void camera_video_frame_operation(uint8_t *camera_buf, uint8_t camera_buf_index,
 
     if (System_Ui->get_current_win() == Lvgl_Ui::System::Current_Win::CAMERA)
     {
-        assert = esp_lcd_panel_draw_bitmap(Screen_Mipi_Dpi_Panel, 0, (SCREEN_HEIGHT - output_img_height) / 2,
-                                           output_img_width, output_img_height + ((SCREEN_HEIGHT - output_img_height) / 2),
+        assert = esp_lcd_panel_draw_bitmap(Screen_Mipi_Dpi_Panel, 0, (g_screen_height - output_img_height) / 2,
+                                           output_img_width, output_img_height + ((g_screen_height - output_img_height) / 2),
                                            output_buffer);
         if (assert != ESP_OK)
         {
@@ -3424,6 +3402,36 @@ extern "C" void app_main(void)
     XL9535->pin_mode(XL9535_ETHERNET_RST, Cpp_Bus_Driver::Xl95x5::Mode::OUTPUT);
     XL9535->pin_write(XL9535_ETHERNET_RST, Cpp_Bus_Driver::Xl95x5::Value::HIGH);
 
+    // --- Runtime screen detection via I2C probe ---
+    // Both touch ICs share I2C_NUM_0 (SDA=7, SCL=8) with XL9535.
+    // GT9895 (AMOLED) is at 0x5D; HI8561 (LCD) touch is at 0x68.
+    // Probe GT9895 first — if begin() succeeds, this is the AMOLED variant.
+    // Detection MUST happen before Screen_Init_Runtime() and backlight PWM.
+    {
+        GT9895_IIC_Bus->set_bus_handle(XL9535_IIC_Bus->get_bus_handle());
+        HI8561_T_IIC_Bus->set_bus_handle(XL9535_IIC_Bus->get_bus_handle());
+
+        bool gt9895_found = GT9895->begin();
+        if (gt9895_found) {
+            g_screen_type = SCREEN_TYPE_RM69A10;
+            g_screen_width = RM69A10_SCREEN_WIDTH;
+            g_screen_height = RM69A10_SCREEN_HEIGHT;
+        } else {
+            HI8561_T->begin();
+            g_screen_type = SCREEN_TYPE_HI8561;
+            g_screen_width = HI8561_SCREEN_WIDTH;
+            g_screen_height = HI8561_SCREEN_HEIGHT;
+        }
+        printf("[SCREEN] Detected: %s\n", screen_type_name());
+
+        // Update UI layout dimensions to match detected screen
+#if defined SCREEN_ROTATION_DIRECTION_0
+        System_Ui->set_screen_size(g_screen_width, g_screen_height);
+#elif defined SCREEN_ROTATION_DIRECTION_90
+        System_Ui->set_screen_size(g_screen_height, g_screen_width);
+#endif
+    }
+
     // Kill SD card power immediately — resets the card's internal state
     // machine if a previous hard reset left it stuck mid-transaction.
     // Power stays off through the rest of peripheral init (~5 seconds),
@@ -3433,12 +3441,10 @@ extern "C" void app_main(void)
 
     Ethernet_Init();
 
-#if defined CONFIG_SCREEN_TYPE_HI8561
-    HI8561_T->create_pwm(HI8561_SCREEN_BL, ledc_channel_t::LEDC_CHANNEL_0, 2000);
-#elif defined CONFIG_SCREEN_TYPE_RM69A10
-#else
-#error "unknown macro definition"
-#endif
+    // HI8561 uses PWM for backlight; RM69A10 uses MIPI DSI brightness command
+    if (screen_is_hi8561()) {
+        HI8561_T->create_pwm(HI8561_SCREEN_BL, ledc_channel_t::LEDC_CHANNEL_0, 2000);
+    }
 
     if (SGM38121->begin() == false)
     {
@@ -3500,7 +3506,7 @@ extern "C" void app_main(void)
 #if CONFIG_ENABLE_USB_DISPLAY == true
     Usb_Screen_Init(&Screen_Mipi_Dpi_Panel);
 #else
-    Screen_Init(&Screen_Mipi_Dpi_Panel);
+    Screen_Init_Runtime(&Screen_Mipi_Dpi_Panel);
 #endif
 
     // Stock LilyGO init sequence: Screen_Init() → esp_lcd_panel_init() only.
@@ -3509,15 +3515,7 @@ extern "C" void app_main(void)
     esp_err_t assert = esp_lcd_panel_init(Screen_Mipi_Dpi_Panel);
     if (assert != ESP_OK) printf("esp_lcd_panel_init fail (error code: %#X)\n", assert);
 
-#if defined CONFIG_SCREEN_TYPE_HI8561
-    HI8561_T_IIC_Bus->set_bus_handle(XL9535_IIC_Bus->get_bus_handle());
-    HI8561_T->begin();
-#elif defined CONFIG_SCREEN_TYPE_RM69A10
-    GT9895_IIC_Bus->set_bus_handle(XL9535_IIC_Bus->get_bus_handle());
-    GT9895->begin();
-#else
-#error "unknown macro definition"
-#endif
+    // Touch driver already initialized in screen detection above
 
     // ESP32C6_AT->begin() is intentionally skipped — we use ESP-Hosted
     // protocol instead of AT commands for WiFi. Calling AT begin() would
@@ -3658,17 +3656,15 @@ extern "C" void app_main(void)
 
 #if CONFIG_ENABLE_USB_DISPLAY == true
 #else
-#if defined CONFIG_SCREEN_TYPE_HI8561
-    HI8561_T->start_pwm_gradient_time(100, 500);
-#elif defined CONFIG_SCREEN_TYPE_RM69A10
-    for (uint8_t i = 0; i < 255; i += 5)
-    {
-        set_rm69a10_brightness(Screen_Mipi_Dpi_Panel, i);
-        vTaskDelay(pdMS_TO_TICKS(10));
+    if (screen_is_hi8561()) {
+        HI8561_T->start_pwm_gradient_time(100, 500);
+    } else {
+        for (uint8_t i = 0; i < 255; i += 5)
+        {
+            set_rm69a10_brightness(Screen_Mipi_Dpi_Panel, i);
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
     }
-#else
-#error "unknown macro definition"
-#endif
 #endif
 
     PCF8563_IIC_Bus->set_bus_handle(XL9535_IIC_Bus->get_bus_handle());

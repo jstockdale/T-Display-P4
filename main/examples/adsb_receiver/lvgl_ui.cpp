@@ -10,6 +10,7 @@
 #include "esp_mac.h"
 #include "esp_flash.h"
 #include "t_display_p4_driver.h"
+#include "screen_detect.h"
 
 namespace Lvgl_Ui
 {
@@ -67,13 +68,7 @@ namespace Lvgl_Ui
 #endif
             {"software name: ", "lvgl_9_ui"},
 
-#if defined CONFIG_SCREEN_TYPE_HI8561
-            {"screen type: ", "hi8561"},
-#elif defined CONFIG_SCREEN_TYPE_RM69A10
-            {"screen type: ", "rm69a10"},
-#else
-#error "unknown macro definition, please select the correct macro definition."
-#endif
+            {"screen type: ", "detecting..."},  // overridden at runtime in begin()
 
 #if defined CONFIG_SCREEN_PIXEL_FORMAT_RGB565
             {"screen pixel format: ", "rgb565"},
@@ -155,6 +150,9 @@ namespace Lvgl_Ui
         _device_information_list[6].info = free_heap_size_str;
 
         _device_information_list[7].info = esp_get_idf_version();
+
+        // Runtime screen type (detected by I2C probe in main.cpp)
+        _device_information_list[11].info = screen_is_rm69a10() ? "rm69a10 (amoled)" : "hi8561 (lcd)";
 
 #if defined CONFIG_BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
         _registry.keyboard_group = lv_group_create();
@@ -417,21 +415,19 @@ namespace Lvgl_Ui
         lv_obj_set_style_bg_color(_registry.win.home.root, lv_color_black(), (lv_style_selector_t)LV_PART_MAIN);
 
 #if defined SCREEN_ROTATION_DIRECTION_0
-#if defined CONFIG_SCREEN_TYPE_HI8561
-        if (_has_sd) lv_obj_set_style_bg_image_src(_registry.win.home.root, GET_WALLPAPER_PATH("wallpaper_1_540x1168px.png"), (lv_style_selector_t)LV_PART_MAIN);
-#elif defined CONFIG_SCREEN_TYPE_RM69A10
-        if (_has_sd) lv_obj_set_style_bg_image_src(_registry.win.home.root, GET_WALLPAPER_PATH("wallpaper_1_568x1232px.png"), (lv_style_selector_t)LV_PART_MAIN);
-#else
-#error "unknown macro definition, please select the correct macro definition."
-#endif
+        if (_has_sd) {
+            if (screen_is_rm69a10())
+                lv_obj_set_style_bg_image_src(_registry.win.home.root, GET_WALLPAPER_PATH("wallpaper_1_568x1232px.png"), (lv_style_selector_t)LV_PART_MAIN);
+            else
+                lv_obj_set_style_bg_image_src(_registry.win.home.root, GET_WALLPAPER_PATH("wallpaper_1_540x1168px.png"), (lv_style_selector_t)LV_PART_MAIN);
+        }
 #elif defined SCREEN_ROTATION_DIRECTION_90
-#if defined CONFIG_SCREEN_TYPE_HI8561
-        if (_has_sd) lv_obj_set_style_bg_image_src(_registry.win.home.root, GET_WALLPAPER_PATH("wallpaper_1_1168x540px.png"), (lv_style_selector_t)LV_PART_MAIN);
-#elif defined CONFIG_SCREEN_TYPE_RM69A10
-        if (_has_sd) lv_obj_set_style_bg_image_src(_registry.win.home.root, GET_WALLPAPER_PATH("wallpaper_1_1232x568px.png"), (lv_style_selector_t)LV_PART_MAIN);
-#else
-#error "unknown macro definition, please select the correct macro definition."
-#endif
+        if (_has_sd) {
+            if (screen_is_rm69a10())
+                lv_obj_set_style_bg_image_src(_registry.win.home.root, GET_WALLPAPER_PATH("wallpaper_1_1232x568px.png"), (lv_style_selector_t)LV_PART_MAIN);
+            else
+                lv_obj_set_style_bg_image_src(_registry.win.home.root, GET_WALLPAPER_PATH("wallpaper_1_1168x540px.png"), (lv_style_selector_t)LV_PART_MAIN);
+        }
 #else
 #error "unknown macro definition, please select the correct macro definition."
 #endif
