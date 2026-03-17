@@ -102,6 +102,8 @@ extern void alloc_adsb_transfer(void);
 extern void adsb_update_display(lv_obj_t *table);
 extern void sd_log_rename_with_time(void);
 extern void sd_log_close(void);
+extern void sd_log_print_status(void);
+extern void sd_clear_dirty_flag(void);
 
 // Receiver position — updated by GPS task, read by ADS-B display/logging
 typedef struct {

@@ -343,6 +343,11 @@ void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg)
 {
     uint32_t crc2; // Computed CRC, used to verify the message CRC.
 
+    // Zero-init all fields so consumers can safely check any field
+    // without worrying about which DF type populated it.
+    memset(mm, 0, sizeof(*mm));
+    mm->errorbit = -1;
+
     // Work on our local copy
     memcpy(mm->msg, msg, MODE_S_LONG_MSG_BYTES);
     msg = mm->msg;
@@ -358,7 +363,6 @@ void mode_s_decode(mode_s_t *self, struct mode_s_msg *mm, unsigned char *msg)
     crc2 = mode_s_checksum(msg, mm->msgbits);
 
     // Check CRC and fix single bit errors using the CRC when possible (DF 11 and 17).
-    mm->errorbit = -1; // No error
     mm->crcok = (mm->crc == crc2);
 
     if (!mm->crcok && self->fix_errors && (mm->msgtype == 11 || mm->msgtype == 17))

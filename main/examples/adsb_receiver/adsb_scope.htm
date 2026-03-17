@@ -10,40 +10,45 @@
   @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Space+Grotesk:wght@400;600;700&display=swap');
   :root { --bg:#0a0e14; --panel:#111820; --panel-border:#1e2a36; --text:#c8d6e5; --text-dim:#5c7080; --accent:#00e5a0; --accent-dim:rgba(0,229,160,0.15); --warning:#ff6b35; --blue:#4dabf7; }
   *{margin:0;padding:0;box-sizing:border-box}
-  body{background:var(--bg);color:var(--text);font-family:'JetBrains Mono',monospace;height:100vh;overflow:hidden}
+  body{background:var(--bg);color:var(--text);font-family:'JetBrains Mono',monospace;height:100vh;overflow:hidden;-webkit-tap-highlight-color:transparent}
   #map{position:absolute;inset:0;z-index:1}
   .leaflet-tile-pane{filter:saturate(0.3) brightness(0.55) contrast(1.2)}
   .leaflet-control-attribution{display:none!important}
-  #topbar{position:absolute;top:0;left:0;right:0;z-index:1000;background:linear-gradient(180deg,rgba(10,14,20,0.95),rgba(10,14,20,0.7));backdrop-filter:blur(10px);padding:10px 20px;display:flex;align-items:center;gap:14px;border-bottom:1px solid var(--panel-border);font-size:12px}
+  #topbar{position:absolute;top:0;left:0;right:0;z-index:1000;background:linear-gradient(180deg,rgba(10,14,20,0.95),rgba(10,14,20,0.7));backdrop-filter:blur(10px);border-bottom:1px solid var(--panel-border);font-size:12px;display:flex;align-items:center;gap:14px;padding:10px 20px;flex-wrap:wrap}
+  #topbar-spacer{flex:1 1 0;min-width:0}
+  #topbar-right{display:flex;align-items:center;gap:8px;flex-shrink:0;margin-left:auto}
   #topbar .logo{font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:15px;color:var(--accent);letter-spacing:-0.5px;white-space:nowrap}
   #topbar .logo span{color:var(--text-dim);font-weight:400}
+  .scope-ver{font-size:10px;opacity:0.5}
   .stat{display:flex;align-items:center;gap:5px;color:var(--text-dim)}.stat .val{color:var(--text);font-weight:600}.stat .val.live{color:var(--accent)}
-  .topbtn{background:transparent;color:var(--text-dim);border:1px solid var(--panel-border);padding:4px 10px;border-radius:4px;font-family:inherit;font-size:11px;font-weight:600;cursor:pointer;text-transform:uppercase;letter-spacing:0.5px}
+  .topbtn{background:transparent;color:var(--text-dim);border:1px solid var(--panel-border);padding:4px 10px;border-radius:4px;font-family:inherit;font-size:11px;font-weight:600;cursor:pointer;text-transform:uppercase;letter-spacing:0.5px;white-space:nowrap;min-height:32px;touch-action:manipulation}
   .topbtn:hover{border-color:var(--text-dim);color:var(--text)}.topbtn.active{border-color:var(--accent);color:var(--accent)}
-  #connect-btn{margin-left:auto;background:var(--accent);color:var(--bg);border:none;padding:6px 16px;border-radius:4px;font-family:inherit;font-size:12px;font-weight:700;cursor:pointer;text-transform:uppercase;letter-spacing:0.5px}
+  #connect-btn{background:var(--accent);color:var(--bg);border:none;padding:6px 16px;border-radius:4px;font-family:inherit;font-size:12px;font-weight:700;cursor:pointer;text-transform:uppercase;letter-spacing:0.5px;white-space:nowrap;min-height:36px;touch-action:manipulation}
   #connect-btn:hover{filter:brightness(1.15)}#connect-btn.connected{background:transparent;color:var(--accent);border:1px solid var(--accent)}
-  #color-modes{display:flex;gap:3px}
-  #label-modes{display:flex;gap:3px}
-  #color-modes button,#label-modes button{background:transparent;color:var(--text-dim);border:1px solid var(--panel-border);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:10px;cursor:pointer;font-weight:600}
+  #color-modes{display:flex;gap:3px;flex-shrink:0}
+  #label-modes{display:flex;gap:3px;flex-shrink:0}
+  #color-modes button,#label-modes button{background:transparent;color:var(--text-dim);border:1px solid var(--panel-border);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:10px;cursor:pointer;font-weight:600;white-space:nowrap;min-height:28px;min-width:32px;touch-action:manipulation}
   #color-modes button:hover,#label-modes button:hover{border-color:var(--text-dim)}#color-modes button.active,#label-modes button.active{border-color:var(--accent);color:var(--accent)}
   #panel{position:absolute;bottom:0;left:0;right:0;z-index:1000;background:linear-gradient(0deg,rgba(10,14,20,0.97),rgba(10,14,20,0.85));backdrop-filter:blur(10px);border-top:1px solid var(--panel-border);height:35vh;overflow:hidden;display:flex;flex-direction:column}
   #panel.collapsed{height:32px}
-  #panel-drag{height:6px;cursor:ns-resize;flex-shrink:0;display:flex;align-items:center;justify-content:center}
+  #panel-drag{height:12px;cursor:ns-resize;flex-shrink:0;display:flex;align-items:center;justify-content:center;touch-action:none}
   #panel-drag::after{content:'';width:40px;height:3px;background:var(--panel-border);border-radius:2px}
   #panel-drag:hover::after{background:var(--text-dim)}
-  #panel-toggle{width:100%;padding:4px 8px;background:none;border:none;color:var(--text-dim);font-family:inherit;font-size:11px;cursor:pointer;text-align:center;letter-spacing:1px;text-transform:uppercase;flex-shrink:0}
-  #panel-scroll{flex:1;overflow-y:auto}
-  #ac-table{width:100%;border-collapse:collapse;font-size:11px}
+  #panel-toggle{width:100%;padding:4px 8px;background:none;border:none;color:var(--text-dim);font-family:inherit;font-size:11px;cursor:pointer;text-align:center;letter-spacing:1px;text-transform:uppercase;flex-shrink:0;min-height:32px;touch-action:manipulation}
+  #panel-scroll{flex:1;overflow:auto;-webkit-overflow-scrolling:touch}
+  #ac-table{width:100%;border-collapse:collapse;font-size:11px;min-width:700px}
   #ac-table th{position:sticky;top:0;background:var(--panel);color:var(--text-dim);text-align:left;padding:6px 10px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;font-size:10px;border-bottom:1px solid var(--panel-border)}
   #ac-table td{padding:5px 10px;border-bottom:1px solid rgba(30,42,54,0.4);white-space:nowrap}
   #ac-table tr:hover td{background:var(--accent-dim);cursor:pointer}
   #ac-table tr.selected td{background:rgba(77,171,247,0.15)}
   .col-icao{font-weight:600}.col-cs{color:var(--text);font-weight:600}.col-alt{color:var(--accent)}
+  #ac-table th{cursor:pointer;user-select:none;white-space:nowrap}#ac-table th:hover{color:var(--accent)}
+  #ac-table th span{font-size:9px;opacity:0.6}
   .col-vr.climbing{color:var(--accent)}.col-vr.descending{color:var(--warning)}.col-dist{color:var(--text-dim)}
   .leaflet-div-icon{background:none!important;border:none!important}
   .leaflet-control-zoom{display:none!important}
   #zoom-ctrl{position:absolute;right:12px;z-index:1000;display:flex;flex-direction:column;gap:2px}
-  #zoom-ctrl button{width:32px;height:32px;background:var(--panel);color:var(--text);border:1px solid var(--panel-border);border-radius:4px;font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-family:inherit}
+  #zoom-ctrl button{width:40px;height:40px;background:var(--panel);color:var(--text);border:1px solid var(--panel-border);border-radius:4px;font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-family:inherit;touch-action:manipulation}
   #zoom-ctrl button:hover{background:var(--panel-border);color:#fff}
   #legend{display:none;position:absolute;left:12px;z-index:999;background:rgba(17,24,32,0.9);border:1px solid var(--panel-border);border-radius:6px;padding:8px 10px;font-size:10px;color:var(--text-dim)}
   #legend.visible{display:block}
@@ -54,35 +59,125 @@
   #gnss-info .fix{color:var(--accent);font-weight:600}#gnss-info .nofix{color:var(--warning);font-weight:600}
   #sd-info{color:var(--text-dim);font-size:10px;margin-top:4px;padding-top:4px;border-top:1px solid var(--panel-border)}
   #sd-info .sd-ok{color:var(--accent)}#sd-info .sd-err{color:var(--warning)}#sd-info .sd-wait{color:var(--text-dim)}
-  #detail-wrap{position:absolute;top:66px;right:12px;bottom:40vh;z-index:1000;overflow-y:auto;overflow-x:hidden;display:none;flex-direction:column;gap:8px;width:240px;padding-bottom:8px}
+  #detail-wrap{position:absolute;top:66px;right:12px;bottom:40vh;z-index:1000;overflow-y:auto;overflow-x:hidden;display:none;flex-direction:column;gap:8px;width:240px;padding-bottom:8px;-webkit-overflow-scrolling:touch}
   #detail-wrap.visible{display:flex}
   .det-card{background:rgba(17,24,32,0.95);border:1px solid var(--panel-border);border-radius:6px;padding:10px 14px;font-size:12px;color:var(--text);line-height:1.7;flex-shrink:0}
   .det-card .dh{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;border-bottom:1px solid var(--panel-border);padding-bottom:4px}
   .dh .dcs{font-weight:700;font-size:16px;color:var(--accent)}.dh .dicao{color:var(--blue);font-size:11px}
-  .dh .dx{background:none;border:none;color:var(--text-dim);font-size:16px;cursor:pointer;padding:0 4px}.dh .dx:hover{color:var(--text)}
+  .dh .dx{background:none;border:none;color:var(--text-dim);font-size:16px;cursor:pointer;padding:4px 8px;min-width:32px;min-height:32px;display:flex;align-items:center;justify-content:center;touch-action:manipulation}.dh .dx:hover{color:var(--text)}
   .dr{display:flex;justify-content:space-between;gap:16px}.dl{color:var(--text-dim);font-size:10px;text-transform:uppercase;letter-spacing:0.5px}
   .dv{font-weight:600}.dv.up{color:var(--accent)}.dv.dn{color:var(--warning)}
   #log-panel{display:none;position:absolute;top:160px;left:12px;z-index:1001;width:min(640px,calc(100vw - 24px));height:min(400px,calc(100vh - 220px));background:rgba(10,14,20,0.96);border:1px solid var(--panel-border);border-radius:6px;overflow:hidden;flex-direction:column;resize:both}
   #log-panel.visible{display:flex}
   #log-header{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid var(--panel-border);font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:0.5px;flex-shrink:0}
-  #log-header button{background:none;border:none;color:var(--text-dim);font-size:14px;cursor:pointer;padding:2px 6px}#log-header button:hover{color:var(--text)}
+  #log-header button{background:none;border:none;color:var(--text-dim);font-size:14px;cursor:pointer;padding:4px 8px;min-width:32px;min-height:32px;touch-action:manipulation}#log-header button:hover{color:var(--text)}
   #log-controls{display:flex;gap:10px;align-items:center;padding:6px 12px;border-bottom:1px solid var(--panel-border);flex-shrink:0}
-  #log-controls label{font-size:10px;color:var(--text-dim);display:flex;align-items:center;gap:4px;cursor:pointer}
-  #log-controls input[type="checkbox"]{accent-color:var(--accent)}
-  #log-output{flex:1;overflow-y:auto;padding:8px 12px;font-size:10px;line-height:1.5;color:var(--text);white-space:pre;font-family:'JetBrains Mono',monospace}
+  #log-controls label{font-size:10px;color:var(--text-dim);display:flex;align-items:center;gap:4px;cursor:pointer;min-height:32px;touch-action:manipulation}
+  #log-controls input[type="checkbox"]{accent-color:var(--accent);width:16px;height:16px}
+  #log-output{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:8px 12px;font-size:10px;line-height:1.5;color:var(--text);white-space:pre;font-family:'JetBrains Mono',monospace}
   .log-adsb{color:var(--accent)}.log-gnss{color:var(--blue)}.log-info{color:var(--text-dim)}.log-error{color:var(--warning)}.log-scope{color:#c792ea}
   .ac-label{display:inline-block;background:rgba(10,14,20,0.8);border:1px solid rgba(255,255,255,0.08);border-radius:3px;padding:2px 5px;font-family:'JetBrains Mono',monospace;font-size:10px;white-space:nowrap;cursor:pointer;pointer-events:auto;text-shadow:0 0 3px rgba(0,0,0,0.9),0 0 6px rgba(0,0,0,0.7)}
   .ac-label.sel{outline:1.5px solid currentColor;outline-offset:1px;background:rgba(10,14,20,0.85);text-shadow:0 0 6px currentColor,0 0 2px rgba(0,0,0,0.9)}
   .ac-icon{font-size:18px}
+  /* Timeline */
+  #timeline{display:none;position:absolute;top:0;left:0;right:0;z-index:1000;background:rgba(10,14,20,0.95);border-bottom:1px solid var(--panel-border);padding:8px 16px;align-items:center;gap:12px;font-size:11px}
+  #timeline.visible{display:flex}
+  #timeline .tl-time{color:var(--accent);font-weight:600;min-width:170px;font-variant-numeric:tabular-nums}
+  #timeline .tl-speed{color:var(--text-dim);min-width:40px;text-align:center}
+  #tl-scrub{flex:1;height:6px;-webkit-appearance:none;appearance:none;background:var(--panel-border);border-radius:3px;cursor:pointer;outline:none}
+  #tl-scrub::-webkit-slider-thumb{-webkit-appearance:none;width:24px;height:24px;border-radius:50%;background:var(--accent);cursor:grab;border:2px solid var(--bg)}
+  #tl-scrub::-moz-range-thumb{width:24px;height:24px;border-radius:50%;background:var(--accent);cursor:grab;border:2px solid var(--bg)}
+  #timeline button{background:none;border:1px solid var(--panel-border);color:var(--text);border-radius:4px;padding:6px 10px;font-family:inherit;font-size:12px;cursor:pointer;min-width:36px;min-height:36px;touch-action:manipulation}
+  #timeline button:hover{border-color:var(--text-dim)}
+  #timeline button.active{border-color:var(--accent);color:var(--accent)}
+  #csv-btn{background:transparent;color:var(--text-dim);border:1px solid var(--panel-border);padding:4px 10px;border-radius:4px;font-family:inherit;font-size:11px;font-weight:700;cursor:pointer;text-transform:uppercase;letter-spacing:0.5px;white-space:nowrap;min-height:32px;touch-action:manipulation}
+  #csv-btn:hover{border-color:var(--text-dim);color:var(--text)}
+  /* File browser */
+  #files-panel{display:none;position:absolute;top:160px;left:12px;z-index:1002;width:min(500px,calc(100vw - 24px));height:min(400px,calc(100vh - 220px));background:rgba(10,14,20,0.97);border:1px solid var(--panel-border);border-radius:6px;overflow:hidden;flex-direction:column;resize:both}
+  @media(min-width:1100px){#files-panel.side-by-side{left:calc(12px + min(640px,calc(100vw - 24px)) + 12px);width:min(500px,calc(100vw - 688px))}}
+  #files-panel.visible{display:flex}
+  #files-header{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid var(--panel-border);font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:0.5px;flex-shrink:0}
+  #files-header button{background:none;border:none;color:var(--text-dim);font-size:14px;cursor:pointer;padding:4px 8px;min-width:32px;min-height:32px;touch-action:manipulation}#files-header button:hover{color:var(--text)}
+  #files-path{padding:6px 12px;font-size:11px;color:var(--accent);border-bottom:1px solid var(--panel-border);flex-shrink:0}
+  #files-status{padding:4px 12px;font-size:10px;color:var(--text-dim);border-bottom:1px solid var(--panel-border);flex-shrink:0;min-height:22px;position:relative;overflow:hidden}
+  #files-status .dl-bar{position:absolute;left:0;top:0;bottom:0;background:rgba(0,255,170,0.12);transition:width 0.3s ease;pointer-events:none}
+  #files-list{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:4px 0}
+  .file-row{display:flex;align-items:center;padding:6px 12px;gap:10px;cursor:pointer;font-size:11px;touch-action:manipulation}
+  .file-row:hover{background:var(--accent-dim)}
+  .file-icon{width:18px;text-align:center;flex-shrink:0}
+  .file-name{flex:1;color:var(--text);overflow:hidden;text-overflow:ellipsis}
+  .file-name.dir{color:var(--blue);font-weight:600}
+  .file-size{color:var(--text-dim);font-size:10px;min-width:60px;text-align:right}
+  .file-actions{display:flex;gap:3px}
+  .file-actions button{background:var(--panel);border:1px solid var(--panel-border);color:var(--text-dim);border-radius:3px;padding:2px 6px;font-size:9px;cursor:pointer;font-family:inherit;text-transform:uppercase;touch-action:manipulation}
+  .file-actions button:hover{color:var(--accent);border-color:var(--accent)}
+  .file-row.active-log{border-left:2px solid var(--accent)}
+  .file-row.active-log .file-name{color:var(--accent);font-weight:600}
   ::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--panel-border);border-radius:3px}
-  @media(max-width:768px){#topbar{padding:8px 10px;gap:8px;font-size:11px}.stat.hm{display:none}}
+
+  /* ═══ Mobile ═══ */
+  @media(max-width:768px){
+    #topbar{padding:8px 10px;gap:6px}
+    #topbar .logo span{display:none}
+    .stat.hm{display:none}
+    #topbar-spacer{display:none}
+
+    #gnss-info{font-size:10px;padding:6px 10px;max-width:calc(100vw - 70px)}
+    #detail-wrap{top:auto;bottom:calc(30vh + 8px);right:8px;left:auto;width:200px;max-height:40vh}
+    #panel{height:30vh}
+
+    #log-panel{top:auto!important;bottom:0!important;left:0!important;right:0!important;width:100%!important;height:50vh!important;border-radius:6px 6px 0 0;resize:none}
+    #files-panel{top:auto!important;bottom:0!important;left:0!important;right:0!important;width:100%!important;height:50vh!important;border-radius:6px 6px 0 0;resize:none}
+    #flash-panel{width:calc(100vw - 20px);max-height:90vh;overflow-y:auto}
+
+    #timeline{flex-wrap:wrap;padding:6px 10px;gap:6px}
+    #timeline .tl-time{min-width:auto;font-size:10px;order:10;width:100%;text-align:center}
+    #tl-scrub{min-width:0}
+
+    #zoom-ctrl{right:8px}
+    #zoom-ctrl button{width:44px;height:44px}
+
+    #ac-table{font-size:10px}
+    #ac-table th,#ac-table td{padding:5px 6px}
+    .ac-label{font-size:9px}
+  }
+
+  /* ═══ Small phones ═══ */
+  @media(max-width:420px){
+    #topbar .logo{font-size:13px}
+    #connect-btn{padding:6px 8px;font-size:10px;letter-spacing:0}
+    #detail-wrap{display:none!important}
+    #gnss-info{font-size:9px;padding:4px 8px}
+  }
+  /* Flash panel */
+  #flash-panel{display:none;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);z-index:2000;width:min(520px,calc(100vw - 40px));background:rgba(10,14,20,0.98);border:1px solid var(--panel-border);border-radius:8px;overflow:hidden;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,0.6)}
+  #flash-panel.visible{display:flex}
+  #flash-header{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--panel-border);font-size:12px;color:var(--text);font-weight:700;text-transform:uppercase;letter-spacing:0.5px;flex-shrink:0}
+  #flash-header button{background:none;border:none;color:var(--text-dim);font-size:14px;cursor:pointer;padding:4px 8px;min-width:32px;min-height:32px;touch-action:manipulation}#flash-header button:hover{color:var(--text)}
+  #flash-body{padding:16px;font-size:12px;line-height:1.8;color:var(--text-dim)}
+  .flash-row{display:flex;justify-content:space-between;align-items:center;padding:4px 0}.flash-row .fl{text-transform:uppercase;font-size:10px;letter-spacing:0.5px;color:var(--text-dim)}.flash-row .fv{color:var(--text);font-weight:600}
+  .flash-row .fv.ok{color:var(--accent)}.flash-row .fv.warn{color:var(--warning)}
+  #flash-progress{display:none;margin:12px 0}
+  #flash-progress-bar{width:100%;height:6px;background:var(--panel-border);border-radius:3px;overflow:hidden}
+  #flash-progress-fill{height:100%;width:0%;background:var(--accent);border-radius:3px;transition:width 0.3s ease}
+  #flash-progress-text{font-size:10px;color:var(--text-dim);margin-top:4px;font-variant-numeric:tabular-nums}
+  #flash-log{max-height:180px;overflow-y:auto;margin-top:12px;padding:10px;background:rgba(0,0,0,0.3);border-radius:4px;font-size:10px;line-height:1.6;white-space:pre-wrap;font-family:'JetBrains Mono',monospace;color:var(--text-dim)}
+  #flash-log .fl-ok{color:var(--accent)}#flash-log .fl-err{color:var(--warning)}#flash-log .fl-info{color:var(--blue)}
+  #flash-actions{display:flex;gap:8px;margin-top:14px}
+  .flash-btn{flex:1;padding:10px;border-radius:5px;font-family:inherit;font-size:12px;font-weight:700;cursor:pointer;text-transform:uppercase;letter-spacing:0.5px;text-align:center;border:none;min-height:44px;touch-action:manipulation}
+  .flash-btn.primary{background:var(--accent);color:var(--bg)}.flash-btn.primary:hover{filter:brightness(1.15)}
+  .flash-btn.primary:disabled{opacity:0.4;cursor:not-allowed;filter:none}
+  .flash-btn.secondary{background:transparent;color:var(--text-dim);border:1px solid var(--panel-border)}.flash-btn.secondary:hover{border-color:var(--text-dim);color:var(--text)}
+  #flash-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1999}#flash-overlay.visible{display:block}
+  #flash-badge{display:none;width:7px;height:7px;border-radius:50%;background:var(--warning);margin-left:4px;vertical-align:middle;animation:badge-pulse 2s infinite}
+  @keyframes badge-pulse{0%,100%{opacity:1}50%{opacity:0.4}}
 </style>
 </head>
 <body>
 <div id="topbar">
-  <div class="logo">ADS-B SCOPE <span>/ Off by One</span></div>
+  <div class="logo">ADS-B SCOPE <span>/ Off by One <span class="scope-ver">v1.0.2</span></span></div>
   <div class="stat"><span>AC</span><span class="val live" id="ac-count">0</span></div>
-  <div class="stat"><span>MSG</span><span class="val" id="msg-count">0</span></div>
+  <div class="stat hm"><span>MSG</span><span class="val" id="msg-count">0</span></div>
   <div class="stat hm"><span>MSG/s</span><span class="val" id="msg-rate">0</span></div>
   <div id="color-modes">
     <button class="active" onclick="setCM('mono')" id="cm-mono" title="Terminal green">MONO</button>
@@ -94,8 +189,24 @@
     <button class="active" onclick="setLM('alt')" id="lm-alt" title="Show altitude on labels">↕ ALT</button>
     <button onclick="setLM('dist')" id="lm-dist" title="Show distance on labels">↔ DIST</button>
   </div>
-  <button class="topbtn" id="log-btn" onclick="toggleLog()">Log</button>
-  <button id="connect-btn" onclick="toggleSerial()">Connect Serial</button>
+  <div id="topbar-spacer"></div>
+  <div id="topbar-right">
+    <button class="topbtn" id="log-btn" onclick="toggleLog()">Log</button>
+    <button class="topbtn" id="files-btn" onclick="toggleFiles()">Files</button>
+    <button id="csv-btn" onclick="document.getElementById('csv-file').click()">Load CSV</button>
+    <input type="file" id="csv-file" accept=".csv" style="display:none" onchange="loadCSV(this)">
+    <button class="topbtn" id="flash-btn" onclick="toggleFlash()">Flash<span id="flash-badge"></span></button>
+    <button id="connect-btn" onclick="toggleSerial()">Connect Serial</button>
+  </div>
+</div>
+<div id="timeline">
+  <button id="tl-play" onclick="tlToggle()">▶</button>
+  <button onclick="tlSpeed(-1)">−</button>
+  <span class="tl-speed" id="tl-speed">1×</span>
+  <button onclick="tlSpeed(1)">+</button>
+  <input type="range" id="tl-scrub" min="0" max="1000" value="0" oninput="tlScrub(this.value)">
+  <span class="tl-time" id="tl-time">--:--:--</span>
+  <button onclick="tlClose()">✕</button>
 </div>
 <div id="gnss-info">RX: <span id="gnss-status" class="nofix">No fix</span><br><span id="gnss-detail"></span>
 <div id="sd-info">SD: <span id="sd-status" class="sd-wait">waiting</span></div>
@@ -120,15 +231,48 @@
   <button onclick="map.zoomIn()" title="Zoom in">+</button>
   <button onclick="map.zoomOut()" title="Zoom out">−</button>
 </div>
+<div id="files-panel">
+  <div id="files-header">
+    <span>SD Card Files</span>
+    <div style="display:flex;gap:4px">
+      <button onclick="filesRefresh()" title="Refresh">↻</button>
+      <button onclick="toggleFiles()" title="Close">✕</button>
+    </div>
+  </div>
+  <div id="files-path">/sdcard</div>
+  <div id="files-status"></div>
+  <div id="files-list"></div>
+</div>
+<div id="flash-overlay" onclick="toggleFlash()"></div>
+<div id="flash-panel">
+  <div id="flash-header"><span>Firmware Update</span><div style="display:flex;align-items:center;gap:8px"><span style="font-size:10px;color:var(--text-dim);font-weight:400;text-transform:none;letter-spacing:0">ADS-B Scope v1.0.2</span><button onclick="toggleFlash()">✕</button></div></div>
+  <div id="flash-body">
+    <div class="flash-row"><span class="fl">Device Version</span><span class="fv" id="flash-dev-ver">—</span></div>
+    <div class="flash-row"><span class="fl">Latest Version</span><span class="fv" id="flash-latest-ver">—</span></div>
+    <div class="flash-row"><span class="fl">Firmware URL</span><span class="fv" id="flash-fw-url" style="font-size:10px;word-break:break-all">latest.bin</span></div>
+    <div class="flash-row"><span class="fl">Status</span><span class="fv" id="flash-status">Ready</span></div>
+    <div id="flash-progress">
+      <div id="flash-progress-bar"><div id="flash-progress-fill"></div></div>
+      <div id="flash-progress-text">0%</div>
+    </div>
+    <div id="flash-log"></div>
+    <div id="flash-actions">
+      <button class="flash-btn secondary" onclick="document.getElementById('flash-file').click()">Local .bin</button>
+      <input type="file" id="flash-file" accept=".bin" style="display:none" onchange="flashLocalFile(this)">
+      <button class="flash-btn primary" id="flash-go-btn" onclick="startFlash()">Flash Latest</button>
+    </div>
+  </div>
+</div>
 <div id="map"></div>
 <div id="panel">
   <div id="panel-drag"></div>
   <button id="panel-toggle" onclick="togglePanel()">▲ Aircraft ▲</button>
   <div id="panel-scroll">
-  <table id="ac-table"><thead><tr><th>ICAO</th><th>Callsign</th><th>Alt</th><th>Spd</th><th>Hdg</th><th>V/S</th><th>Dist</th><th>Brg</th><th>Age</th></tr></thead><tbody id="ac-tbody"></tbody></table>
+  <table id="ac-table"><thead><tr><th onclick="tblSort('icao')">ICAO <span id="sh-icao"></span></th><th onclick="tblSort('cs')">Callsign <span id="sh-cs"></span></th><th onclick="tblSort('alt')">Alt <span id="sh-alt"></span></th><th onclick="tblSort('spd')">Spd <span id="sh-spd"></span></th><th onclick="tblSort('hdg')">Hdg <span id="sh-hdg"></span></th><th onclick="tblSort('vr')">V/S <span id="sh-vr"></span></th><th onclick="tblSort('dist')">Dist <span id="sh-dist"></span></th><th onclick="tblSort('brg')">Brg <span id="sh-brg"></span></th><th onclick="tblSort('age')">Age <span id="sh-age"></span></th></tr></thead><tbody id="ac-tbody"></tbody></table>
   </div>
 </div>
 <script>
+const SCOPE_VERSION='1.0.2';
 const A=new Map();let rxP=null,map,rxM,rxR=[],rxRL=[],port,reader,conn=false,totM=0,mTs=[],logN=0,selSet=new Set(),cMode='mono',lMode='alt';
 const EXP=180000,TMAX=60,LMAX=1000;
 
@@ -185,8 +329,9 @@ function initMap(){
 }
 
 // --- Aircraft ---
+function nowTime(){return csvRows.length&&csvNow?csvNow:Date.now()}
 function acStale(ac){
-  const age=Date.now()-ac.ls;
+  const age=nowTime()-ac.ls;
   if(age<30000)return{opacity:1,gray:false};      // fresh
   if(age<60000)return{opacity:0.5,gray:false};     // dimming
   return{opacity:0.35,gray:true};                   // stale/gray
@@ -302,6 +447,21 @@ function parse(l){
     rxP=null;updGnss();
     for(const[ic,ac]of A){if(!ac.expired){rmAc(ac);ac.expired=true}}
     selSet.clear();
+    deviceVersion='';updFlashVer();
+  }
+  // Parse device version from boot log
+  const verM=/App version:\s+(\S+)/.exec(l);
+  if(verM){
+    deviceVersion=verM[1];
+    updFlashVer();
+    const match=versionsMatch();
+    if(match===false)addLog('[scope] ⚠ Firmware update available: device='+deviceVersion+' latest='+latestVersion.version);
+    else if(match===true)addLog('[scope] Firmware is up to date ('+deviceVersion+')');
+  }
+  const ctM=/Compile time:\s+(.+)/.exec(l);
+  if(ctM){
+    const el=document.getElementById('flash-dev-ver');
+    if(el&&deviceVersion)el.textContent=deviceVersion+' ('+ctM[1].trim()+')';
   }
   // SD card status — check failures first (some contain substrings of success patterns)
   if(/Failed to reopen/.test(l)){
@@ -384,24 +544,26 @@ function updGnss(){
   else{s.textContent='No fix';s.className='nofix';d.textContent='Acquiring...'}
 }
 
+let sdActiveFile='';
 function updSD(ok,path){
   const el=document.getElementById('sd-status');
   if(ok===true){
     const short=path?path.replace('/sdcard/',''):'logging';
     el.textContent='● '+short;el.className='sd-ok';
+    sdActiveFile=short;
   }else if(ok==='wait'){
-    el.textContent='waiting';el.className='sd-wait';
+    el.textContent='waiting';el.className='sd-wait';sdActiveFile='';
   }else if(ok==='mounted'){
     el.textContent='mounted, waiting for log';el.className='sd-wait';
   }else if(ok==='retrying'){
     el.textContent='✕ mount retry #'+path;el.className='sd-err';
   }else if(ok==='no-card'){
-    el.textContent='✕ no card / mount failed';el.className='sd-err';
+    el.textContent='✕ no card / mount failed';el.className='sd-err';sdActiveFile='';
   }else if(ok==='lost'){
     const short=path?path.replace('/sdcard/',''):'log lost';
-    el.textContent='✕ '+short+' (lost)';el.className='sd-err';
+    el.textContent='✕ '+short+' (lost)';el.className='sd-err';sdActiveFile='';
   }else{
-    el.textContent='✕ write failed';el.className='sd-err';
+    el.textContent='✕ write failed';el.className='sd-err';sdActiveFile='';
   }
 }
 
@@ -449,13 +611,44 @@ function refilterLog(){
   }
 }
 function clearLog(){document.getElementById('log-output').innerHTML='';logN=0;logPaused=[]}
-function toggleLog(){document.getElementById('log-panel').classList.toggle('visible');document.getElementById('log-btn').classList.toggle('active')}
+function toggleLog(){document.getElementById('log-panel').classList.toggle('visible');document.getElementById('log-btn').classList.toggle('active');syncPanelLayout()}
+
+// --- Table sort ---
+let sortCol=null, sortDir=0; // 0=default, 1=asc, -1=desc
+const sortKeys=['icao','cs','alt','spd','hdg','vr','dist','brg','age'];
+function tblSort(col){
+  if(sortCol===col){
+    if(sortDir===1)sortDir=-1;
+    else if(sortDir===-1){sortCol=null;sortDir=0;}
+    else sortDir=1;
+  }else{sortCol=col;sortDir=1;}
+  // Update header indicators
+  for(const k of sortKeys){
+    const el=document.getElementById('sh-'+k);
+    if(el)el.textContent=(sortCol===k?(sortDir===1?'▲':'▼'):'');
+  }
+}
+function sortVal(ic,ac,n){
+  const age=Math.round((n-ac.ls)/1000);
+  switch(sortCol){
+    case'icao':return ic;
+    case'cs':return ac.cs||'zzz';
+    case'alt':return ac.alt??-99999;
+    case'spd':return ac.speed??-1;
+    case'hdg':return ac.hdg??-1;
+    case'vr':return ac.vr??0;
+    case'dist':return ac.dist??999;
+    case'brg':return ac.brg??999;
+    case'age':return age;
+    default:return ac.dist??999;
+  }
+}
 
 // --- Tick ---
 function tick(){
-  const n=Date.now();
-  // Only expire when connected — freeze state when disconnected
-  if(conn){
+  const n=nowTime();
+  // Only expire when receiving data — freeze state when idle
+  if(conn||csvPlaying){
     for(const[ic,ac]of A){
       const age=n-ac.ls;
       if(age>EXP&&!ac.expired){
@@ -474,9 +667,14 @@ function tick(){
   document.getElementById('msg-rate').textContent=(mTs.length/5).toFixed(1);
   if(selSet.size)updDet();
   const tb=document.getElementById('ac-tbody');
-  // Sort: live aircraft by distance first, then expired at the bottom
+  // Sort: expired always at bottom, then by user-selected column or default (distance)
   const so=[...A.entries()].sort((a,b)=>{
     if(a[1].expired!==b[1].expired)return a[1].expired?1:-1;
+    if(sortCol&&sortDir){
+      const va=sortVal(a[0],a[1],n),vb=sortVal(b[0],b[1],n);
+      const cmp=typeof va==='string'?va.localeCompare(vb):va-vb;
+      return cmp*sortDir;
+    }
     return(a[1].dist||999)-(b[1].dist||999);
   });
   tb.innerHTML=so.map(([ic,ac])=>{
@@ -516,6 +714,8 @@ let panelH=Math.round(window.innerHeight*0.35);
 let lb='';
 async function toggleSerial(){
   if(conn){await discon();return}
+  // Close CSV replay if active
+  if(csvRows.length)tlClose();
   if(!('serial' in navigator)){alert('WebSerial not supported. Use Chrome/Edge.');return}
   try{
     port=await navigator.serial.requestPort();
@@ -526,6 +726,19 @@ async function toggleSerial(){
     await port.setSignals({dataTerminalReady:false,requestToSend:false});
     conn=true;document.getElementById('connect-btn').textContent='Disconnect';document.getElementById('connect-btn').classList.add('connected');
     addLog('[scope] Serial connected — device may reboot (DTR race), waiting for data...');
+    fetchLatestVersion(); // check for firmware updates
+    // Deferred version query: if the device doesn't reboot (no boot log),
+    // ask for the version after things settle.  10s gives the DTR reboot
+    // plenty of time to complete — if we already have the version from
+    // the boot log by then, this is a no-op.
+    setTimeout(async()=>{
+      if(conn&&!deviceVersion&&!cmdWaiting){
+        try{
+          const r=await sendCmdResume('version',3000);
+          if(r){r.split('\n').forEach(l=>parse(l))}
+        }catch(e){/* device busy or not responding — not critical */}
+      }
+    },10000);
     readLoop();
   }catch(e){addLog('[scope] Serial error: '+e.message)}
 }
@@ -533,23 +746,696 @@ async function readLoop(){
   const dc=new TextDecoder();
   while(conn&&port?.readable){
     reader=port.readable.getReader();
-    try{while(true){const{value,done}=await reader.read();if(done)break;if(!value)continue;lb+=dc.decode(value,{stream:true});let i;while((i=lb.indexOf('\n'))!==-1){const l=lb.substring(0,i).replace(/\r$/,'');lb=lb.substring(i+1);if(l.length>0){parse(l);addLog(l)}}}}
+    try{while(true){const{value,done}=await reader.read();if(done)break;if(!value)continue;lb+=dc.decode(value,{stream:true});let i;while((i=lb.indexOf('\n'))!==-1){const l=lb.substring(0,i).replace(/\r$/,'');lb=lb.substring(i+1);if(l.length>0)handleLine(l)}
+      if(cmdWaiting&&lb.includes('adsb>')){const pi=lb.indexOf('adsb>');lb=lb.substring(pi+5);if(cmdSkipPrompts>0){cmdSkipPrompts--;cmdBuf=[];}else{if(cmdResolve)cmdResolve(cmdBuf.join('\n'));cmdBuf=[];cmdWaiting=false;cmdResolve=null;if(cmdTO){clearTimeout(cmdTO);cmdTO=null;}}}
+    }}
     catch(e){if(conn)addLog('[scope] Read error: '+e.message)}
     finally{try{reader.releaseLock()}catch(e){}}
     if(conn)await new Promise(r=>setTimeout(r,500));
   }
 }
+let cmdWaiting=false,cmdBuf=[],cmdResolve=null,cmdTO=null,cmdSkipPrompts=0,cmdInactivityMs=10000,cmdBytes=0;
+function cmdResetTO(){
+  if(cmdTO)clearTimeout(cmdTO);
+  if(!cmdResolve)return;
+  cmdTO=setTimeout(()=>{cmdWaiting=false;const r=cmdResolve;cmdResolve=null;r(null);},cmdInactivityMs);
+}
+function handleLine(l){
+  if(cmdWaiting){
+    if(l.includes('adsb>')){
+      if(cmdSkipPrompts>0){cmdSkipPrompts--;cmdBuf=[];return;} // skip Ctrl+C prompt
+      const b=l.split('adsb>')[0].trim();if(b)cmdBuf.push(b);
+      if(cmdTO){clearTimeout(cmdTO);cmdTO=null;}
+      if(cmdResolve)cmdResolve(cmdBuf.join('\n'));
+      cmdBuf=[];cmdWaiting=false;cmdResolve=null;
+      return;
+    }
+    // Skip command mode banner and command echo
+    const clean=l.replace(/\x1b\[[0-9;]*m/g,'').trim();
+    if(clean.startsWith('── Command mode')||clean==='')return;
+    cmdBuf.push(l);
+    cmdBytes+=l.length;
+    cmdResetTO(); // data flowing — reset inactivity timer
+    // Update progress in file status
+    const st=document.getElementById('files-status');
+    if(st&&st.dataset.dl){
+      const kb=(cmdBytes/1024).toFixed(0);
+      const estKB=parseFloat(st.dataset.est)||0;
+      st.childNodes.forEach(n=>{if(n.nodeType===3)n.textContent=st.dataset.dl+' ('+kb+' KB received)'});
+      const bar=document.getElementById('dl-bar');
+      if(bar&&estKB>0)bar.style.width=Math.min(100,cmdBytes/(estKB*1024)*100).toFixed(1)+'%';
+    }
+    return;
+  }
+  parse(l);addLog(l);
+}
+async function serialWrite(t){if(!conn||!port?.writable)return;const w=port.writable.getWriter();try{await w.write(new TextEncoder().encode(t))}finally{w.releaseLock()}}
+async function sendCmd(cmd,inactMs){
+  cmdInactivityMs=inactMs||10000;
+  if(!conn)throw new Error('Not connected');
+  // Phase 1: Enter command mode, wait for first prompt
+  cmdBuf=[];cmdSkipPrompts=1;cmdWaiting=true;cmdBytes=0;
+  await serialWrite('\x03');
+  // Wait up to 2s for the Ctrl+C prompt to be consumed
+  const waitStart=Date.now();
+  while(cmdSkipPrompts>0&&Date.now()-waitStart<2000)await new Promise(r=>setTimeout(r,50));
+  // Phase 2: Send actual command, capture response until next prompt
+  cmdBuf=[];cmdSkipPrompts=0;cmdBytes=0;
+  const p=new Promise((res)=>{
+    cmdResolve=res;
+    cmdResetTO(); // start first inactivity timer
+  });
+  await serialWrite(cmd+'\n');
+  const raw=await p;
+  if(cmdTO){clearTimeout(cmdTO);cmdTO=null;}
+  if(raw===null)throw new Error('Timeout (no data for '+(cmdInactivityMs/1000)+'s)');
+  // Clean response: strip ANSI codes, remove command echo (first line)
+  const lines=raw.split('\n');
+  const cleaned=lines
+    .map(l=>l.replace(/\x1b\[[0-9;]*m/g,''))
+    .filter((l,i)=>{
+      // Skip first line if it's the command echo
+      if(i===0&&l.trim()===cmd.trim())return false;
+      // Skip "Entering log mode" lines
+      if(l.includes('Entering log mode'))return false;
+      return true;
+    });
+  return cleaned.join('\n');
+}
+async function sendCmdResume(cmd,inactMs){
+  const r=await sendCmd(cmd,inactMs);
+  // Return to log mode — 'log' command doesn't produce a prompt,
+  // so just wait briefly then stop capturing. Any lines received
+  // during the transition get flushed to the normal parser.
+  cmdBuf=[];cmdWaiting=true;cmdSkipPrompts=0;
+  await serialWrite('log\n');
+  await new Promise(r=>setTimeout(r,500));
+  const flushed=cmdBuf.slice();
+  cmdWaiting=false;cmdBuf=[];cmdSkipPrompts=0;
+  // Flush captured lines to parser (catches sd_log_print_status etc)
+  for(const l of flushed){
+    const clean=l.replace(/\x1b\[[0-9;]*m/g,'').trim();
+    if(clean&&!clean.startsWith('Entering log mode'))handleLine(l);
+  }
+  return r;
+}
+
+// --- File browser ---
+let filesPath='/sdcard';
+function toggleFiles(){const p=document.getElementById('files-panel'),b=document.getElementById('files-btn');p.classList.toggle('visible');b.classList.toggle('active');syncPanelLayout();if(p.classList.contains('visible'))filesRefresh()}
+function syncPanelLayout(){
+  const logVis=document.getElementById('log-panel').classList.contains('visible');
+  const filesVis=document.getElementById('files-panel').classList.contains('visible');
+  document.getElementById('files-panel').classList.toggle('side-by-side',logVis&&filesVis);
+}
+async function filesRefresh(){
+  const list=document.getElementById('files-list'),st=document.getElementById('files-status');
+  if(!conn){st.textContent='Connect serial first';list.innerHTML='';return}
+  st.textContent='Loading...';list.innerHTML='';
+  try{
+    const raw=await sendCmdResume('ls '+filesPath,5000);
+    // Check for error in response
+    const rawClean=raw.replace(/\x1b\[[0-9;]*m/g,'');
+    if(rawClean.includes('error:')||rawClean.includes('No such file')||rawClean.includes('cannot open')){
+      st.textContent='SD card not mounted';
+      list.innerHTML='<div style="padding:20px 12px;color:var(--warning);font-size:12px">SD card is not available. Check that a card is inserted and the device has mounted it successfully.</div>';
+      return;
+    }
+    const lines=raw.split('\n');let files=[];
+    for(const line of lines){
+      const t=line.replace(/\x1b\[[0-9;]*m/g,'').replace(/^\s+/,'');
+      if(!t||t.startsWith('/')||t.startsWith('\u2500'))continue;
+      const dm=t.match(/^(.+?)\s+<dir>\s*$/);
+      if(dm){files.push({name:dm[1].trim(),isDir:true,size:''});continue}
+      const fm=t.match(/^(.+?)\s+([\d.]+)\s+(B|KB|MB)\s*$/);
+      if(fm)files.push({name:fm[1].trim(),isDir:false,size:fm[2]+' '+fm[3]});
+    }
+    files.sort((a,b)=>{if(a.isDir!==b.isDir)return a.isDir?-1:1;return a.name.localeCompare(b.name)});
+    document.getElementById('files-path').textContent=filesPath;
+    st.textContent=files.length+' items';
+    let html='';
+    if(filesPath!=='/sdcard')html+='<div class="file-row" onclick="fileNav(\'..\')">\u2B06 <span class="file-name dir">..</span></div>';
+    for(const f of files){
+      const ic=f.isDir?'\uD83D\uDCC1':'\uD83D\uDCC4';
+      const cls=f.isDir?'dir':'';
+      const isC=f.name.endsWith('.csv');
+      const isActive=(!f.isDir&&sdActiveFile&&f.name===sdActiveFile)?'active-log':'';
+      const n=f.name.replace(/'/g,"\\'");
+      let acts='';
+      if(!f.isDir){
+        acts='<div class="file-actions">';
+        if(isC)acts+='<button onclick="event.stopPropagation();fileReplay(\''+n+'\',\''+f.size+'\')">Replay</button>';
+        acts+='<button onclick="event.stopPropagation();fileDL(\''+n+'\',\''+f.size+'\')">DL</button>';
+        acts+='<button onclick="event.stopPropagation();fileDel(\''+n+'\')">Del</button>';
+        acts+='</div>';
+      }
+      const ck=f.isDir?'onclick="fileNav(\''+n+'\')"':'';
+      html+='<div class="file-row '+isActive+'" '+ck+'><span class="file-icon">'+ic+'</span><span class="file-name '+cls+'">'+f.name+'</span><span class="file-size">'+f.size+'</span>'+acts+'</div>';
+    }
+    list.innerHTML=html;
+  }catch(e){st.textContent='Error: '+e.message}
+}
+function fileNav(name){
+  if(name==='..'){const p=filesPath.split('/');p.pop();filesPath=p.join('/')||'/'}
+  else filesPath+='/'+name;
+  filesRefresh();
+}
+function parseSizeKB(s){
+  if(!s)return 0;
+  const m=s.match(/([\d.]+)\s*(B|KB|MB)/);
+  if(!m)return 0;
+  const v=parseFloat(m[1]);
+  if(m[2]==='MB')return v*1024;
+  if(m[2]==='KB')return v;
+  return v/1024;
+}
+function transferTime(kb){return Math.ceil(kb/10)} // ~10 KB/s at 115200 baud
+async function fileDL(name,size){
+  const kb=parseSizeKB(size);
+  const secs=transferTime(kb);
+  if(secs>120){
+    if(!confirm(name+' is '+size+'. Transfer will take ~'+Math.ceil(secs/60)+' minutes at 115200 baud. Continue?'))return;
+  }
+  const st=document.getElementById('files-status');
+  st.dataset.dl='Downloading '+name;st.dataset.est=kb;
+  st.innerHTML='<div class="dl-bar" id="dl-bar" style="width:0%"></div>Downloading '+name+(secs>10?' (~'+secs+'s)':'')+'...';
+  try{
+    const raw=await sendCmdResume('cat '+filesPath+'/'+name);
+    delete st.dataset.dl;delete st.dataset.est;
+    const blob=new Blob([raw],{type:'text/plain'});const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');a.href=url;a.download=name;document.body.appendChild(a);a.click();
+    document.body.removeChild(a);URL.revokeObjectURL(url);
+    st.innerHTML='Downloaded '+name+' ('+(raw.length/1024).toFixed(0)+' KB)';
+  }catch(e){delete st.dataset.dl;delete st.dataset.est;st.innerHTML='Failed: '+e.message}
+}
+async function fileReplay(name,size){
+  const kb=parseSizeKB(size);
+  const secs=transferTime(kb);
+  if(secs>120){
+    if(!confirm(name+' is '+size+'. Transfer will take ~'+Math.ceil(secs/60)+' minutes at 115200 baud. Continue?'))return;
+  }
+  const st=document.getElementById('files-status');
+  st.dataset.dl='Loading '+name;st.dataset.est=kb;
+  st.innerHTML='<div class="dl-bar" id="dl-bar" style="width:0%"></div>Loading '+name+(secs>10?' (~'+secs+'s)':'')+'...';
+  try{
+    const raw=await sendCmdResume('cat '+filesPath+'/'+name);
+    delete st.dataset.dl;delete st.dataset.est;
+    document.getElementById('files-panel').classList.remove('visible');
+    document.getElementById('files-btn').classList.remove('active');
+    parseCSVText(raw,name);
+  }catch(e){delete st.dataset.dl;delete st.dataset.est;st.innerHTML='Failed: '+e.message}
+}
+async function fileDel(name){
+  if(!confirm('Delete '+name+'?'))return;
+  try{await sendCmdResume('rm '+filesPath+'/'+name,5000);filesRefresh()}
+  catch(e){document.getElementById('files-status').textContent='Failed: '+e.message}
+}
 async function discon(){
+  // Try to safely unmount SD card before disconnecting (hard 3s limit)
+  if(conn&&port?.writable){
+    try{
+      addLog('[scope] Unmounting SD card...');
+      await Promise.race([
+        sendCmd('unmount',5000),
+        new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')),3000))
+      ]);
+      addLog('[scope] SD card unmounted');
+    }catch(e){addLog('[scope] Unmount skipped: '+e.message)}
+  }
   conn=false;document.getElementById('connect-btn').textContent='Connect Serial';document.getElementById('connect-btn').classList.remove('connected');
   try{if(reader){await reader.cancel();reader.releaseLock()}}catch(e){}
   try{if(port)await port.setSignals({dataTerminalReady:false,requestToSend:false})}catch(e){}
   try{if(port)await port.close()}catch(e){}
-  reader=null;port=null;addLog('[scope] Disconnected');
+  reader=null;port=null;cmdWaiting=false;cmdBuf=[];cmdResolve=null;addLog('[scope] Disconnected');
 }
 
-initMap();setInterval(tick,1000);
+// --- CSV Replay ---
+let csvRows=[], csvPlaying=false, csvIdx=0, csvTimer=null, csvSpeedIdx=3;
+const csvSpeeds=[0.25,0.5,0.75,1,2,4,8,16,32];
+let csvStartReal=0, csvStartData=0, csvNow=0;
+
+function loadCSV(input){
+  const file=input.files[0];if(!file)return;
+  const reader=new FileReader();
+  reader.onload=async function(e){
+    if(conn)await discon();
+    parseCSVText(e.target.result,file.name);
+  };
+  reader.readAsText(file);
+  input.value='';
+}
+
+function parseCSVText(text,filename){
+  const lines=text.split('\n');
+  const hdr=lines[0].split(',');
+  const cols={};hdr.forEach((h,i)=>cols[h.trim()]=i);
+  csvRows=[];
+  for(let i=1;i<lines.length;i++){
+    const f=lines[i].split(',');if(f.length<10)continue;
+    const ts=f[cols.timestamp_utc]||'';
+    const t=new Date(ts).getTime();
+    if(isNaN(t))continue;
+    csvRows.push({t,icao:f[cols.icao]||'',cs:f[cols.callsign]||'',
+      alt:parseInt(f[cols.altitude_ft])||null,speed:parseInt(f[cols.speed_kt])||null,
+      hdg:parseInt(f[cols.heading_deg])||null,vr:parseInt(f[cols.vrate_fpm])||null,
+      lat:parseFloat(f[cols.lat])||null,lon:parseFloat(f[cols.lon])||null,
+      rxLat:parseFloat(f[cols.rx_lat])||null,rxLon:parseFloat(f[cols.rx_lon])||null,
+      dist:parseFloat(f[cols.range_km])||null,brg:parseFloat(f[cols.bearing_deg])||null,
+      sats:parseInt(f[cols.rx_sats])||0,hdop:parseFloat(f[cols.rx_hdop])||0
+    });
+  }
+  csvRows.sort((a,b)=>a.t-b.t);
+  if(!csvRows.length){alert('No valid rows in CSV');return}
+  for(const[ic,ac]of A){rmAc(ac)}
+  A.clear();selSet.clear();
+  csvIdx=0;csvSpeedIdx=3;
+  document.getElementById('timeline').classList.add('visible');
+  document.getElementById('tl-scrub').max=csvRows.length-1;
+  document.getElementById('tl-scrub').value=0;
+  posTopbar();
+  const rxRow=csvRows.find(r=>r.rxLat&&r.rxLon&&Math.abs(r.rxLat)>0.1);
+  if(rxRow){rxP={lat:rxRow.rxLat,lon:rxRow.rxLon,sats:rxRow.sats,hdop:rxRow.hdop,fix:true};updRx();updGnss();map.setView([rxRow.rxLat,rxRow.rxLon],11)}
+  updTlTime();
+  addLog('[scope] CSV loaded: '+csvRows.length+' rows, '+filename);
+  tlPlay();
+}
+
+function feedCSVRow(row){
+  const ic=row.icao;if(!ic||ic==='000000')return;
+  let ac=A.get(ic);
+  if(!ac){ac={cs:null,alt:null,speed:null,hdg:null,vr:null,lat:null,lon:null,hasPos:false,expired:false,dist:null,brg:null,ls:row.t,mk:null,lb:null,tr:null};A.set(ic,ac)}
+  ac.ls=row.t;
+  if(ac.expired){ac.expired=false;ac.mk=null;ac.lb=null;ac.tr=null;}
+  if(row.cs)ac.cs=row.cs;
+  if(row.alt!=null)ac.alt=row.alt;
+  if(row.speed!=null)ac.speed=row.speed;
+  if(row.hdg!=null)ac.hdg=row.hdg;
+  if(row.vr!=null)ac.vr=row.vr;
+  if(row.lat&&row.lon&&Math.abs(row.lat)>0.1&&Math.abs(row.lon)>0.1){
+    ac.lat=row.lat;ac.lon=row.lon;ac.hasPos=true;
+  }
+  if(row.dist!=null)ac.dist=row.dist*(1/1.852);// km→nm
+  if(row.brg!=null)ac.brg=Math.round(row.brg);
+  updAc(ic,ac);
+  totM++;
+}
+
+function tlPlay(){
+  csvPlaying=true;
+  document.getElementById('tl-play').textContent='⏸';
+  csvStartReal=performance.now();
+  csvStartData=csvRows[csvIdx].t;
+  csvNow=csvStartData;
+  if(csvTimer)cancelAnimationFrame(csvTimer);
+  csvTimer=requestAnimationFrame(tlTick);
+}
+
+function tlPause(){
+  csvPlaying=false;
+  document.getElementById('tl-play').textContent='▶';
+  if(csvTimer){cancelAnimationFrame(csvTimer);csvTimer=null}
+}
+
+function tlToggle(){if(csvPlaying)tlPause();else tlPlay()}
+
+function tlSpeed(dir){
+  csvSpeedIdx=Math.max(0,Math.min(csvSpeeds.length-1,csvSpeedIdx+dir));
+  document.getElementById('tl-speed').textContent=csvSpeeds[csvSpeedIdx]+'×';
+  // Re-anchor timing from current position to avoid jumps
+  if(csvPlaying){csvStartReal=performance.now();csvStartData=csvNow;}
+}
+
+function tlScrub(val){
+  const wasPlaying=csvPlaying;
+  if(csvPlaying)tlPause();
+  csvIdx=parseInt(val);
+  if(csvIdx>=csvRows.length)csvIdx=csvRows.length-1;
+  csvNow=csvRows[csvIdx].t;
+  // Clear and replay up to this point to build trails
+  for(const[ic,ac]of A){rmAc(ac)}
+  A.clear();selSet.clear();
+  // Feed last ~60s of data for trail context
+  const targetT=csvRows[csvIdx].t;
+  const trailStart=csvRows.findIndex(r=>r.t>=targetT-60000);
+  for(let i=Math.max(0,trailStart);i<=csvIdx;i++){
+    feedCSVRow(csvRows[i]);
+  }
+  updTlTime();
+  if(wasPlaying)tlPlay();
+}
+
+function tlTick(){
+  if(!csvPlaying||csvIdx>=csvRows.length-1){tlPause();return}
+  const speed=csvSpeeds[csvSpeedIdx];
+  const elapsedReal=performance.now()-csvStartReal;
+  csvNow=csvStartData+elapsedReal*speed;
+  let fed=0;
+  while(csvIdx<csvRows.length-1&&csvRows[csvIdx].t<=csvNow&&fed<200){
+    feedCSVRow(csvRows[csvIdx]);
+    csvIdx++;fed++;
+  }
+  document.getElementById('tl-scrub').value=csvIdx;
+  updTlTime();
+  if(csvIdx>=csvRows.length-1){tlPause();return}
+  csvTimer=requestAnimationFrame(tlTick);
+}
+
+function updTlTime(){
+  if(!csvRows.length)return;
+  const row=csvRows[Math.min(csvIdx,csvRows.length-1)];
+  const d=new Date(row.t);
+  const ts=d.toISOString().replace('T',' ').replace(/\.\d+Z/,'Z');
+  const pct=csvRows.length>1?Math.round(csvIdx/(csvRows.length-1)*100):0;
+  document.getElementById('tl-time').textContent=`${ts} (${csvIdx+1}/${csvRows.length})`;
+}
+
+function tlClose(){
+  tlPause();
+  csvRows=[];csvIdx=0;csvNow=0;
+  document.getElementById('timeline').classList.remove('visible');
+  posTopbar();
+  // Clear replay aircraft
+  for(const[ic,ac]of A){rmAc(ac)}
+  A.clear();selSet.clear();totM=0;
+  addLog('[scope] CSV replay closed');
+}
+
+// --- Flash Firmware ---
+let deviceVersion='';
+let latestVersion=null; // {version, date, url} from latest.version.json
+const FW_BASE='https://adsb-scope.offx1.com/';
+const FW_URL=FW_BASE+'latest.bin';
+const FW_OFFSET=0x0;  // merged binary (bootloader+partition+app)
+let flashBusy=false, esptoolMod=null;
+
+async function fetchLatestVersion(){
+  try{
+    const r=await fetch(FW_BASE+'latest.version.json',{cache:'no-store'});
+    if(!r.ok)return;
+    latestVersion=await r.json();
+    updFlashVer();
+  }catch(e){/* latest.version.json not available yet — silent */}
+}
+
+function versionsMatch(){
+  if(!deviceVersion||!latestVersion?.version)return null; // unknown
+  // Normalize: strip -dirty suffix for comparison
+  const dev=deviceVersion.replace(/-dirty$/,'');
+  const lat=latestVersion.version.replace(/-dirty$/,'');
+  return dev===lat;
+}
+
+function updFlashVer(){
+  const el=document.getElementById('flash-dev-ver');
+  const latEl=document.getElementById('flash-latest-ver');
+  const btn=document.getElementById('flash-btn');
+  const badge=document.getElementById('flash-badge');
+
+  // Device version
+  if(el){
+    el.textContent=deviceVersion||'—';
+    const match=versionsMatch();
+    if(match===true)el.className='fv ok';
+    else if(match===false)el.className='fv warn';
+    else el.className='fv';
+  }
+
+  // Latest version
+  if(latEl){
+    if(latestVersion){
+      const dateStr=latestVersion.date?' ('+latestVersion.date+')':'';
+      latEl.textContent=latestVersion.version+dateStr;
+      latEl.className='fv ok';
+    }else{
+      latEl.textContent='checking...';
+      latEl.className='fv';
+    }
+  }
+
+  // Update badge on toolbar button
+  if(badge){
+    const match=versionsMatch();
+    if(match===false){
+      badge.style.display='inline-block';
+      badge.title='Update available: '+latestVersion.version;
+    }else{
+      badge.style.display='none';
+    }
+  }
+
+  // Status row hint
+  const statusEl=document.getElementById('flash-status');
+  if(statusEl&&!flashBusy){
+    const match=versionsMatch();
+    if(match===true){statusEl.textContent='Up to date';statusEl.className='fv ok'}
+    else if(match===false){
+      const isDev=deviceVersion&&deviceVersion.includes('-dirty');
+      statusEl.textContent=isDev?'Dev build (latest: '+latestVersion.version+')':'Update available';
+      statusEl.className='fv warn';
+    }
+    else{statusEl.textContent='Ready';statusEl.className='fv'}
+  }
+}
+
+function toggleFlash(){
+  const p=document.getElementById('flash-panel'),o=document.getElementById('flash-overlay'),b=document.getElementById('flash-btn');
+  if(flashBusy)return; // don't close during flash
+  p.classList.toggle('visible');o.classList.toggle('visible');b.classList.toggle('active');
+  updFlashVer();
+}
+
+function flashLog(msg,cls){
+  const el=document.getElementById('flash-log');
+  const d=document.createElement('div');
+  d.className=cls||'';d.textContent=msg;
+  el.appendChild(d);el.scrollTop=el.scrollHeight;
+}
+function flashStatus(msg,cls){
+  const el=document.getElementById('flash-status');
+  el.textContent=msg;el.className='fv '+(cls||'');
+}
+function flashProgress(pct){
+  document.getElementById('flash-progress').style.display='block';
+  document.getElementById('flash-progress-fill').style.width=pct+'%';
+  document.getElementById('flash-progress-text').textContent=pct+'%';
+}
+function flashReset(){
+  document.getElementById('flash-log').innerHTML='';
+  document.getElementById('flash-progress').style.display='none';
+  document.getElementById('flash-progress-fill').style.width='0%';
+  document.getElementById('flash-go-btn').disabled=false;
+  flashBusy=false;
+}
+
+async function loadEsptool(){
+  if(esptoolMod)return esptoolMod;
+  flashLog('Loading esptool-js from CDN...','fl-info');
+  try{
+    esptoolMod=await import('https://unpkg.com/esptool-js@0.5.4/bundle.js');
+    flashLog('esptool-js loaded','fl-ok');
+    return esptoolMod;
+  }catch(e){
+    // Try alternate CDN path
+    try{
+      esptoolMod=await import('https://unpkg.com/esptool-js/bundle.js');
+      flashLog('esptool-js loaded','fl-ok');
+      return esptoolMod;
+    }catch(e2){
+      flashLog('Failed to load esptool-js: '+e2.message,'fl-err');
+      flashLog('If loading from file://, open from https:// instead.','fl-err');
+      flashLog('Or flash manually: esptool.py --chip esp32p4 write_flash 0x0 firmware.bin','fl-info');
+      return null;
+    }
+  }
+}
+
+async function fetchFirmware(url){
+  flashLog('Downloading firmware...','fl-info');
+  flashStatus('Downloading...','');
+  try{
+    const resp=await fetch(url);
+    if(!resp.ok)throw new Error('HTTP '+resp.status);
+    const data=await resp.arrayBuffer();
+    // Extract version from final redirect URL if present
+    const finalUrl=resp.url||url;
+    const fnMatch=finalUrl.match(/([^/]+)\.bin$/);
+    if(fnMatch)flashLog('Firmware: '+fnMatch[1],'fl-info');
+    flashLog('Downloaded '+(data.byteLength/1024).toFixed(0)+' KB','fl-ok');
+    return data;
+  }catch(e){
+    if(e.message.includes('Failed to fetch')||e.message.includes('NetworkError')){
+      flashLog('Download failed — CORS or network error.','fl-err');
+      flashLog('Ensure '+url+' has Access-Control-Allow-Origin header,','fl-err');
+      flashLog('or use "Local .bin" button to pick a file from disk.','fl-info');
+    }else{
+      flashLog('Download failed: '+e.message,'fl-err');
+    }
+    return null;
+  }
+}
+
+async function doFlash(binData){
+  const mod=await loadEsptool();
+  if(!mod)return false;
+
+  document.getElementById('flash-go-btn').disabled=true;
+  flashBusy=true;
+
+  // Save the port reference before disconnecting — requestPort() returns
+  // the same SerialPort object for the same physical device, which Chrome
+  // considers "already open" even after close() if the OS hasn't fully
+  // released it.  Reusing our existing reference avoids the picker AND
+  // the stale-open race.
+  let flashPort=port||null;
+
+  // Disconnect serial if connected — fully release the port
+  if(conn){
+    flashLog('Disconnecting serial...','fl-info');
+    try{await discon()}catch(e){}
+    // Give the OS time to fully release the serial port
+    await new Promise(r=>setTimeout(r,1000));
+  }
+
+  // Ensure saved port is closed before esptool reopens it
+  if(flashPort){
+    try{await flashPort.close()}catch(e){/* already closed by discon */}
+    await new Promise(r=>setTimeout(r,500));
+    flashLog('Using previously connected port.','fl-info');
+  }else{
+    // No prior connection — ask user to pick a port
+    flashLog('Select the serial port for the device...','fl-info');
+    flashStatus('Waiting for port...','');
+    try{
+      flashPort=await navigator.serial.requestPort();
+      try{await flashPort.close()}catch(e){}
+    }catch(e){
+      flashLog('Serial port error: '+e.message,'fl-err');
+      flashStatus('Failed','warn');
+      flashBusy=false;document.getElementById('flash-go-btn').disabled=false;
+      return false;
+    }
+  }
+
+  // Create transport and loader — esptool-js opens the port itself
+  flashLog('Connecting to bootloader...','fl-info');
+  flashStatus('Connecting...','');
+  flashLog('If device does not respond: hold BOOT, press RESET, release BOOT.','fl-info');
+
+  let transport,loader,chip;
+  try{
+    transport=new mod.Transport(flashPort,true);
+    loader=new mod.ESPLoader({
+      transport,
+      baudrate:921600,
+      romBaudrate:115200,
+      terminal:{
+        clean(){},
+        writeLine(d){if(d&&d.trim())flashLog(d.trim())},
+        write(d){}
+      }
+    });
+    chip=await loader.main();
+    flashLog('Connected: '+chip,'fl-ok');
+  }catch(e){
+    flashLog('Bootloader connection failed: '+e.message,'fl-err');
+    flashLog('Try: hold BOOT → press RESET → release BOOT → click Flash again.','fl-info');
+    flashStatus('Failed','warn');
+    try{await transport.disconnect()}catch(ex){}
+    try{await flashPort.close()}catch(ex){}
+    flashBusy=false;document.getElementById('flash-go-btn').disabled=false;
+    return false;
+  }
+
+  // Flash
+  flashLog('Erasing and writing flash...','fl-info');
+  flashStatus('Flashing...','');
+  flashProgress(0);
+  const binaryStr=Array.from(new Uint8Array(binData)).map(b=>String.fromCharCode(b)).join('');
+
+  try{
+    await loader.writeFlash({
+      fileArray:[{data:binaryStr,address:FW_OFFSET}],
+      flashSize:'keep',
+      flashMode:'keep',
+      flashFreq:'keep',
+      eraseAll:false,
+      compress:true,
+      reportProgress(fileIndex,written,total){
+        const pct=Math.round(written/total*100);
+        flashProgress(pct);
+        flashStatus('Flashing... '+pct+'%','');
+      }
+    });
+    flashLog('Flash complete!','fl-ok');
+    flashProgress(100);
+  }catch(e){
+    flashLog('Flash failed: '+e.message,'fl-err');
+    flashStatus('Failed','warn');
+    try{await transport.disconnect()}catch(ex){}
+    try{await flashPort.close()}catch(ex){}
+    flashBusy=false;document.getElementById('flash-go-btn').disabled=false;
+    return false;
+  }
+
+  // Reset
+  flashLog('Resetting device...','fl-info');
+  try{await loader.hardReset()}catch(e){
+    flashLog('Auto-reset failed — please press RESET button.','fl-info');
+  }
+
+  try{await transport.disconnect()}catch(e){}
+  try{await flashPort.close()}catch(e){}
+  flashStatus('Complete!','ok');
+  flashLog('Device is rebooting. Reconnect serial when ready.','fl-ok');
+  flashBusy=false;
+  document.getElementById('flash-go-btn').disabled=false;
+  return true;
+}
+
+async function startFlash(){
+  if(flashBusy)return;
+  if(versionsMatch()===true){
+    if(!confirm('Device is already running the latest firmware ('+deviceVersion+'). Re-flash anyway?'))return;
+  }
+  flashReset();
+  if(!('serial' in navigator)){flashLog('WebSerial not supported. Use Chrome/Edge.','fl-err');return}
+  const binData=await fetchFirmware(FW_URL);
+  if(!binData)return;
+  await doFlash(binData);
+}
+
+async function flashLocalFile(input){
+  if(flashBusy)return;
+  const file=input.files[0];if(!file)return;
+  input.value='';
+  flashReset();
+  if(!('serial' in navigator)){flashLog('WebSerial not supported. Use Chrome/Edge.','fl-err');return}
+  flashLog('Reading '+file.name+' ('+((file.size/1024).toFixed(0))+' KB)...','fl-info');
+  const binData=await file.arrayBuffer();
+  flashLog('File loaded: '+(binData.byteLength/1024).toFixed(0)+' KB','fl-ok');
+  await doFlash(binData);
+}
+
+initMap();setInterval(tick,1000);fetchLatestVersion();
 function posZoom(){const h=document.getElementById('panel').offsetHeight;document.getElementById('zoom-ctrl').style.bottom=(h+12)+'px';document.getElementById('legend').style.bottom=(h+12)+'px'}
-posZoom();new MutationObserver(posZoom).observe(document.getElementById('panel'),{attributes:true,attributeFilter:['style','class']});
+function posTopbar(){
+  const tb=document.getElementById('topbar').offsetHeight;
+  const tl=document.getElementById('timeline');
+  tl.style.top=tb+'px';
+  const tlH=tl.classList.contains('visible')?tl.offsetHeight:0;
+  const top=(tb+tlH+8)+'px';
+  document.getElementById('gnss-info').style.top=top;
+  // On mobile, detail wrap is positioned from the bottom by CSS
+  if(window.innerWidth<=768){
+    document.getElementById('detail-wrap').style.top='';
+  }else{
+    document.getElementById('detail-wrap').style.top=top;
+  }
+}
+posZoom();posTopbar();
+new MutationObserver(posZoom).observe(document.getElementById('panel'),{attributes:true,attributeFilter:['style','class']});
+new ResizeObserver(posTopbar).observe(document.getElementById('topbar'));
+window.addEventListener('resize',posTopbar);
 if(!('serial' in navigator)){const b=document.getElementById('connect-btn');b.textContent='No WebSerial';b.disabled=true;b.style.opacity=0.4}
 </script>
 </body>

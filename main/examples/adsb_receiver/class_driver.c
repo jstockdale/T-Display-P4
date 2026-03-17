@@ -254,20 +254,27 @@ static void haversine(double lat1, double lon1, double lat2, double lon2,
 // SD card logging
 // ============================================================
 
-static FILE *sd_log = NULL;
-static char sd_log_filename[64] = {0};  // current log path for rename
-static int64_t sd_log_last_sync = 0;    // last close/reopen timestamp (us)
-static int sd_log_writes = 0;           // writes since last close/reopen
-#define SD_SYNC_INTERVAL_US  30000000LL // close/reopen every 30s
-#define SD_SYNC_WRITE_COUNT  100        // or every 100 writes
+static char sd_log_filename[64] = {0};
+static int64_t sd_log_last_sync = 0;
+static int sd_log_writes = 0;
+static bool sd_log_initialized = false;  // header written at least once
+#define SD_SYNC_INTERVAL_US  5000000LL   // flush buffer every 5s
+#define SD_SYNC_WRITE_COUNT  100         // or every 100 messages
 
-static void sd_log_open(void) {
+// PSRAM write buffer — messages accumulate here between flushes.
+// File stays CLOSED between sync cycles so the FAT32 dirty bit is
+// never set when a hard reset occurs.  On reset we lose at most one
+// sync interval of buffered data, but macOS mounts without repair.
+#define SD_LOG_BUFSIZE  (64 * 1024)
+static char *sd_log_buf = NULL;
+static int   sd_log_buf_pos = 0;
+
+static void sd_log_pick_filename(void) {
     time_t now;
     struct tm timeinfo;
     time(&now);
     gmtime_r(&now, &timeinfo);
 
-    // Sanity check: if time is before 2024-01-01 the RTC hasn't been set
     if (now < 1704067200LL) {
         snprintf(sd_log_filename, sizeof(sd_log_filename),
             "/sdcard/adsb_boot%llu.csv",
@@ -276,149 +283,197 @@ static void sd_log_open(void) {
         strftime(sd_log_filename, sizeof(sd_log_filename),
             "/sdcard/adsb_%Y-%m-%dT%H%M%SZ.csv", &timeinfo);
     }
+}
 
-    sd_log = fopen(sd_log_filename, "w");
-    if (sd_log) {
-        fprintf(sd_log, "timestamp_utc,raw_msg,icao,callsign,altitude_ft,speed_kt,"
-                        "heading_deg,vrate_fpm,lat,lon,squawk,"
-                        "rx_lat,rx_lon,range_km,bearing_deg,"
-                        "rx_sats,rx_hdop\n");
-        fflush(sd_log);
-        fsync(fileno(sd_log));
-        sd_log_last_sync = esp_timer_get_time();
-        sd_log_writes = 0;
-    }
+// Write the CSV header to a new file and close it immediately.
+static void sd_log_create(void) {
+    sd_log_pick_filename();
 
-    if (sd_log) {
-        ESP_LOGI(TAG, "SD log: %s", sd_log_filename);
-    } else {
+    FILE *f = fopen(sd_log_filename, "w");
+    if (!f) {
         ESP_LOGW(TAG, "Failed to open SD log: %s", sd_log_filename);
+        return;
     }
+    fprintf(f, "timestamp_utc,raw_msg,icao,callsign,altitude_ft,speed_kt,"
+               "heading_deg,vrate_fpm,lat,lon,squawk,"
+               "rx_lat,rx_lon,range_km,bearing_deg,"
+               "rx_sats,rx_hdop\n");
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+    sd_clear_dirty_flag();
+
+    sd_log_initialized = true;
+    sd_log_last_sync = esp_timer_get_time();
+    sd_log_writes = 0;
+    sd_log_buf_pos = 0;
+    ESP_LOGI(TAG, "SD log: %s", sd_log_filename);
 }
 
-// Close and reopen the log file in append mode.
-// This forces the FAT directory entry (file size, cluster chain) to disk,
-// making the filesystem consistent. A crash after fclose loses no data;
-// a crash with the file open only risks the writes since the last sync.
-static void sd_log_sync(void) {
-    if (!sd_log || sd_log_filename[0] == '\0') return;
+// Flush the PSRAM buffer to disk: open → append → close → clear dirty.
+// File is open for only the duration of this call (~10-50ms).
+static void sd_log_flush(void) {
+    if (!sd_log_initialized || sd_log_buf_pos == 0) return;
+    if (sd_log_filename[0] == '\0') return;
 
-    fflush(sd_log);
-    fsync(fileno(sd_log));
-    fclose(sd_log);
-    sd_log = NULL;
+    FILE *f = fopen(sd_log_filename, "a");
+    if (!f) {
+        ESP_LOGW(TAG, "SD flush: cannot open %s", sd_log_filename);
+        // Don't discard buffer — retry next cycle
+        return;
+    }
 
-    sd_log = fopen(sd_log_filename, "a");
-    if (sd_log) {
-        sd_log_last_sync = esp_timer_get_time();
-        sd_log_writes = 0;
+    size_t written = fwrite(sd_log_buf, 1, sd_log_buf_pos, f);
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+
+    // File is now closed — FatFS has no cached state.
+    // Clear dirty bit directly on disk; nothing can overwrite it
+    // until the next fopen (which only happens at next flush).
+    sd_clear_dirty_flag();
+
+    if ((int)written == sd_log_buf_pos) {
+        sd_log_buf_pos = 0;
     } else {
-        ESP_LOGW(TAG, "Failed to reopen SD log: %s", sd_log_filename);
+        // Partial write — shift unwritten data to front
+        int remain = sd_log_buf_pos - (int)written;
+        memmove(sd_log_buf, sd_log_buf + written, remain);
+        sd_log_buf_pos = remain;
+        ESP_LOGW(TAG, "SD flush: partial write (%d/%d)", (int)written, sd_log_buf_pos + (int)written);
     }
+
+    sd_log_last_sync = esp_timer_get_time();
+    sd_log_writes = 0;
 }
 
-// Close the log file permanently (for clean shutdown/unmount).
+// Close the log permanently (for clean shutdown/unmount).
 void sd_log_close(void) {
-    if (!sd_log) return;
-    fflush(sd_log);
-    fsync(fileno(sd_log));
-    fclose(sd_log);
-    sd_log = NULL;
+    sd_log_flush();  // write any remaining buffered data
+    sd_log_initialized = false;
     ESP_LOGI(TAG, "SD log closed: %s", sd_log_filename);
 }
 
-// Rename the current log file from boot-numbered to UTC-timestamped.
-// Called once from the GPS task when the system clock is first set.
-void sd_log_rename_with_time(void) {
-    if (!sd_log) return;
+// Print current SD log status.
+void sd_log_print_status(void) {
+    if (sd_log_initialized && sd_log_filename[0]) {
+        printf("I (%lu) CLASS: SD log: %s\n",
+            (unsigned long)(esp_timer_get_time() / 1000), sd_log_filename);
+    }
+}
 
-    // Only rename if current name is a boot-numbered file
+// Rename boot-numbered log to UTC-timestamped name.
+// Called once from GPS task when the system clock is first set.
+void sd_log_rename_with_time(void) {
+    if (!sd_log_initialized) return;
     if (strstr(sd_log_filename, "adsb_boot") == NULL) return;
 
     time_t now;
     struct tm timeinfo;
     time(&now);
     gmtime_r(&now, &timeinfo);
-
-    // Don't rename if clock still isn't set
     if (now < 1704067200LL) return;
+
+    // Flush any buffered data to the old filename first
+    sd_log_flush();
 
     char new_filename[64];
     strftime(new_filename, sizeof(new_filename),
         "/sdcard/adsb_%Y-%m-%dT%H%M%SZ.csv", &timeinfo);
 
-    // Close, rename, reopen in append mode
-    fflush(sd_log);
-    fsync(fileno(sd_log));
-    fclose(sd_log);
-    sd_log = NULL;
-
+    // File is already closed (flush closes it), so rename is safe
     if (rename(sd_log_filename, new_filename) == 0) {
         ESP_LOGI(TAG, "SD log renamed: %s → %s", sd_log_filename, new_filename);
         strncpy(sd_log_filename, new_filename, sizeof(sd_log_filename));
     } else {
-        ESP_LOGW(TAG, "SD log rename failed, reopening original");
-    }
-
-    sd_log = fopen(sd_log_filename, "a");
-    if (sd_log) {
-        sd_log_last_sync = esp_timer_get_time();
-        sd_log_writes = 0;
-    } else {
-        ESP_LOGE(TAG, "Failed to reopen SD log: %s", sd_log_filename);
+        ESP_LOGW(TAG, "SD log rename failed");
     }
 }
 
-// Format current time as ISO-8601 UTC string for CSV logging.
-// Falls back to boot-time microseconds if wall clock not set.
-static int sd_log_write_timestamp(void) {
+// Append a formatted timestamp to the PSRAM buffer.
+static void sd_log_buf_timestamp(void) {
+    if (!sd_log_buf) return;
+    int avail = SD_LOG_BUFSIZE - sd_log_buf_pos;
+    if (avail < 40) return;  // need room for timestamp
+
     struct timeval tv;
     gettimeofday(&tv, NULL);
     struct tm tm_info;
     gmtime_r(&tv.tv_sec, &tm_info);
 
+    int n;
     if (tm_info.tm_year + 1900 >= 2024) {
-        return fprintf(sd_log, "%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ",
+        n = snprintf(sd_log_buf + sd_log_buf_pos, avail,
+            "%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ",
             tm_info.tm_year + 1900, tm_info.tm_mon + 1, tm_info.tm_mday,
             tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec,
             (long)(tv.tv_usec / 1000));
     } else {
         int64_t boot_ms = esp_timer_get_time() / 1000;
-        return fprintf(sd_log, "boot+%lld.%03lld",
+        n = snprintf(sd_log_buf + sd_log_buf_pos, avail,
+            "boot+%lld.%03lld",
             (long long)(boot_ms / 1000), (long long)(boot_ms % 1000));
     }
+    if (n > 0) sd_log_buf_pos += n;
 }
 
 static void sd_log_aircraft(aircraft_t *ac, const struct mode_s_msg *mm) {
-    // Lazy open: retry every 5 seconds if the log isn't open yet
-    // (SD card may mount late or not be available at boot)
-    if (!sd_log) {
-        static int64_t last_retry = 0;
-        int64_t now_us = esp_timer_get_time();
-        if (now_us - last_retry > 5000000LL) {  // 5 seconds
-            last_retry = now_us;
-            sd_log_open();
-        }
-        if (!sd_log) return;
+    // Allocate buffer once
+    if (!sd_log_buf) {
+        sd_log_buf = heap_caps_malloc(SD_LOG_BUFSIZE, MALLOC_CAP_SPIRAM);
+        if (!sd_log_buf) return;
+        sd_log_buf_pos = 0;
     }
+
+    // Lazy create: retry every 5 seconds if the log hasn't been created yet
+    if (!sd_log_initialized) {
+        static int64_t last_retry = 0;
+        static int64_t last_mount_retry = 0;
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - last_retry > 5000000LL) {
+            last_retry = now_us;
+            sd_log_create();
+            if (!sd_log_initialized && (now_us - last_mount_retry > 30000000LL)) {
+                last_mount_retry = now_us;
+                extern bool sd_remount(void);
+                if (sd_remount()) {
+                    sd_log_create();
+                }
+            }
+        }
+        if (!sd_log_initialized) return;
+    }
+
+    // Check buffer space — flush if getting full (leave 512B headroom)
+    if (sd_log_buf_pos > SD_LOG_BUFSIZE - 512) {
+        sd_log_flush();
+    }
+
     receiver_pos_t rx = adsb_get_receiver_pos();
     double range_km = 0, bearing = 0;
     if (rx.fix_valid && ac->has_position)
         haversine(rx.lat, rx.lon, ac->lat, ac->lon, &range_km, &bearing);
 
-    // Timestamp
-    sd_log_write_timestamp();
+    // Write to PSRAM buffer (not to disk)
+    sd_log_buf_timestamp();
 
-    // Raw hex message (second column)
-    fprintf(sd_log, ",");
+    int avail = SD_LOG_BUFSIZE - sd_log_buf_pos;
+    if (avail < 256) return;  // safety margin
+
+    // Raw hex message
+    int n = snprintf(sd_log_buf + sd_log_buf_pos, avail, ",");
+    if (n > 0) sd_log_buf_pos += n;
+
     if (mm) {
         int msglen = mm->msgbits / 8;
-        for (int i = 0; i < msglen; i++)
-            fprintf(sd_log, "%02X", mm->msg[i]);
+        for (int i = 0; i < msglen && sd_log_buf_pos < SD_LOG_BUFSIZE - 4; i++) {
+            n = snprintf(sd_log_buf + sd_log_buf_pos, 3, "%02X", mm->msg[i]);
+            if (n > 0) sd_log_buf_pos += n;
+        }
     }
 
-    // Decoded fields
-    fprintf(sd_log,
+    avail = SD_LOG_BUFSIZE - sd_log_buf_pos;
+    n = snprintf(sd_log_buf + sd_log_buf_pos, avail,
         ",%06lX,%s,%d,%d,%d,%d,%.5f,%.5f,%04X,%.5f,%.5f,%.1f,%.0f,%d,%.1f\n",
         (unsigned long)ac->icao,
         ac->callsign[0] ? ac->callsign : "",
@@ -436,16 +491,15 @@ static void sd_log_aircraft(aircraft_t *ac, const struct mode_s_msg *mm) {
         rx.sats,
         rx.hdop
     );
+    if (n > 0) sd_log_buf_pos += n;
 
-    fflush(sd_log);
     sd_log_writes++;
 
-    // Periodic close/reopen to commit FAT metadata to disk.
-    // This ensures filesystem consistency if the device crashes.
+    // Periodic flush: buffer → disk → close → clear dirty
     int64_t sync_now = esp_timer_get_time();
     if (sd_log_writes >= SD_SYNC_WRITE_COUNT ||
         (sync_now - sd_log_last_sync) > SD_SYNC_INTERVAL_US) {
-        sd_log_sync();
+        sd_log_flush();
     }
 }
 // ============================================================
@@ -468,7 +522,10 @@ void adsb_update_display(lv_obj_t *table) {
 
 void on_msg(mode_s_t *self, struct mode_s_msg *mm)
 {
-    mode_s_decode(self, mm, mm->msg);
+    // mm is already fully decoded by mode_s_detect() → mode_s_decode()
+    // before invoking this callback.  Do NOT re-decode: mode_s_decode()
+    // does memset(mm,0,...) which zeroes mm->msg, and since the third
+    // arg (msg) points into the same struct, the copy-back reads zeros.
 
     uint32_t icao = (uint32_t)(mm->aa1 << 16 | mm->aa2 << 8 | mm->aa3);
     if (icao == 0) return;
@@ -488,12 +545,17 @@ void on_msg(mode_s_t *self, struct mode_s_msg *mm)
             ac->callsign[i] = '\0';
     }
 
-    // Altitude
-    if (mm->altitude) {
-        ac->altitude = mm->altitude;
+    // Altitude — only from message types that carry it:
+    //   DF0/4/16/20: 13-bit AC field (decode_ac13_field)
+    //   DF17 TC 9-18: 12-bit altitude in airborne position (decode_ac12_field)
+    if (mm->msgtype == 0 || mm->msgtype == 4 ||
+        mm->msgtype == 16 || mm->msgtype == 20) {
+        if (mm->altitude) ac->altitude = mm->altitude;
+    } else if (mm->msgtype == 17 && mm->metype >= 9 && mm->metype <= 18) {
+        if (mm->altitude) ac->altitude = mm->altitude;
     }
 
-    // CPR position (DF17, ME 9-18)
+    // CPR position (DF17, TC 9-18)
     if (mm->msgtype == 17 && mm->metype >= 9 && mm->metype <= 18) {
         cpr_cache_t *c = cpr_get(icao);
         int64_t now = esp_timer_get_time();
@@ -517,13 +579,25 @@ void on_msg(mode_s_t *self, struct mode_s_msg *mm)
         }
     }
 
-    // Velocity (DF17, ME 19)
+    // Velocity (DF17, TC 19, subtypes 1-4)
     if (mm->msgtype == 17 && mm->metype == 19) {
-        ac->speed     = mm->velocity;
-        ac->heading   = mm->heading_is_valid ? mm->heading : ac->heading;
-        ac->vert_rate = mm->vert_rate_sign
-                      ? -(mm->vert_rate * 64)
-                      :  (mm->vert_rate * 64);
+        if (mm->mesub == 1 || mm->mesub == 2) {
+            ac->speed = mm->velocity;
+            // Heading is computed from EW/NS velocity components in mode_s_decode
+            // and is always valid when velocity > 0 (heading_is_valid is only
+            // meaningful for subtypes 3/4 which carry airborne magnetic heading).
+            if (mm->velocity)
+                ac->heading = mm->heading;
+            // vert_rate raw=0 means "not available" per DO-260B
+            if (mm->vert_rate) {
+                ac->vert_rate = mm->vert_rate_sign
+                              ? -((mm->vert_rate - 1) * 64)
+                              :  ((mm->vert_rate - 1) * 64);
+            }
+        } else if (mm->mesub == 3 || mm->mesub == 4) {
+            if (mm->heading_is_valid)
+                ac->heading = mm->heading;
+        }
     }
 
     // Squawk (DF5, DF21)
@@ -532,8 +606,11 @@ void on_msg(mode_s_t *self, struct mode_s_msg *mm)
     }
 
     // --- Print one-line summary with full known state ---
-    // Only print when serial console is in LOG mode
-    if (serial_console_log_enabled()) {
+    // Routes through serial_console_print() so lines are buffered in PSRAM
+    // during CMD mode and replayed when returning to LOG mode.
+    {
+    char line[384];
+    int pos = 0, avail = sizeof(line);
 
     // Timestamp
     struct timeval tv;
@@ -541,54 +618,73 @@ void on_msg(mode_s_t *self, struct mode_s_msg *mm)
     struct tm tm_info;
     gmtime_r(&tv.tv_sec, &tm_info);
     if (tm_info.tm_year + 1900 >= 2024) {
-        fprintf(stdout, "[%04d-%02d-%02d %02d:%02d:%02d.%03ldZ] ",
+        int n = snprintf(line + pos, avail, "[%04d-%02d-%02d %02d:%02d:%02d.%03ldZ] ",
             tm_info.tm_year + 1900, tm_info.tm_mon + 1, tm_info.tm_mday,
             tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec,
             (long)(tv.tv_usec / 1000));
+        if (n > 0) { pos += n; avail -= n; }
     } else {
         int64_t boot_ms = esp_timer_get_time() / 1000;
-        fprintf(stdout, "[boot+%lld.%03lld] ", boot_ms / 1000, boot_ms % 1000);
+        int n = snprintf(line + pos, avail, "[boot+%lld.%03lld] ", boot_ms / 1000, boot_ms % 1000);
+        if (n > 0) { pos += n; avail -= n; }
     }
 
     // ICAO + callsign
-    fprintf(stdout, "%06lX", (unsigned long)icao);
-    if (ac->callsign[0])
-        fprintf(stdout, " %-8s", ac->callsign);
+    { int n = snprintf(line + pos, avail, "%06lX", (unsigned long)icao);
+      if (n > 0) { pos += n; avail -= n; } }
+    if (ac->callsign[0]) {
+        int n = snprintf(line + pos, avail, " %-8s", ac->callsign);
+        if (n > 0) { pos += n; avail -= n; }
+    }
 
     // Altitude + velocity
-    if (ac->altitude)
-        fprintf(stdout, " %5dft", ac->altitude);
-    if (ac->speed)
-        fprintf(stdout, " %3dkt %03d°", ac->speed, ac->heading);
-    if (ac->vert_rate)
-        fprintf(stdout, " %+dfpm", ac->vert_rate);
+    if (ac->altitude) {
+        int n = snprintf(line + pos, avail, " %5dft", ac->altitude);
+        if (n > 0) { pos += n; avail -= n; }
+    }
+    if (ac->speed) {
+        int n = snprintf(line + pos, avail, " %3dkt %03d°", ac->speed, ac->heading);
+        if (n > 0) { pos += n; avail -= n; }
+    }
+    if (ac->vert_rate) {
+        int n = snprintf(line + pos, avail, " %+dfpm", ac->vert_rate);
+        if (n > 0) { pos += n; avail -= n; }
+    }
 
     // Position + distance from receiver
     if (ac->has_position) {
-        fprintf(stdout, " (%.4f%c,%.4f%c)",
+        int n = snprintf(line + pos, avail, " (%.4f%c,%.4f%c)",
             fabs(ac->lat), ac->lat >= 0 ? 'N' : 'S',
             fabs(ac->lon), ac->lon >= 0 ? 'E' : 'W');
+        if (n > 0) { pos += n; avail -= n; }
         receiver_pos_t rx = adsb_get_receiver_pos();
         if (rx.fix_valid) {
             double dist_km, brg;
             haversine(rx.lat, rx.lon, ac->lat, ac->lon, &dist_km, &brg);
             double dist_nm = dist_km * 0.539957;
-            fprintf(stdout, " %.1fnm@%03.0f°", dist_nm, brg);
+            n = snprintf(line + pos, avail, " %.1fnm@%03.0f°", dist_nm, brg);
+            if (n > 0) { pos += n; avail -= n; }
         }
     }
 
     // Squawk
-    if (ac->squawk)
-        fprintf(stdout, " SQK:%04X", ac->squawk);
+    if (ac->squawk) {
+        int n = snprintf(line + pos, avail, " SQK:%04X", ac->squawk);
+        if (n > 0) { pos += n; avail -= n; }
+    }
 
     // Raw hex (compact, at end)
-    fprintf(stdout, " [");
+    { int n = snprintf(line + pos, avail, " [");
+      if (n > 0) { pos += n; avail -= n; } }
     int msglen = mm->msgbits / 8;
-    for (int i = 0; i < msglen; i++)
-        fprintf(stdout, "%02X", mm->msg[i]);
-    fprintf(stdout, "]\n");
+    for (int i = 0; i < msglen && avail > 3; i++) {
+        int n = snprintf(line + pos, avail, "%02X", mm->msg[i]);
+        if (n > 0) { pos += n; avail -= n; }
+    }
+    if (avail > 2) { line[pos++] = ']'; line[pos++] = '\n'; line[pos] = '\0'; }
 
-    } // end serial_console_log_enabled()
+    serial_console_print("%s", line);
+    }
 
     sd_log_aircraft(ac, mm);
 
@@ -646,7 +742,7 @@ static void adsb_reader_task(void *arg)
 
     ESP_LOGI(TAG, "[APP] Free memory: %ld bytes", esp_get_free_heap_size());
     mode_s_init(&state);
-    sd_log_open();
+    sd_log_create();
 
     // Allocate read buffers and magnitude buffer once — in PSRAM to
     // preserve internal RAM for SDMMC DMA, LVGL, and wallpaper decoding.
@@ -700,7 +796,7 @@ static void adsb_reader_task(void *arg)
     free(buffer);
 
 done:
-    if (sd_log) { fclose(sd_log); sd_log = NULL; }
+    sd_log_close();
     // Release USB event pumping back to class_driver_task
     s_reader_owns_events = false;
     ESP_LOGI(TAG, "ADSB reader task exiting");

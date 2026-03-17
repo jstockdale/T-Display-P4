@@ -40,6 +40,8 @@
 #include "lvgl_ui.h"
 #include "sd_pwr_ctrl_by_on_chip_ldo.h"
 #include "esp_vfs_fat.h"
+#include "sdmmc_cmd.h"
+#include "driver/sdmmc_host.h"
 #include "New Notification 010_c2_b16_s44100.h"
 #include "ICM20948_WE.h"
 #include "esp_netif.h"
@@ -2038,7 +2040,7 @@ bool Set_T_Mixrf_Lr1121_Sleep()
 
 static sdmmc_card_t *sd_card_handle = NULL;
 
-bool Sdmmc_Init(const char *base_path)
+bool Sdmmc_Init(const char *base_path, int max_retries = 1)
 {
     esp_vfs_fat_sdmmc_mount_config_t mount_config =
         {
@@ -2076,15 +2078,17 @@ bool Sdmmc_Init(const char *base_path)
     printf("mounting filesystem\n");
 
     // Retry mount — SD card may need extra time to come online
-    for (int attempt = 0; attempt < 3; attempt++) {
+    for (int attempt = 0; attempt < max_retries; attempt++) {
         assert = esp_vfs_fat_sdmmc_mount(base_path, &host, &slot_config, &mount_config, &card);
         if (assert == ESP_OK) break;
-        printf("SD mount attempt %d failed (0x%lx), retrying in 1s...\n", attempt + 1, assert);
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (attempt < max_retries - 1) {
+            printf("SD mount attempt %d failed (0x%lx), retrying in 1s...\n", attempt + 1, assert);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
     }
     if (assert != ESP_OK)
     {
-        printf("failed to mount filesystem after retries\n");
+        printf("failed to mount filesystem\n");
         return false;
     }
 
@@ -2092,7 +2096,35 @@ bool Sdmmc_Init(const char *base_path)
     printf("[MEM] after SD mount: internal=%u\n", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     sdmmc_card_print_info(stdout, card);
     sd_card_handle = card;
+
+    // Clear FAT32 dirty flag after mount
+    sd_clear_dirty_flag();
+
     return true;
+}
+
+// Clear the FAT32 dirty flag (ClnShutBit + HrdErrBit in FAT[1]).
+// Called after mount and periodically during sd_log_sync so that
+// a hard crash always leaves the flag clean for macOS.
+extern "C" void sd_clear_dirty_flag(void) {
+    if (!sd_card_handle) return;
+    uint8_t bpb[512];
+    if (sdmmc_read_sectors(sd_card_handle, bpb, 0, 1) != ESP_OK) return;
+    if (bpb[510] != 0x55 || bpb[511] != 0xAA) return;
+    uint16_t reserved = *(uint16_t *)(bpb + 14);
+    uint8_t n_fats = bpb[16];
+    uint32_t fat_size = *(uint32_t *)(bpb + 36);
+    if (reserved == 0) return;
+    uint8_t fat_sec[512];
+    if (sdmmc_read_sectors(sd_card_handle, fat_sec, reserved, 1) != ESP_OK) return;
+    uint32_t fat1 = *(uint32_t *)(fat_sec + 4);
+    if ((fat1 & 0x0C000000) == 0x0C000000) return; // already clean
+    fat1 |= 0x0C000000;
+    *(uint32_t *)(fat_sec + 4) = fat1;
+    sdmmc_write_sectors(sd_card_handle, fat_sec, reserved, 1);
+    if (n_fats > 1 && fat_size > 0) {
+        sdmmc_write_sectors(sd_card_handle, fat_sec, reserved + fat_size, 1);
+    }
 }
 
 // Clean SD shutdown: close log file, unmount FATFS so dirty bit is cleared.
@@ -2104,6 +2136,20 @@ extern "C" void sd_safe_shutdown(void) {
         sd_card_handle = NULL;
         printf("[SD] Filesystem unmounted cleanly\n");
     }
+}
+
+extern "C" bool sd_remount(void) {
+    if (sd_card_handle) {
+        printf("[SD] Already mounted\n");
+        return true;
+    }
+    bool ok = Sdmmc_Init("/sdcard", 1);  // single attempt, no retries
+    if (ok) {
+        printf("[SD] Filesystem mounted\n");
+    } else {
+        printf("[SD] Mount failed\n");
+    }
+    return ok;
 }
 
 void System_Ui_Callback_Init(void)
@@ -3174,6 +3220,14 @@ extern "C" void app_main(void)
 
     XL9535->pin_mode(XL9535_ETHERNET_RST, Cpp_Bus_Driver::Xl95x5::Mode::OUTPUT);
     XL9535->pin_write(XL9535_ETHERNET_RST, Cpp_Bus_Driver::Xl95x5::Value::HIGH);
+
+    // Kill SD card power immediately — resets the card's internal state
+    // machine if a previous hard reset left it stuck mid-transaction.
+    // Power stays off through the rest of peripheral init (~5 seconds),
+    // giving caps plenty of time to drain.  Re-enabled just before mount.
+    XL9535->pin_mode(XL9535_SD_EN, Cpp_Bus_Driver::Xl95x5::Mode::OUTPUT);
+    XL9535->pin_write(XL9535_SD_EN, Cpp_Bus_Driver::Xl95x5::Value::HIGH);  // power OFF
+
     Ethernet_Init();
 
 #if defined CONFIG_SCREEN_TYPE_HI8561
@@ -3268,11 +3322,12 @@ extern "C" void app_main(void)
     // put the C6 into AT mode and conflict with ESP-Hosted transport.
     Sys_Status.esp32c6.init_flag = true;  // ESP-Hosted inits automatically
 
-    XL9535->pin_mode(XL9535_SD_EN, Cpp_Bus_Driver::Xl95x5::Mode::OUTPUT);
-    XL9535->pin_write(XL9535_SD_EN, Cpp_Bus_Driver::Xl95x5::Value::LOW);
-    vTaskDelay(pdMS_TO_TICKS(100));
+    // Re-enable SD card power — card has been off since early in boot,
+    // so its state machine is fully reset.
+    XL9535->pin_write(XL9535_SD_EN, Cpp_Bus_Driver::Xl95x5::Value::LOW);   // power ON
+    vTaskDelay(pdMS_TO_TICKS(100));  // let card power up and stabilize
 
-    bool sd_mounted = Sdmmc_Init(SD_BASE_PATH);
+    bool sd_mounted = Sdmmc_Init(SD_BASE_PATH, 3);
     if (!sd_mounted)
         printf("Sdmmc_Init fail -- wallpaper resources unavailable\n");
     else
