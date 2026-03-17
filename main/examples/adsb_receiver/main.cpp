@@ -226,6 +226,7 @@ TaskHandle_t Ethernet_Task_Handle = NULL;
 TaskHandle_t At_Task_Handle = NULL;
 TaskHandle_t Sleep_Task_Handle = NULL;
 TaskHandle_t Rf_Task_Handle = NULL;
+TaskHandle_t Adsb_App_Task_Handle = NULL;
 TaskHandle_t Iis_Transmission_Data_Stream_Task = NULL;
 
 // USB host task handles — kept so app_main can clean up if needed
@@ -389,14 +390,59 @@ typedef struct
 } app_message_t;
 #endif
 
+// Get local timezone offset in minutes from GPS position and UTC date.
+// Uses the full tz_lookup library with 0.1° resolution grid and DST rules.
+// Returns 0 (UTC) if no GPS fix or system clock not set.
+#include "tz_lookup.h"
+
+static int16_t get_tz_offset_minutes(void) {
+    if (tz_is_manual()) {
+        // Manual override — tz_lookup handles this internally but we
+        // need the value here for direct RTC calculations.
+        receiver_pos_t rx = {0};  // dummy
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        struct tm tm_utc;
+        gmtime_r(&tv.tv_sec, &tm_utc);
+        tz_result_t r = tz_lookup(0, 0, tm_utc.tm_year + 1900, tm_utc.tm_mon + 1, tm_utc.tm_mday);
+        return r.total_offset_min;
+    }
+    receiver_pos_t rx = adsb_get_receiver_pos();
+    if (!rx.fix_valid) return 0;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    struct tm tm_utc;
+    gmtime_r(&tv.tv_sec, &tm_utc);
+    return tz_get_offset_minutes(rx.lat, rx.lon,
+        tm_utc.tm_year + 1900, tm_utc.tm_mon + 1, tm_utc.tm_mday);
+}
+
 void Save_Real_Time(Cpp_Bus_Driver::Esp_At::Real_Time time)
 {
+    int16_t tz_off_min = get_tz_offset_minutes();
+
+    // Compute local time from UTC for RTC and UI display
+    time_t utc_epoch = 0;
+    {
+        struct tm tm_utc = {};
+        tm_utc.tm_year = time.year - 1900;
+        tm_utc.tm_mon  = time.month - 1;
+        tm_utc.tm_mday = time.day;
+        tm_utc.tm_hour = time.hour;
+        tm_utc.tm_min  = time.minute;
+        tm_utc.tm_sec  = time.second;
+        utc_epoch = mktime(&tm_utc);
+    }
+    time_t local_epoch = utc_epoch + tz_off_min * 60;
+    struct tm tm_local;
+    gmtime_r(&local_epoch, &tm_local);
+
     Cpp_Bus_Driver::Pcf8563x::Time t =
         {
-            .second = time.second,
-            .minute = time.minute,
-            .hour = static_cast<uint8_t>((time.hour + 8 + 24) % 24),
-            .day = time.day,
+            .second = static_cast<uint8_t>(tm_local.tm_sec),
+            .minute = static_cast<uint8_t>(tm_local.tm_min),
+            .hour = static_cast<uint8_t>(tm_local.tm_hour),
+            .day = static_cast<uint8_t>(tm_local.tm_mday),
             .week = Cpp_Bus_Driver::Pcf8563x::Week::SUNDAY,
             .month = time.month,
             .year = static_cast<uint8_t>(time.year - 2000),
@@ -413,27 +459,20 @@ void Save_Real_Time(Cpp_Bus_Driver::Esp_At::Real_Time time)
     PCF8563->set_time(t);
 
     // Sync the POSIX system clock so gettimeofday() returns real UTC time.
-    // Use raw NTP UTC values (not the +8 adjusted ones used for PCF8563/UI).
-    struct tm tm_utc = {};
-    tm_utc.tm_year = time.year - 1900;
-    tm_utc.tm_mon  = time.month - 1;
-    tm_utc.tm_mday = time.day;
-    tm_utc.tm_hour = time.hour;   // raw UTC from NTP
-    tm_utc.tm_min  = time.minute;
-    tm_utc.tm_sec  = time.second;
-    time_t epoch = mktime(&tm_utc);
-    if (epoch > 0) {
-        struct timeval tv_now = { .tv_sec = epoch, .tv_usec = 0 };
+    if (utc_epoch > 0) {
+        struct timeval tv_now = { .tv_sec = utc_epoch, .tv_usec = 0 };
         settimeofday(&tv_now, NULL);
     }
 
-    System_Ui->_time.week = time.week;
-    System_Ui->_time.year = time.year;
-    System_Ui->_time.month = time.month;
-    System_Ui->_time.day = time.day;
-    System_Ui->_time.hour = static_cast<uint8_t>((time.hour + 8 + 24) % 24);
-    System_Ui->_time.minute = time.minute;
-    System_Ui->_time.second = time.second;
+    // UI displays local time
+    static const char *wday_names[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+    System_Ui->_time.week = wday_names[tm_local.tm_wday];
+    System_Ui->_time.year = static_cast<uint16_t>(tm_local.tm_year + 1900);
+    System_Ui->_time.month = static_cast<uint8_t>(tm_local.tm_mon + 1);
+    System_Ui->_time.day = static_cast<uint8_t>(tm_local.tm_mday);
+    System_Ui->_time.hour = static_cast<uint8_t>(tm_local.tm_hour);
+    System_Ui->_time.minute = static_cast<uint8_t>(tm_local.tm_min);
+    System_Ui->_time.second = static_cast<uint8_t>(tm_local.tm_sec);
     System_Ui->_time.time_zone = time.time_zone;
 }
 
@@ -1075,10 +1114,11 @@ void device_gps_task(void *arg)
                             }
 
                             // --- Set PCF8563 RTC at first fix, then every 60s ---
-                            // RTC stores UTC+8 (LilyGo UI convention)
+                            // RTC stores local time (offset from tz_lookup)
                             size_t now_ms_clk = esp_log_timestamp();
                             if (!last_rtc_write || (now_ms_clk > last_rtc_write + 60000)) {
-                                time_t epoch_local = gps_epoch + 8 * 3600;
+                                int16_t tz_off_min = get_tz_offset_minutes();
+                                time_t epoch_local = gps_epoch + tz_off_min * 60;
                                 struct tm tm_local;
                                 gmtime_r(&epoch_local, &tm_local);
 
@@ -1103,9 +1143,10 @@ void device_gps_task(void *arg)
                                 };
                                 PCF8563->set_time(t);
 
-                                serial_console_print("[GNSS] RTC set: %04d-%02d-%02d %02d:%02d:%02d UTC+8\n",
+                                serial_console_print("[GNSS] RTC set: %04d-%02d-%02d %02d:%02d:%02d UTC%+d:%02d\n",
                                     tm_local.tm_year + 1900, tm_local.tm_mon + 1, tm_local.tm_mday,
-                                    tm_local.tm_hour, tm_local.tm_min, tm_local.tm_sec);
+                                    tm_local.tm_hour, tm_local.tm_min, tm_local.tm_sec,
+                                    tz_off_min / 60, abs(tz_off_min) % 60);
 
                                 last_rtc_write = now_ms_clk;
                             }
@@ -1163,7 +1204,12 @@ void device_gps_task(void *arg)
                         if (rmc.utc.update_flag == true)
                         {
                             rmc_data_str += "utc time: " + std::to_string(rmc.utc.hour) + ":" + std::to_string(rmc.utc.minute) + ":" + std::to_string(static_cast<uint8_t>(rmc.utc.second)) + "\n";
-                            rmc_data_str += "china time: " + std::to_string((rmc.utc.hour + 8 + 24) % 24) + ":" + std::to_string(rmc.utc.minute) + ":" + std::to_string(static_cast<uint8_t>(rmc.utc.second)) + "\n";
+                            {
+                                int16_t tz_m = get_tz_offset_minutes();
+                                int local_h = ((int)rmc.utc.hour * 60 + (int)rmc.utc.minute + tz_m + 1440) / 60 % 24;
+                                int local_min = ((int)rmc.utc.hour * 60 + (int)rmc.utc.minute + tz_m + 1440) % 60;
+                                rmc_data_str += "local time: " + std::to_string(local_h) + ":" + std::to_string(local_min) + ":" + std::to_string(static_cast<uint8_t>(rmc.utc.second)) + "\n";
+                            }
                             rmc.utc.update_flag = false;
                         }
 
@@ -1353,7 +1399,7 @@ void device_at_task(void *arg)
 
                 // RTL-SDR connection
                 status_str += "RTL-SDR: ";
-                status_str += stats.rtlsdr_connected ? "\xE2\x9C\x93 connected\n" : "\xE2\x9C\x97 not connected\n";
+                status_str += stats.rtlsdr_connected ? "[OK] connected\n" : "[--] not connected\n";
 
                 // Message stats
                 char buf[128];
@@ -1409,6 +1455,85 @@ void device_at_task(void *arg)
 
         default:
             break;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+void device_adsb_app_task(void *arg)
+{
+    printf("device_adsb_app_task start\n");
+    vTaskSuspend(Adsb_App_Task_Handle);
+
+    // Buffers for formatting — allocated once on task stack
+    static char stats_buf[512];
+    static char list_buf[4096];
+
+    size_t cycle_time = 0;
+
+    while (1)
+    {
+        if (esp_log_timestamp() > cycle_time)
+        {
+            if (System_Ui->get_current_win() == Lvgl_Ui::System::Current_Win::ADSB)
+            {
+                adsb_stats_t stats = adsb_get_stats();
+                receiver_pos_t rx = adsb_get_receiver_pos();
+
+                // Format stats panel
+                int pos = 0;
+                pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
+                    "RTL-SDR: %s", stats.rtlsdr_connected ? "connected" : "disconnected");
+
+                if (stats.rtlsdr_connected) {
+                    pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
+                        "   %.1f msg/s", stats.msg_rate);
+                }
+
+                pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
+                    "\nAircraft: %d   Messages: %lu",
+                    stats.active_aircraft, (unsigned long)stats.total_messages);
+
+                // GPS line
+                if (rx.fix_valid) {
+                    pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
+                        "\nGPS: %.4f, %.4f (%d sats)",
+                        rx.lat, rx.lon, rx.sats);
+                } else {
+                    pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
+                        "\nGPS: searching...");
+                }
+
+                // Nearest aircraft
+                if (stats.nearest_icao) {
+                    pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
+                        "\nNearest: %06lX %s  %.1fnm  %dft",
+                        (unsigned long)stats.nearest_icao,
+                        stats.nearest_callsign[0] ? stats.nearest_callsign : "----",
+                        stats.nearest_dist_nm, stats.nearest_alt);
+                }
+
+                // UTC time
+                struct timeval tv;
+                gettimeofday(&tv, NULL);
+                struct tm tm_info;
+                gmtime_r(&tv.tv_sec, &tm_info);
+                if (tm_info.tm_year + 1900 >= 2024) {
+                    pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
+                        "\nUTC: %02d:%02d:%02d",
+                        tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec);
+                }
+
+                // Format aircraft list
+                adsb_format_aircraft_list(list_buf, sizeof(list_buf));
+
+                _lock_acquire(&lvgl_api_lock);
+                System_Ui->win_adsb_update(stats_buf, list_buf);
+                _lock_release(&lvgl_api_lock);
+            }
+
+            cycle_time = esp_log_timestamp() + 500;  // update every 500ms for responsive feel
         }
 
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -2203,11 +2328,11 @@ extern "C" bool sd_remount(void) {
     return ok;
 }
 
-extern "C" bool sd_is_mounted(void) {
+bool sd_is_mounted(void) {
     return sd_card_handle != NULL;
 }
 
-extern "C" bool sd_is_logging(void) {
+bool sd_is_logging(void) {
     // We're logging if SD is mounted and the RTL-SDR reader task is running
     // (sd_log_create is called when the reader task starts)
     adsb_stats_t stats = adsb_get_stats();
@@ -2321,6 +2446,14 @@ void System_Ui_Callback_Init(void)
                     printf("app_video_stream_task_stop fail (error code: %#X)\n", assert);
             }
         }
+    };
+
+    System_Ui->_win_adsb_status_callback = [](bool status)
+    {
+        if (status == true)
+            vTaskResume(Adsb_App_Task_Handle);
+        else
+            vTaskSuspend(Adsb_App_Task_Handle);
     };
 
     System_Ui->_win_rf_config_sx1262_params_callback = [](Lvgl_Ui::System::Device_Sx1262 device_sx1262) -> bool
@@ -3038,7 +3171,7 @@ bool App_Video_Init(void)
     return true;
 }
 
-#if (CONFIG_ENABLE_PPA_SCREEN_ROTATION == true) && (!defined SCREEN_ROTATION_DIRECTION_0)
+// PPA rotation client — always initialized so runtime rotation toggle works
 bool Ppa_Screen_Rotation_Init(void)
 {
     ppa_client_config_t ppa_srm_config = { .oper_type = PPA_OPERATION_SRM };
@@ -3050,7 +3183,6 @@ bool Ppa_Screen_Rotation_Init(void)
 
     return true;
 }
-#endif
 
 void System_Startup_Message_Init(void)
 {
@@ -3359,12 +3491,11 @@ extern "C" void app_main(void)
         Sys_Status.camera.init_flag = true;
     }
 
-#if (CONFIG_ENABLE_PPA_SCREEN_ROTATION == true) && (!defined SCREEN_ROTATION_DIRECTION_0)
+    // Always init PPA rotation engine — needed for runtime rotation toggle
     if (Ppa_Screen_Rotation_Init() == false)
         printf("Ppa_Screen_Rotation_init fail\n");
     else
         printf("Ppa_Screen_Rotation_init success\n");
-#endif
 
 #if CONFIG_ENABLE_USB_DISPLAY == true
     Usb_Screen_Init(&Screen_Mipi_Dpi_Panel);
@@ -3730,6 +3861,7 @@ extern "C" void app_main(void)
     xTaskCreate(device_rtc_task,         "device_rtc_task",         4 * 1024, NULL, 3, NULL);
     xTaskCreate(device_at_task,          "device_at_task",          4 * 1024, NULL, 3, &At_Task_Handle);
     xTaskCreate(device_rf_task,          "device_rf_task",          4 * 1024, NULL, 3, &Rf_Task_Handle);
+    xTaskCreate(device_adsb_app_task,    "adsb_app_task",           8 * 1024, NULL, 3, &Adsb_App_Task_Handle);
     xTaskCreate(iis_transmission_data_stream_task, "iis_transmission_data_stream_task", 4 * 1024, NULL, 4, &Iis_Transmission_Data_Stream_Task);
 
 #if defined CONFIG_BOARD_TYPE_T_DISPLAY_P4_KEYBOARD

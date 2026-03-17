@@ -91,6 +91,7 @@ namespace Lvgl_Ui
             CIT_NFC_TEST,
 #endif
             CAMERA,
+            ADSB,
             RF,
             RF_SETINGS,
             MUSIC,
@@ -288,6 +289,22 @@ namespace Lvgl_Ui
 
                     // lv_obj_t *canvas;
                 } camera;
+
+                struct
+                {
+                    lv_obj_t *root;
+                    lv_obj_t *stats_label;
+                    lv_obj_t *list_label;
+                    bool rotated;
+                    lv_display_rotation_t saved_rotation;
+
+                    // Draggable divider state
+                    lv_obj_t *divider;
+                    lv_obj_t *stats_panel;
+                    lv_obj_t *list_panel;
+                    lv_obj_t *list_header;
+                    int32_t divider_y;  // current Y position of divider
+                } adsb;
 
                 struct
                 {
@@ -618,6 +635,8 @@ namespace Lvgl_Ui
 
         void (*_win_camera_status_callback)(bool status) = nullptr;
 
+        void (*_win_adsb_status_callback)(bool status) = nullptr;
+
         bool (*_win_rf_config_sx1262_params_callback)(Device_Sx1262 device_sx1262) = nullptr;
 
         void (*_win_rf_send_data_callback)(std::string data) = nullptr;
@@ -707,6 +726,9 @@ namespace Lvgl_Ui
         // void init_win_cit_sleep_test(void);
 
         void init_win_camera(void);
+
+        void init_win_adsb(void);
+        void win_adsb_update(const char *stats_text, const char *list_text);
 
         void init_win_rf(void);
         void win_rf_chat_message_data_update(std::vector<Win_Rf_Chat_Message> wlcm);

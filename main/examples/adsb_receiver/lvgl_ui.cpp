@@ -552,6 +552,57 @@ namespace Lvgl_Ui
                                 break;
                                 } }, LV_EVENT_ALL, this);
 
+        // ADS-B app button (4th position — no icon image, uses styled button)
+        {
+            lv_obj_t *adsb_btn = lv_button_create(tileview_tile_1);
+            lv_obj_set_size(adsb_btn, APP_STYLE_ICON_WIDTH_HEIGHT, APP_STYLE_ICON_WIDTH_HEIGHT);
+            lv_obj_set_style_radius(adsb_btn, 20, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_bg_color(adsb_btn, lv_color_hex(0x1A3A5C), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(adsb_btn, LV_OPA_COVER, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_shadow_width(adsb_btn, 0, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_border_width(adsb_btn, 0, (lv_style_selector_t)LV_PART_MAIN);
+            // Press animation
+            lv_obj_set_style_bg_color(adsb_btn, lv_color_hex(0x0E2640), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_PRESSED);
+#if defined SCREEN_ROTATION_DIRECTION_0
+            lv_obj_align(adsb_btn, LV_ALIGN_TOP_LEFT,
+                         _app_style.icon.edge_distance.width + (APP_STYLE_ICON_WIDTH_HEIGHT * 3) + (_app_style.icon.icon_distance.width * 3),
+                         _app_style.icon.edge_distance.height + 300);
+#elif defined SCREEN_ROTATION_DIRECTION_90
+            lv_obj_align(adsb_btn, LV_ALIGN_TOP_LEFT,
+                         _app_style.icon.edge_distance.width + (APP_STYLE_ICON_WIDTH_HEIGHT * 3) + (_app_style.icon.icon_distance.width * 3) + 400,
+                         _app_style.icon.edge_distance.height);
+#endif
+            // Radar icon inside the button
+            lv_obj_t *icon_lbl = lv_label_create(adsb_btn);
+            lv_label_set_text(icon_lbl, LV_SYMBOL_GPS);
+            lv_obj_set_style_text_font(icon_lbl, &lv_font_montserrat_48, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_text_color(icon_lbl, lv_color_hex(0x00DD00), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_center(icon_lbl);
+
+            // Label below
+            lv_obj_t *adsb_label = lv_label_create(tileview_tile_1);
+            lv_label_set_text(adsb_label, "ADS-B");
+            lv_obj_set_style_text_align(adsb_label, LV_TEXT_ALIGN_CENTER, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_text_font(adsb_label, &lv_font_montserrat_22, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_size(adsb_label, _app_style.label.width, _app_style.label.height);
+            lv_obj_set_style_text_color(adsb_label, lv_color_white(), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_align_to(adsb_label, adsb_btn, LV_ALIGN_OUT_BOTTOM_MID, 0, 0);
+
+            lv_obj_add_event_cb(adsb_btn, [](lv_event_t *e)
+                                {
+                                    System *self = static_cast<System *>(lv_event_get_user_data(e));
+                                    lv_event_code_t code = lv_event_get_code(e);
+                                    switch (code)
+                                    {
+                                    case LV_EVENT_CLICKED:
+                                        self->init_win_adsb();
+                                        lv_screen_load_anim(self->_registry.win.adsb.root, LV_SCR_LOAD_ANIM_FADE_OUT, 500, 0, true);
+                                        break;
+                                    default:
+                                        break;
+                                    } }, LV_EVENT_ALL, this);
+        }
+
         // 时钟
         _registry.win.home.clock.time_label = lv_label_create(tileview_tile_1);
         char buffer_time[10];
@@ -913,19 +964,19 @@ namespace Lvgl_Ui
 
         // SD card status icon
         _registry.status_bar.sd_icon = lv_label_create(_registry.status_bar.root);
-        lv_obj_set_style_text_font(_registry.status_bar.sd_icon, &lv_font_montserrat_18, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
+        lv_obj_set_style_text_font(_registry.status_bar.sd_icon, &lv_font_montserrat_22, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
         lv_obj_align(_registry.status_bar.sd_icon, LV_ALIGN_RIGHT_MID, -35, 0);
         status_bar_sd_update();
 
         // ADS-B aircraft count icon
         _registry.status_bar.adsb_icon = lv_label_create(_registry.status_bar.root);
-        lv_obj_set_style_text_font(_registry.status_bar.adsb_icon, &lv_font_montserrat_18, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
+        lv_obj_set_style_text_font(_registry.status_bar.adsb_icon, &lv_font_montserrat_22, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
         lv_obj_align(_registry.status_bar.adsb_icon, LV_ALIGN_RIGHT_MID, -68, 0);
         status_bar_adsb_update();
 
         // GPS status icon
         _registry.status_bar.gps_icon = lv_label_create(_registry.status_bar.root);
-        lv_obj_set_style_text_font(_registry.status_bar.gps_icon, &lv_font_montserrat_18, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
+        lv_obj_set_style_text_font(_registry.status_bar.gps_icon, &lv_font_montserrat_22, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
         lv_obj_align(_registry.status_bar.gps_icon, LV_ALIGN_RIGHT_MID, -115, 0);
         status_bar_gps_update();
 
@@ -2748,6 +2799,249 @@ namespace Lvgl_Ui
         set_camera_status(true);
 
         _current_win = Current_Win::CAMERA;
+    }
+
+    void System::init_win_adsb(void)
+    {
+        // Get display dimensions (may be swapped if rotated)
+        lv_display_t *disp = lv_display_get_default();
+        int32_t w = lv_display_get_horizontal_resolution(disp);
+        int32_t h = lv_display_get_vertical_resolution(disp);
+        bool is_landscape = (w > h);
+
+        // Root screen
+        _registry.win.adsb.root = lv_obj_create(NULL);
+        lv_obj_set_style_bg_color(_registry.win.adsb.root, lv_color_hex(0x0A1520), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_size(_registry.win.adsb.root, w, h);
+        lv_obj_set_scrollbar_mode(_registry.win.adsb.root, LV_SCROLLBAR_MODE_OFF);
+
+        // Title bar
+        int32_t status_h = is_landscape ? 0 : 50;  // hide status bar in landscape for max space
+        int32_t title_h = is_landscape ? 40 : 80;
+        lv_obj_t *title_bar = lv_obj_create(_registry.win.adsb.root);
+        lv_obj_set_size(title_bar, w, title_h);
+        lv_obj_align(title_bar, LV_ALIGN_TOP_MID, 0, status_h);
+        lv_obj_set_style_bg_color(title_bar, lv_color_hex(0x1A3A5C), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(title_bar, LV_OPA_COVER, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_border_width(title_bar, 0, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_radius(title_bar, 0, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_remove_flag(title_bar, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *title_label = lv_label_create(title_bar);
+        lv_label_set_text(title_label, is_landscape ? LV_SYMBOL_GPS " ADS-B" : LV_SYMBOL_GPS " ADS-B Receiver");
+        lv_obj_set_style_text_color(title_label, lv_color_hex(0x00DD00), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_text_font(title_label, is_landscape ? &lv_font_montserrat_22 : &lv_font_montserrat_28, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_align(title_label, LV_ALIGN_LEFT_MID, 10, 0);
+
+        // Rotate toggle button
+        lv_obj_t *toggle_btn = lv_button_create(title_bar);
+        lv_obj_set_size(toggle_btn, is_landscape ? 40 : 60, is_landscape ? 30 : 50);
+        lv_obj_align(toggle_btn, LV_ALIGN_RIGHT_MID, -5, 0);
+        lv_obj_set_style_bg_color(toggle_btn, lv_color_hex(0x2A5A8C), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_shadow_width(toggle_btn, 0, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_border_width(toggle_btn, 0, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_radius(toggle_btn, 6, (lv_style_selector_t)LV_PART_MAIN);
+
+        lv_obj_t *toggle_lbl = lv_label_create(toggle_btn);
+        lv_label_set_text(toggle_lbl, LV_SYMBOL_REFRESH);
+        lv_obj_set_style_text_color(toggle_lbl, lv_color_white(), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_center(toggle_lbl);
+
+        lv_obj_add_event_cb(toggle_btn, [](lv_event_t *e)
+                            {
+                                System *self = static_cast<System *>(lv_event_get_user_data(e));
+                                if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+                                lv_display_t *d = lv_display_get_default();
+                                // Save original rotation on first press
+                                if (!self->_registry.win.adsb.rotated) {
+                                    self->_registry.win.adsb.saved_rotation = lv_display_get_rotation(d);
+                                    self->_registry.win.adsb.rotated = true;
+                                }
+                                // Cycle to next rotation (0 → 90 → 180 → 270 → 0 ...)
+                                lv_display_rotation_t cur = lv_display_get_rotation(d);
+                                lv_display_rotation_t next = (lv_display_rotation_t)((cur + 1) % 4);
+                                lv_display_set_rotation(d, next);
+                                self->_registry.win.adsb.divider_y = 0;  // reset divider for new aspect
+                                // Rebuild with new dimensions
+                                self->init_win_adsb();
+                                lv_screen_load(self->_registry.win.adsb.root);
+                            }, LV_EVENT_ALL, this);
+
+        int32_t content_top = status_h + title_h + 4;
+        int32_t content_h = h - content_top - 4;
+
+        // Default divider position (stats / list split)
+        if (_registry.win.adsb.divider_y == 0) {
+            _registry.win.adsb.divider_y = content_top + (is_landscape ? 70 : 180);
+        }
+        // Clamp divider to sensible range
+        int32_t div_min = content_top + 50;
+        int32_t div_max = h - 120;
+        if (_registry.win.adsb.divider_y < div_min) _registry.win.adsb.divider_y = div_min;
+        if (_registry.win.adsb.divider_y > div_max) _registry.win.adsb.divider_y = div_max;
+
+        int32_t div_y = _registry.win.adsb.divider_y;
+
+        // Stats panel — above divider
+        _registry.win.adsb.stats_panel = lv_obj_create(_registry.win.adsb.root);
+        lv_obj_set_size(_registry.win.adsb.stats_panel, w - 20, div_y - content_top);
+        lv_obj_align(_registry.win.adsb.stats_panel, LV_ALIGN_TOP_MID, 0, content_top);
+        lv_obj_set_style_bg_color(_registry.win.adsb.stats_panel, lv_color_hex(0x0F1F2E), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(_registry.win.adsb.stats_panel, LV_OPA_COVER, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_border_color(_registry.win.adsb.stats_panel, lv_color_hex(0x1A3A5C), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_border_width(_registry.win.adsb.stats_panel, 1, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_radius(_registry.win.adsb.stats_panel, 8, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_pad_all(_registry.win.adsb.stats_panel, 8, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_remove_flag(_registry.win.adsb.stats_panel, LV_OBJ_FLAG_SCROLLABLE);
+
+        _registry.win.adsb.stats_label = lv_label_create(_registry.win.adsb.stats_panel);
+        lv_obj_set_style_text_color(_registry.win.adsb.stats_label, lv_color_hex(0xCCDDEE), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_text_font(_registry.win.adsb.stats_label, &lv_font_montserrat_22, (lv_style_selector_t)LV_PART_MAIN);
+        lv_label_set_text(_registry.win.adsb.stats_label, "Waiting for data...");
+        lv_obj_set_width(_registry.win.adsb.stats_label, w - 40);
+
+        // Draggable divider bar
+        _registry.win.adsb.divider = lv_obj_create(_registry.win.adsb.root);
+        lv_obj_set_size(_registry.win.adsb.divider, w - 40, 12);
+        lv_obj_align(_registry.win.adsb.divider, LV_ALIGN_TOP_MID, 0, div_y);
+        lv_obj_set_style_bg_color(_registry.win.adsb.divider, lv_color_hex(0x3A6A9C), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(_registry.win.adsb.divider, LV_OPA_COVER, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_radius(_registry.win.adsb.divider, 6, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_border_width(_registry.win.adsb.divider, 0, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_add_flag(_registry.win.adsb.divider, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_remove_flag(_registry.win.adsb.divider, LV_OBJ_FLAG_SCROLLABLE);
+
+        // Drag handle visual (three small dots)
+        lv_obj_t *handle_lbl = lv_label_create(_registry.win.adsb.divider);
+        lv_label_set_text(handle_lbl, "= = =");
+        lv_obj_set_style_text_color(handle_lbl, lv_color_hex(0x88AACC), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_center(handle_lbl);
+
+        lv_obj_add_event_cb(_registry.win.adsb.divider, [](lv_event_t *e)
+                            {
+                                System *self = static_cast<System *>(lv_event_get_user_data(e));
+                                lv_event_code_t code = lv_event_get_code(e);
+                                if (code != LV_EVENT_PRESSING) return;
+
+                                lv_indev_t *indev = lv_indev_active();
+                                lv_point_t point;
+                                lv_indev_get_point(indev, &point);
+
+                                lv_display_t *d = lv_display_get_default();
+                                int32_t h_now = lv_display_get_vertical_resolution(d);
+                                int32_t w_now = lv_display_get_horizontal_resolution(d);
+                                bool landscape = (w_now > h_now);
+                                int32_t status_h_now = landscape ? 0 : 50;
+                                int32_t title_h_now = landscape ? 40 : 80;
+                                int32_t ct = status_h_now + title_h_now + 4;
+                                int32_t d_min = ct + 50;
+                                int32_t d_max = h_now - 120;
+
+                                int32_t new_y = point.y;
+                                if (new_y < d_min) new_y = d_min;
+                                if (new_y > d_max) new_y = d_max;
+                                self->_registry.win.adsb.divider_y = new_y;
+
+                                // Move divider
+                                lv_obj_align(self->_registry.win.adsb.divider, LV_ALIGN_TOP_MID, 0, new_y);
+
+                                // Resize stats panel
+                                lv_obj_set_height(self->_registry.win.adsb.stats_panel, new_y - ct);
+
+                                // Move and resize list header + list panel
+                                int32_t hdr_y = new_y + 14;
+                                lv_obj_align(self->_registry.win.adsb.list_header, LV_ALIGN_TOP_MID, 0, hdr_y);
+                                lv_obj_set_pos(self->_registry.win.adsb.list_panel, 10, hdr_y + 34);
+                                lv_obj_set_height(self->_registry.win.adsb.list_panel, h_now - hdr_y - 38);
+                            }, LV_EVENT_ALL, this);
+
+        // Column header — below divider
+        int32_t hdr_y = div_y + 14;
+        _registry.win.adsb.list_header = lv_obj_create(_registry.win.adsb.root);
+        lv_obj_set_size(_registry.win.adsb.list_header, w - 20, 32);
+        lv_obj_align(_registry.win.adsb.list_header, LV_ALIGN_TOP_MID, 0, hdr_y);
+        lv_obj_set_style_bg_color(_registry.win.adsb.list_header, lv_color_hex(0x1A3A5C), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(_registry.win.adsb.list_header, LV_OPA_COVER, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_border_width(_registry.win.adsb.list_header, 0, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_radius(_registry.win.adsb.list_header, 6, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_pad_all(_registry.win.adsb.list_header, 4, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_remove_flag(_registry.win.adsb.list_header, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *hdr_label = lv_label_create(_registry.win.adsb.list_header);
+        lv_label_set_text(hdr_label, "ICAO   CALL     ALT     SPD   HDG    DIST");
+        lv_obj_set_style_text_color(hdr_label, lv_color_hex(0x88AACC), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_text_font(hdr_label, &lv_font_montserrat_22, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_align(hdr_label, LV_ALIGN_LEFT_MID, 0, 0);
+
+        // Aircraft list — below header, fills remaining space
+        int32_t list_top = hdr_y + 34;
+        _registry.win.adsb.list_panel = lv_obj_create(_registry.win.adsb.root);
+        lv_obj_set_size(_registry.win.adsb.list_panel, w - 20, h - list_top - 4);
+        lv_obj_set_pos(_registry.win.adsb.list_panel, 10, list_top);
+        lv_obj_set_style_bg_color(_registry.win.adsb.list_panel, lv_color_hex(0x0A1520), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(_registry.win.adsb.list_panel, LV_OPA_COVER, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_border_color(_registry.win.adsb.list_panel, lv_color_hex(0x1A3A5C), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_border_width(_registry.win.adsb.list_panel, 1, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_radius(_registry.win.adsb.list_panel, 8, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_pad_all(_registry.win.adsb.list_panel, 6, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_scrollbar_mode(_registry.win.adsb.list_panel, LV_SCROLLBAR_MODE_ACTIVE);
+
+        _registry.win.adsb.list_label = lv_label_create(_registry.win.adsb.list_panel);
+        lv_obj_set_style_text_color(_registry.win.adsb.list_label, lv_color_hex(0x00DD00), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_text_font(_registry.win.adsb.list_label, &lv_font_montserrat_22, (lv_style_selector_t)LV_PART_MAIN);
+        lv_label_set_text(_registry.win.adsb.list_label, "No aircraft");
+        lv_obj_set_width(_registry.win.adsb.list_label, w - 36);
+
+        // Swipe to return home (restore rotation)
+        lv_obj_add_event_cb(_registry.win.adsb.root, [](lv_event_t *e)
+                            {
+                                System *self = static_cast<System *>(lv_event_get_user_data(e));
+                                lv_event_code_t code = lv_event_get_code(e);
+
+                                if (code == LV_EVENT_GESTURE)
+                                {
+                                    lv_dir_t gesture_dir = lv_indev_get_gesture_dir(lv_indev_active());
+
+                                    if ((gesture_dir == LV_DIR_LEFT || gesture_dir == LV_DIR_RIGHT) && (self->_edge_touch_flag == true))
+                                    {
+                                        if (self->_win_adsb_status_callback)
+                                            self->_win_adsb_status_callback(false);
+
+                                        // Restore rotation if changed
+                                        if (self->_registry.win.adsb.rotated) {
+                                            lv_display_set_rotation(lv_display_get_default(),
+                                                self->_registry.win.adsb.saved_rotation);
+                                            self->_registry.win.adsb.rotated = false;
+                                            self->_registry.win.adsb.divider_y = 0;  // reset for next time
+                                        }
+
+                                        self->set_vibration();
+                                        self->init_win_home();
+
+                                        lv_screen_load_anim(self->_registry.win.home.root, LV_SCR_LOAD_ANIM_FADE_OUT, 100, 0, true);
+
+                                        self->_edge_touch_flag = false;
+                                    }
+                                } }, LV_EVENT_ALL, this);
+
+        if (!is_landscape)
+            init_status_bar(_registry.win.adsb.root);
+
+        lv_obj_update_layout(_registry.win.adsb.root);
+
+        if (_win_adsb_status_callback)
+            _win_adsb_status_callback(true);
+
+        _current_win = Current_Win::ADSB;
+    }
+
+    void System::win_adsb_update(const char *stats_text, const char *list_text)
+    {
+        if (_registry.win.adsb.stats_label)
+            lv_label_set_text(_registry.win.adsb.stats_label, stats_text);
+        if (_registry.win.adsb.list_label)
+            lv_label_set_text(_registry.win.adsb.list_label, list_text);
     }
 
     void System::init_win_rf(void)

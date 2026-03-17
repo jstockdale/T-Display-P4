@@ -291,6 +291,87 @@ adsb_stats_t adsb_get_stats(void) {
     return stats;
 }
 
+int adsb_format_aircraft_list(char *buf, int bufsize) {
+    int pos = 0;
+    int64_t now = esp_timer_get_time();
+    receiver_pos_t rx = adsb_get_receiver_pos();
+
+    if (!aircraft_mutex) {
+        pos += snprintf(buf + pos, bufsize - pos, "Not initialized");
+        return pos;
+    }
+
+    // Collect active aircraft indices sorted by distance (nearest first)
+    typedef struct { int idx; double dist_km; } ac_entry_t;
+    ac_entry_t entries[AIRCRAFT_TABLE_SIZE];
+    int count = 0;
+
+    xSemaphoreTake(aircraft_mutex, portMAX_DELAY);
+    for (int i = 0; i < AIRCRAFT_TABLE_SIZE; i++) {
+        if (!aircraft_table[i].active) continue;
+        if ((now - aircraft_table[i].last_seen) > AIRCRAFT_MAX_AGE_US) continue;
+        entries[count].idx = i;
+        entries[count].dist_km = 1e9;
+        if (rx.fix_valid && aircraft_table[i].has_position) {
+            double d, b;
+            haversine(rx.lat, rx.lon, aircraft_table[i].lat, aircraft_table[i].lon, &d, &b);
+            entries[count].dist_km = d;
+        }
+        count++;
+    }
+
+    // Simple insertion sort by distance
+    for (int i = 1; i < count; i++) {
+        ac_entry_t key = entries[i];
+        int j = i - 1;
+        while (j >= 0 && entries[j].dist_km > key.dist_km) {
+            entries[j + 1] = entries[j];
+            j--;
+        }
+        entries[j + 1] = key;
+    }
+
+    if (count == 0) {
+        pos += snprintf(buf + pos, bufsize - pos, "No aircraft");
+    }
+
+    for (int e = 0; e < count && pos < bufsize - 80; e++) {
+        aircraft_t *ac = &aircraft_table[entries[e].idx];
+        char call[9] = "--------";
+        if (ac->callsign[0]) {
+            snprintf(call, sizeof(call), "%-8s", ac->callsign);
+        }
+
+        double dist_nm = entries[e].dist_km * 0.539957;
+        char dist_str[12] = "   --";
+        if (rx.fix_valid && ac->has_position && entries[e].dist_km < 1e8) {
+            snprintf(dist_str, sizeof(dist_str), "%5.1f", dist_nm);
+        }
+
+        char alt_str[12] = "  ----";
+        if (ac->altitude != 0) {
+            snprintf(alt_str, sizeof(alt_str), "%6d", ac->altitude);
+        }
+
+        char spd_str[12] = " ---";
+        if (ac->speed > 0) {
+            snprintf(spd_str, sizeof(spd_str), "%4d", ac->speed);
+        }
+
+        char hdg_str[12] = "---";
+        if (ac->heading > 0) {
+            snprintf(hdg_str, sizeof(hdg_str), "%3d", (int)ac->heading);
+        }
+
+        pos += snprintf(buf + pos, bufsize - pos,
+            "%06lX %s %s %s  %s  %s\n",
+            (unsigned long)ac->icao, call, alt_str, spd_str, hdg_str, dist_str);
+    }
+    xSemaphoreGive(aircraft_mutex);
+
+    return count;
+}
+
 // Great-circle distance (km) and initial bearing (degrees) using haversine
 static void haversine(double lat1, double lon1, double lat2, double lon2,
                       double *dist_km, double *bearing_deg) {

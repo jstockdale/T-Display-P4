@@ -114,14 +114,18 @@ def get_tz_info(tz_name):
     if not has_dst:
         return {'std_offset_min': int(jan_off), 'has_dst': False}
 
-    # Determine which is standard time (shorter offset = standard)
-    if abs(jan_off) <= abs(jul_off):
-        # Northern hemisphere DST pattern (summer offset is larger)
+    # Determine which is standard time.
+    # Northern hemisphere: Jan is winter (standard), Jul is summer (DST).
+    #   Jan offset < Jul offset (e.g., -480 < -420 for US Pacific)
+    # Southern hemisphere: Jan is summer (DST), Jul is winter (standard).
+    #   Jan offset > Jul offset (e.g., +660 > +600 for Australia/Sydney)
+    if jan_off <= jul_off:
+        # Northern hemisphere DST pattern
         std_offset = int(jan_off)
         dst_offset = int(jul_off - jan_off)
         southern = False
     else:
-        # Southern hemisphere (winter=Jul has standard time)
+        # Southern hemisphere
         std_offset = int(jul_off)
         dst_offset = int(jan_off - jul_off)
         southern = True

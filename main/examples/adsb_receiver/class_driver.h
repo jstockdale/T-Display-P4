@@ -136,6 +136,10 @@ typedef struct {
 
 extern adsb_stats_t adsb_get_stats(void);
 
+// Format aircraft list into text buffer, sorted by distance.
+// Returns number of aircraft written.
+extern int adsb_format_aircraft_list(char *buf, int bufsize);
+
 #ifdef __cplusplus
 }
 #endif
