@@ -8,7 +8,7 @@
 <h1 align="center">ADS-B Receiver – T-Display-P4</h1>
 
 <p align="center">
-  A portable 1090 MHz ADS-B receiver built on the LILYGO T-Display-P4, using an RTL-SDR USB dongle for RF reception and the ESP32-P4's dual RISC-V cores for real-time Mode-S decoding.
+  A portable 1090 MHz ADS-B receiver built on the LILYGO T-Display-P4, using a RTL-SDR USB dongle for RF reception and the ESP32-P4's dual RISC-V cores for real-time Mode-S decoding.
 </p>
 
 ## Overview
