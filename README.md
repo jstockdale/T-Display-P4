@@ -19,17 +19,18 @@ This project turns a LILYGO T-Display-P4 development board into a standalone ADS
 
 - **Real-time ADS-B reception** – 15–30 messages/second, 12–30+ simultaneous aircraft tracked
 - **~30 nm range** from Oakland, CA with a 7" telescopic antenna on RTL-SDR
-- **SD card CSV logging** – UTC timestamps, raw Mode-S hex, decoded fields (ICAO, callsign, altitude, speed, heading, vertical rate, position, squawk), receiver GPS metadata (sats, HDOP)
-- **GPS time sync** – L76K GNSS sets the system clock with 650ms serial delay compensation, syncs the PCF8563 RTC
-- **Serial output** – clean formatted messages with N/S E/W position indicators, raw hex for each message
-- **ADS-B Scope** – WebSerial-based live map viewer ([adsb-scope.offx1.com](https://adsb-scope.offx1.com))
+- **SD card CSV logging** – UTC timestamps, raw Mode-S hex, decoded fields (ICAO, callsign, altitude, speed, heading, vertical rate, position, squawk), receiver GPS metadata (sats, HDOP). PSRAM-buffered writes with periodic flush for clean filesystem state.
+- **GPS time sync** – L76K GNSS (5 Hz) sets the system clock with 650ms serial delay compensation, syncs the PCF8563 RTC
+- **Serial console** – interactive command mode (Ctrl+C) with file management, status, version query; ADS-B output buffered and replayed on return to log mode
+- **ADS-B Scope** – WebSerial-based live map viewer with firmware flashing, CSV replay, file browser ([adsb-scope.offx1.com](https://adsb-scope.offx1.com))
+- **SD card reliability** – power-cycled on boot via XL9535 GPIO to reset card state machine after hard resets
 
 ### Known limitations
 
 - **Screen is black** – LVGL initializes successfully but display output is not rendering; under investigation
 - **WiFi disabled** – ESP-Hosted SDIO DMA corrupts internal RAM heap metadata (Espressif Issue #17889); WiFi/NTP unavailable until resolved or AT firmware is deployed on the C6
 - **LVGL display updates disabled** – `adsb_update_display()` is a no-op to work around USB DMA heap corruption; aircraft data is only on serial + SD card + ADS-B Scope
-- **WebSerial triggers device reboot** – USB-JTAG auto-reset circuit fires on DTR toggle during port open; investigation in progress
+- **WebSerial triggers device reboot** – USB-JTAG auto-reset circuit fires on DTR toggle during port open; handled gracefully (scope reconnects, boot log is parsed)
 
 ## ADS-B Scope
 
@@ -41,14 +42,43 @@ Features:
 - Dark radar-scope aesthetic with Leaflet/CartoDB dark tiles
 - Aircraft icons with correct heading rotation and position trails
 - Range rings at 10, 25, and 50 nm
-- GNSS receiver status display
-- Aircraft detail panel on selection (click icon or label)
+- GNSS receiver status and SD card logging status display
+- Aircraft detail panel on selection (click icon or label, multi-select with Cmd/Ctrl+click)
 - Sortable aircraft table with drag-resizable panel
 - Color modes: MONO (terminal green), RAINBOW (by ICAO hash), ALT (altitude heatmap), SPD (speed heatmap)
+- Label modes: altitude or distance from receiver
 - Serial log panel with ADS-B/GNSS/Other filters and pause-to-inspect
+- SD card file browser over serial (list, download, replay, delete)
+- CSV replay with timeline scrubber and variable speed (0.25×–32×)
+- OTA firmware flashing via esptool-js (WebSerial)
+- Firmware version checking against `latest.version.json` with update badge
+- Auto-reconnect after flash
+- Responsive layout with touch-friendly targets for mobile use
 - DTR/RTS deasserted on connect to minimize resets
 
 Requirements: Chrome or Edge (WebSerial API). Connect via USB, click "Connect Serial", select the ESP32-P4 port.
+
+## Serial Console
+
+Press **Ctrl+C** over serial (115200 baud) to enter command mode. Type `log` to return to streaming mode. ADS-B and GNSS output is buffered in PSRAM during command mode (up to 500 lines) and replayed when returning to log mode.
+
+```
+help              show available commands
+log               return to streaming log mode
+ls [path]         list directory (default: /sdcard)
+cat <file>        print file contents
+head <file> [n]   print first n lines (default 20)
+tail <file> [n]   print last n lines (default 20)
+rm <file>         delete a file
+mv <src> <dst>    rename/move a file
+cp <src> <dst>    copy a file
+df                show SD card free space
+status            show receiver status
+version           show firmware version
+mount             mount SD card
+unmount           safely unmount SD card
+reboot            software reset
+```
 
 ## CSV Log Format
 
@@ -95,15 +125,21 @@ ESP32-P4 USB Host Driver (class_driver.c)
     ▼
 Aircraft Table (64 slots, 60s expiry)
     │
-    ├──→ Serial output (printf, formatted + raw hex)
-    ├──→ SD card CSV log (fsync every write)
+    ├──→ Serial output (serial_console.c, buffered during CMD mode)
+    ├──→ SD card CSV log (PSRAM buffer, periodic flush)
     └──→ LVGL table (disabled – heap corruption workaround)
 
-L76K GPS (UART, 1 Hz NMEA)
+L76K GPS (UART, 5 Hz NMEA)
     │
     ├──→ Receiver position → range/bearing calculation
     ├──→ System clock (settimeofday + 650ms serial delay compensation)
     └──→ PCF8563 RTC (UTC+8, every 60s)
+
+Serial Console (serial_console.c)
+    │
+    ├──→ LOG mode: streaming ADS-B/GNSS output
+    ├──→ CMD mode: file management, status, version
+    └──→ Replay buffer: 500 lines in PSRAM, flushed on return to LOG
 ```
 
 ## Memory Budget
@@ -119,9 +155,18 @@ L76K GPS (UART, 1 Hz NMEA)
 
 ## Quick Start – Pre-built Binary
 
-If you just want to flash and go, a pre-built binary is available in the `firmware/` directory. No build environment needed – just `esptool.py`.
+If you just want to flash and go, a pre-built binary is available. No build environment needed.
 
-### Requirements
+### Option 1: Flash from browser (easiest)
+
+1. Open [adsb-scope.offx1.com](https://adsb-scope.offx1.com) in Chrome or Edge
+2. Click **Flash** → **Flash Latest**
+3. Select the ESP32-P4 serial port when prompted
+4. Wait for flash to complete (~60s), device auto-reboots
+
+If the device doesn't enter bootloader mode automatically, hold **BOOT** + tap **RESET** before clicking Flash Latest.
+
+### Option 2: Flash with esptool.py
 
 - [esptool.py](https://github.com/espressif/esptool) (`pip install esptool`)
 - USB cable to the T-Display-P4
@@ -165,6 +210,16 @@ idf.py flash
 
 If auto-reset doesn't work (USB-JTAG bridge disabled in firmware), hold BOOT + tap RESET, then flash.
 
+### Merged firmware binary (for OTA / distribution)
+
+```bash
+cd build && esptool.py --chip esp32p4 merge_bin -o ../release.bin \
+  --flash_mode dio --flash_freq 80m --flash_size 16MB \
+  0x2000 bootloader/bootloader.bin \
+  0x8000 partition_table/partition-table.bin \
+  0x10000 t-display-p4.bin
+```
+
 ### Configuration Notes
 
 - `CONFIG_HEAP_POISONING_LIGHT=y` – enabled for heap corruption debugging
@@ -177,18 +232,35 @@ If auto-reset doesn't work (USB-JTAG bridge disabled in firmware), hold BOOT + t
 2. **Re-enable LVGL aircraft display** – blocked by #1
 3. **Fix screen** – display hardware initializes but screen is black; may be wallpaper/draw buffer issue
 4. **Restore WiFi** – either fix ESP-Hosted SDIO DMA or flash C6 with AT firmware
-5. **Investigate WebSerial reset** – DTR→reset path may be in ROM code, not disableable from app_main
+5. ~~Investigate WebSerial reset~~ – DTR race handled gracefully; scope deasserts DTR/RTS and parses reboot log
+6. ~~SD card corruption on reboot~~ – fixed: power-cycle SD card via XL9535 SD_EN early in boot to reset card state machine
+7. ~~Heading display~~ – fixed: ground speed heading (DF17 TC19 subtypes 1/2) now correctly applied
+8. ~~ADS-B decoding~~ – fixed: removed double-decode in on_msg that zeroed all messages via memset
 
-## Credits
+## Acknowledgments
 
-- **Hardware & base firmware:** [LILYGO](https://github.com/Xinyuan-LilyGO/T-Display-P4)
-- **Mode-S decoder:** Based on [dump1090](https://github.com/antirez/dump1090) by Salvatore Sanfilippo
-- **ADS-B Scope:** [adsb-scope.offx1.com](https://adsb-scope.offx1.com) – Off by One
-- **RTL-SDR driver:** Custom ESP32-P4 USB host implementation based on librtlsdr
+This project builds on the work of several open source authors:
+
+- **[kvhnuke](https://github.com/kvhnuke/esp32-rtl-sdr)** — Original proof of concept for RTL-SDR on ESP32 via USB Host. The ESP32 USB-to-librtlsdr shim layer (`esp_libusb.c/h`) and the adapted `librtlsdr.c` driver originated from this project. Thank you for proving it could be done.
+
+- **[Salvatore Sanfilippo (antirez)](https://github.com/antirez/dump1090)** — Author of dump1090, the Mode S decoder for RTL-SDR devices. The `mode-s.c` decoder is derived from dump1090's signal processing, preamble detection, CRC validation, and message decoding. Released under the BSD 3-Clause License.
+
+- **[Thomas Watson](https://github.com/watson/libmodes)** — Author of libmodes, which refactored the dump1090 decoder into a clean reusable C library with the `mode_s_init` / `mode_s_detect` / `mode_s_decode` API that this project uses directly.
+
+- **[LILYGO](https://github.com/Xinyuan-LilyGO/T-Display-P4)** — T-Display-P4 hardware design and the base ESP-IDF project with LVGL UI framework, peripheral drivers, and board support package.
+
+- **[osmocom / Steve Markgraf](https://github.com/steve-m/librtlsdr)** — Original librtlsdr and the R820T/R828D tuner drivers.
 
 ## License
 
-GPL 3.0 (inherited from LILYGO base project)
+This project contains code under multiple licenses:
+
+- **ADS-B Scope, serial console, SD logging, and all Off by One contributions: BSD 3-Clause**
+- Mode S decoder: **BSD 3-Clause** (antirez/dump1090, watson/libmodes)
+- RTL-SDR driver and tuner code: **GPL v2** (osmocom/librtlsdr)
+- LILYGO board support and UI framework: **GPL v3** (LILYGO)
+
+See individual file headers for details.
 
 ---
 
@@ -396,4 +468,5 @@ For pin definitions, please refer to the configuration file:
 
 * Q. Why is the screen black?
 * A. The MIPI DSI panel and LVGL both initialize successfully, but display output is not rendering. This may be related to wallpaper loading, draw buffer configuration, or a side effect of the USB DMA workaround. Testing with an unmodified LilyGo build is the next diagnostic step.
+
 

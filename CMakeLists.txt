@@ -6,4 +6,4 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 set(PROJECT_VERSION  "2.0.0")
 
-project(t-display-p4)
+project(t-display-p4-adsb)

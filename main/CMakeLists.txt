@@ -1,5 +1,7 @@
 #这里选择你需要编译的项目
-if(CONFIG_EXAMPLE_BUILD_AW86224)
+if(CONFIG_EXAMPLE_BUILD_ADSB_RECEIVER)
+    set(project_path "examples/adsb_receiver/")
+elseif(CONFIG_EXAMPLE_BUILD_AW86224)
     set(project_path "examples/aw86224/")
 elseif(CONFIG_EXAMPLE_BUILD_BQ27220)
     set(project_path "examples/bq27220/")
