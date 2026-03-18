@@ -12,6 +12,10 @@
 #include "t_display_p4_driver.h"
 #include "screen_detect.h"
 
+extern "C" {
+    extern void adsb_set_sort(int col, bool ascending);
+}
+
 namespace Lvgl_Ui
 {
     const System::Win_Home_App_Icon System::_win_home_app_icon_list[] =
@@ -94,6 +98,7 @@ namespace Lvgl_Ui
     void System::begin(bool has_sd)
     {
         _has_sd = has_sd;
+        _home_rotation = lv_display_get_rotation(lv_display_get_default());
 #if defined SCREEN_ROTATION_DIRECTION_0
         _app_style.icon.edge_distance.height = std::min(_width, _height) / 5;
         _app_style.icon.edge_distance.width = _app_style.icon.edge_distance.height / 5;
@@ -592,7 +597,22 @@ namespace Lvgl_Ui
                                     {
                                     case LV_EVENT_CLICKED:
                                         self->init_win_adsb();
-                                        lv_screen_load_anim(self->_registry.win.adsb.root, LV_SCR_LOAD_ANIM_FADE_OUT, 500, 0, true);
+                                        if (self->_registry.win.adsb.has_user_rotation) {
+                                            // Load instantly, then apply rotation after a short
+                                            // delay so the home screen is fully gone first.
+                                            lv_screen_load(self->_registry.win.adsb.root);
+                                            lv_timer_create([](lv_timer_t *t) {
+                                                System *s = static_cast<System *>(lv_timer_get_user_data(t));
+                                                lv_display_set_rotation(lv_display_get_default(), s->_registry.win.adsb.user_rotation);
+                                                s->_registry.win.adsb.rotated = true;
+                                                s->_registry.win.adsb.divider_y = 0;
+                                                s->init_win_adsb();
+                                                lv_screen_load(s->_registry.win.adsb.root);
+                                                lv_timer_delete(t);
+                                            }, 100, self);
+                                        } else {
+                                            lv_screen_load_anim(self->_registry.win.adsb.root, LV_SCR_LOAD_ANIM_FADE_OUT, 500, 0, true);
+                                        }
                                         break;
                                     default:
                                         break;
@@ -809,6 +829,7 @@ namespace Lvgl_Ui
 
     void System::status_bar_gps_update(void)
     {
+        if (!_registry.status_bar.gps_icon) return;  // not yet created
         char buf[16];
         if (_gps_fix_valid && _gps_sats > 0) {
             // Green — have GPS fix with satellite count
@@ -824,31 +845,56 @@ namespace Lvgl_Ui
             lv_obj_set_style_text_color(_registry.status_bar.gps_icon, lv_color_hex(0x666666), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
         }
         lv_label_set_text(_registry.status_bar.gps_icon, buf);
+
+        // Reposition WiFi relative to GPS icon
+        if (_registry.status_bar.wifi_signal_icon) {
+            lv_obj_update_layout(_registry.status_bar.gps_icon);
+            lv_obj_align_to(_registry.status_bar.wifi_signal_icon,
+                            _registry.status_bar.gps_icon, LV_ALIGN_OUT_LEFT_MID, -5, 0);
+        }
     }
 
-    void System::set_adsb_status(bool connected, int aircraft_count)
+    void System::set_adsb_status(bool connected, bool error, int aircraft_count)
     {
         _adsb_connected = connected;
+        _adsb_error = error;
         _adsb_aircraft_count = aircraft_count;
     }
 
     void System::status_bar_adsb_update(void)
     {
+        if (!_registry.status_bar.adsb_icon) return;  // not yet created
         char buf[16];
-        if (_adsb_connected && _adsb_aircraft_count > 0) {
+        if (_adsb_error) {
+            // Red — device seen but can't read (e.g. buffer alloc failed)
+            snprintf(buf, sizeof(buf), "! " LV_SYMBOL_UP);
+            lv_obj_set_style_text_color(_registry.status_bar.adsb_icon, lv_color_hex(0xCC0000), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
+        } else if (_adsb_connected && _adsb_aircraft_count > 0) {
             // Green — receiving aircraft
             snprintf(buf, sizeof(buf), "%d " LV_SYMBOL_UP, _adsb_aircraft_count);
             lv_obj_set_style_text_color(_registry.status_bar.adsb_icon, lv_color_hex(0x00CC00), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
         } else if (_adsb_connected) {
-            // White — connected but no aircraft
+            // White — connected but no aircraft yet
             snprintf(buf, sizeof(buf), "0 " LV_SYMBOL_UP);
             lv_obj_set_style_text_color(_registry.status_bar.adsb_icon, lv_color_white(), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
         } else {
-            // Gray — RTL-SDR not connected
+            // Gray — RTL-SDR not plugged in (icon only, no number)
             snprintf(buf, sizeof(buf), LV_SYMBOL_UP);
             lv_obj_set_style_text_color(_registry.status_bar.adsb_icon, lv_color_hex(0x666666), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
         }
         lv_label_set_text(_registry.status_bar.adsb_icon, buf);
+
+        // Reposition GPS and WiFi relative to ADS-B icon (chains left from right edge).
+        // Uses lv_obj_align_to so it works regardless of screen width or rotation.
+        if (_registry.status_bar.gps_icon && _registry.status_bar.wifi_signal_icon) {
+            lv_obj_update_layout(_registry.status_bar.adsb_icon);
+            lv_obj_align_to(_registry.status_bar.gps_icon,
+                            _registry.status_bar.adsb_icon, LV_ALIGN_OUT_LEFT_MID, -6, 0);
+
+            lv_obj_update_layout(_registry.status_bar.gps_icon);
+            lv_obj_align_to(_registry.status_bar.wifi_signal_icon,
+                            _registry.status_bar.gps_icon, LV_ALIGN_OUT_LEFT_MID, -5, 0);
+        }
     }
 
     void System::set_sd_status(bool mounted, bool logging)
@@ -961,28 +1007,29 @@ namespace Lvgl_Ui
         // SD card status icon
         _registry.status_bar.sd_icon = lv_label_create(_registry.status_bar.root);
         lv_obj_set_style_text_font(_registry.status_bar.sd_icon, &lv_font_montserrat_22, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
-        lv_obj_align(_registry.status_bar.sd_icon, LV_ALIGN_RIGHT_MID, -35, 0);
+        lv_obj_align(_registry.status_bar.sd_icon, LV_ALIGN_RIGHT_MID, -39, 0);
         status_bar_sd_update();
 
         // ADS-B aircraft count icon
         _registry.status_bar.adsb_icon = lv_label_create(_registry.status_bar.root);
         lv_obj_set_style_text_font(_registry.status_bar.adsb_icon, &lv_font_montserrat_22, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
         lv_obj_align(_registry.status_bar.adsb_icon, LV_ALIGN_RIGHT_MID, -68, 0);
-        status_bar_adsb_update();
 
-        // GPS status icon
+        // GPS status icon — positioned dynamically by status_bar_adsb_update()
         _registry.status_bar.gps_icon = lv_label_create(_registry.status_bar.root);
         lv_obj_set_style_text_font(_registry.status_bar.gps_icon, &lv_font_montserrat_22, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
-        lv_obj_align(_registry.status_bar.gps_icon, LV_ALIGN_RIGHT_MID, -115, 0);
-        status_bar_gps_update();
 
-        // 创建wifi信号强度图标
+        // 创建wifi信号强度图标 — positioned dynamically by status_bar_gps_update()
         _registry.status_bar.wifi_signal_icon = lv_label_create(_registry.status_bar.root);
         lv_obj_set_style_text_color(_registry.status_bar.wifi_signal_icon, lv_color_white(), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
         lv_obj_set_style_text_font(_registry.status_bar.wifi_signal_icon, &lv_font_montserrat_22, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
         lv_label_set_text(_registry.status_bar.wifi_signal_icon, LV_SYMBOL_WIFI);
-        lv_obj_align(_registry.status_bar.wifi_signal_icon, LV_ALIGN_RIGHT_MID, -155, 0);
         status_bar_wifi_connect_status_update();
+
+        // Update dynamic icons AFTER all status bar objects exist.
+        // adsb_update repositions gps_icon; gps_update repositions wifi_icon.
+        status_bar_adsb_update();
+        status_bar_gps_update();
     }
 
     void System::init_win_cit(void)
@@ -2799,11 +2846,16 @@ namespace Lvgl_Ui
 
     void System::init_win_adsb(void)
     {
-        // Get display dimensions (may be swapped if rotated)
         lv_display_t *disp = lv_display_get_default();
+
+        // Get display dimensions (current orientation)
         int32_t w = lv_display_get_horizontal_resolution(disp);
         int32_t h = lv_display_get_vertical_resolution(disp);
         bool is_landscape = (w > h);
+
+        // Sync sort state with backend
+        adsb_set_sort(_registry.win.adsb.sort_col,
+                      _registry.win.adsb.sort_asc);
 
         // Root screen
         _registry.win.adsb.root = lv_obj_create(NULL);
@@ -2829,17 +2881,49 @@ namespace Lvgl_Ui
         lv_obj_set_style_text_font(title_label, is_landscape ? &lv_font_montserrat_22 : &lv_font_montserrat_28, (lv_style_selector_t)LV_PART_MAIN);
         lv_obj_align(title_label, LV_ALIGN_LEFT_MID, 10, 0);
 
-        // Rotate toggle button
+        // Close / back button (rightmost)
+        lv_obj_t *close_btn = lv_button_create(title_bar);
+        lv_obj_set_size(close_btn, is_landscape ? 36 : 50, is_landscape ? 36 : 50);
+        lv_obj_align(close_btn, LV_ALIGN_RIGHT_MID, -5, 0);
+        lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x404040), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_shadow_width(close_btn, 0, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_border_width(close_btn, 0, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_radius(close_btn, 6, (lv_style_selector_t)LV_PART_MAIN);
+
+        lv_obj_t *close_lbl = lv_label_create(close_btn);
+        lv_label_set_text(close_lbl, LV_SYMBOL_CLOSE);
+        lv_obj_set_style_text_color(close_lbl, lv_color_white(), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_center(close_lbl);
+
+        lv_obj_add_event_cb(close_btn, [](lv_event_t *e)
+                            {
+                                System *self = static_cast<System *>(lv_event_get_user_data(e));
+                                if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+                                if (self->_win_adsb_status_callback)
+                                    self->_win_adsb_status_callback(false);
+
+                                // Restore home rotation
+                                lv_display_set_rotation(lv_display_get_default(),
+                                    self->_home_rotation);
+                                self->_registry.win.adsb.rotated = false;
+
+                                self->set_vibration();
+                                self->init_win_home();
+                                lv_screen_load_anim(self->_registry.win.home.root, LV_SCR_LOAD_ANIM_FADE_OUT, 100, 0, true);
+                            }, LV_EVENT_ALL, this);
+
+        // Rotate toggle button (left of close button)
         lv_obj_t *toggle_btn = lv_button_create(title_bar);
-        lv_obj_set_size(toggle_btn, is_landscape ? 40 : 60, is_landscape ? 30 : 50);
-        lv_obj_align(toggle_btn, LV_ALIGN_RIGHT_MID, -5, 0);
+        lv_obj_set_size(toggle_btn, is_landscape ? 100 : 110, is_landscape ? 36 : 50);
+        lv_obj_align_to(toggle_btn, close_btn, LV_ALIGN_OUT_LEFT_MID, -5, 0);
         lv_obj_set_style_bg_color(toggle_btn, lv_color_hex(0x2A5A8C), (lv_style_selector_t)LV_PART_MAIN);
         lv_obj_set_style_shadow_width(toggle_btn, 0, (lv_style_selector_t)LV_PART_MAIN);
         lv_obj_set_style_border_width(toggle_btn, 0, (lv_style_selector_t)LV_PART_MAIN);
         lv_obj_set_style_radius(toggle_btn, 6, (lv_style_selector_t)LV_PART_MAIN);
 
         lv_obj_t *toggle_lbl = lv_label_create(toggle_btn);
-        lv_label_set_text(toggle_lbl, LV_SYMBOL_REFRESH);
+        lv_label_set_text(toggle_lbl, LV_SYMBOL_LOOP " 90°");
         lv_obj_set_style_text_color(toggle_lbl, lv_color_white(), (lv_style_selector_t)LV_PART_MAIN);
         lv_obj_center(toggle_lbl);
 
@@ -2849,15 +2933,15 @@ namespace Lvgl_Ui
                                 if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
 
                                 lv_display_t *d = lv_display_get_default();
-                                // Save original rotation on first press
-                                if (!self->_registry.win.adsb.rotated) {
-                                    self->_registry.win.adsb.saved_rotation = lv_display_get_rotation(d);
-                                    self->_registry.win.adsb.rotated = true;
-                                }
+                                // Mark as rotated (home rotation restored via _home_rotation on exit)
+                                self->_registry.win.adsb.rotated = true;
                                 // Cycle to next rotation (0 → 90 → 180 → 270 → 0 ...)
                                 lv_display_rotation_t cur = lv_display_get_rotation(d);
                                 lv_display_rotation_t next = (lv_display_rotation_t)((cur + 1) % 4);
                                 lv_display_set_rotation(d, next);
+                                // Remember for next visit
+                                self->_registry.win.adsb.user_rotation = next;
+                                self->_registry.win.adsb.has_user_rotation = true;
                                 self->_registry.win.adsb.divider_y = 0;  // reset divider for new aspect
                                 // Rebuild with new dimensions
                                 self->init_win_adsb();
@@ -2867,10 +2951,12 @@ namespace Lvgl_Ui
         int32_t content_top = status_h + title_h + 4;
         int32_t content_h = h - content_top - 4;
 
-        // Default divider position (stats / list split)
+        // Default divider position — just below the 5 stats lines.
+        // Only set on first entry; user's drag position persists across visits.
         if (_registry.win.adsb.divider_y == 0) {
-            _registry.win.adsb.divider_y = content_top + (is_landscape ? 70 : 180);
+            _registry.win.adsb.divider_y = content_top + (is_landscape ? 70 : 155);
         }
+
         // Clamp divider to sensible range
         int32_t div_min = content_top + 50;
         int32_t div_max = h - 120;
@@ -2899,7 +2985,7 @@ namespace Lvgl_Ui
 
         // Draggable divider bar
         _registry.win.adsb.divider = lv_obj_create(_registry.win.adsb.root);
-        lv_obj_set_size(_registry.win.adsb.divider, w - 40, 12);
+        lv_obj_set_size(_registry.win.adsb.divider, w - 40, 18);
         lv_obj_align(_registry.win.adsb.divider, LV_ALIGN_TOP_MID, 0, div_y);
         lv_obj_set_style_bg_color(_registry.win.adsb.divider, lv_color_hex(0x3A6A9C), (lv_style_selector_t)LV_PART_MAIN);
         lv_obj_set_style_bg_opa(_registry.win.adsb.divider, LV_OPA_COVER, (lv_style_selector_t)LV_PART_MAIN);
@@ -2953,7 +3039,7 @@ namespace Lvgl_Ui
                             }, LV_EVENT_ALL, this);
 
         // Column header — below divider
-        int32_t hdr_y = div_y + 14;
+        int32_t hdr_y = div_y + 20;
         _registry.win.adsb.list_header = lv_obj_create(_registry.win.adsb.root);
         lv_obj_set_size(_registry.win.adsb.list_header, w - 20, 32);
         lv_obj_align(_registry.win.adsb.list_header, LV_ALIGN_TOP_MID, 0, hdr_y);
@@ -2964,11 +3050,58 @@ namespace Lvgl_Ui
         lv_obj_set_style_pad_all(_registry.win.adsb.list_header, 4, (lv_style_selector_t)LV_PART_MAIN);
         lv_obj_remove_flag(_registry.win.adsb.list_header, LV_OBJ_FLAG_SCROLLABLE);
 
-        lv_obj_t *hdr_label = lv_label_create(_registry.win.adsb.list_header);
-        lv_label_set_text(hdr_label, "ICAO   CALL     ALT     SPD   HDG    DIST");
-        lv_obj_set_style_text_color(hdr_label, lv_color_hex(0x88AACC), (lv_style_selector_t)LV_PART_MAIN);
-        lv_obj_set_style_text_font(hdr_label, &lv_font_montserrat_22, (lv_style_selector_t)LV_PART_MAIN);
-        lv_obj_align(hdr_label, LV_ALIGN_LEFT_MID, 0, 0);
+        // Sortable column headers — each is a clickable label
+        // Sort indicator: ▲ ascending, ▼ descending appended to active column
+        struct { const char *name; int x; int sort_col; } cols[] = {
+            {"ICAO",  0,   1},  // ADSB_SORT_ICAO
+            {"CALL",  78,  2},  // ADSB_SORT_CALL
+            {"ALT",   185, 3},  // ADSB_SORT_ALT
+            {"SPD",   260, 4},  // ADSB_SORT_SPD
+            {"HDG",   320, 5},  // ADSB_SORT_HDG
+            {"DIST",  385, 0},  // ADSB_SORT_DIST
+        };
+        for (int c = 0; c < 6; c++) {
+            lv_obj_t *col_btn = lv_label_create(_registry.win.adsb.list_header);
+            char hdr_txt[16];
+            if (_registry.win.adsb.sort_col == cols[c].sort_col) {
+                snprintf(hdr_txt, sizeof(hdr_txt), "%s%s", cols[c].name,
+                         _registry.win.adsb.sort_asc ? LV_SYMBOL_UP : LV_SYMBOL_DOWN);
+            } else {
+                snprintf(hdr_txt, sizeof(hdr_txt), "%s", cols[c].name);
+            }
+            lv_label_set_text(col_btn, hdr_txt);
+            lv_obj_set_style_text_font(col_btn, &lv_font_montserrat_22, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_text_color(col_btn,
+                (_registry.win.adsb.sort_col == cols[c].sort_col)
+                    ? lv_color_hex(0xFFFFFF)
+                    : lv_color_hex(0x88AACC),
+                (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_align(col_btn, LV_ALIGN_LEFT_MID, cols[c].x, 0);
+            lv_obj_add_flag(col_btn, LV_OBJ_FLAG_CLICKABLE);
+
+            // Store sort_col in user_data for the click handler
+            lv_obj_set_user_data(col_btn, (void *)(intptr_t)cols[c].sort_col);
+            lv_obj_add_event_cb(col_btn, [](lv_event_t *e) {
+                if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+                System *self = static_cast<System *>(lv_event_get_user_data(e));
+                lv_obj_t *target = lv_event_get_target(e);
+                int col_id = (int)(intptr_t)lv_obj_get_user_data(target);
+
+                if (self->_registry.win.adsb.sort_col == col_id) {
+                    // Same column — toggle direction
+                    self->_registry.win.adsb.sort_asc = !self->_registry.win.adsb.sort_asc;
+                } else {
+                    // New column — default ascending (except DIST defaults descending... no, ascending = nearest first)
+                    self->_registry.win.adsb.sort_col = col_id;
+                    self->_registry.win.adsb.sort_asc = true;
+                }
+                adsb_set_sort(self->_registry.win.adsb.sort_col,
+                              self->_registry.win.adsb.sort_asc);
+                // Rebuild to update header visuals
+                self->init_win_adsb();
+                lv_screen_load(self->_registry.win.adsb.root);
+            }, LV_EVENT_ALL, this);
+        }
 
         // Aircraft list — below header, fills remaining space
         int32_t list_top = hdr_y + 34;
@@ -3004,13 +3137,10 @@ namespace Lvgl_Ui
                                         if (self->_win_adsb_status_callback)
                                             self->_win_adsb_status_callback(false);
 
-                                        // Restore rotation if changed
-                                        if (self->_registry.win.adsb.rotated) {
-                                            lv_display_set_rotation(lv_display_get_default(),
-                                                self->_registry.win.adsb.saved_rotation);
-                                            self->_registry.win.adsb.rotated = false;
-                                            self->_registry.win.adsb.divider_y = 0;  // reset for next time
-                                        }
+                                        // Always restore home rotation on exit.
+                                        lv_display_set_rotation(lv_display_get_default(),
+                                            self->_home_rotation);
+                                        self->_registry.win.adsb.rotated = false;
 
                                         self->set_vibration();
                                         self->init_win_home();

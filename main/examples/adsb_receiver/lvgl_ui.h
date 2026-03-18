@@ -76,6 +76,7 @@ namespace Lvgl_Ui
         uint32_t _width;
         uint32_t _height;
         bool _has_sd = true;
+        lv_display_rotation_t _home_rotation = LV_DISPLAY_ROTATION_0;  // captured once in begin()
 
         enum class Current_Win
         {
@@ -295,8 +296,9 @@ namespace Lvgl_Ui
                     lv_obj_t *root;
                     lv_obj_t *stats_label;
                     lv_obj_t *list_label;
-                    bool rotated;
-                    lv_display_rotation_t saved_rotation;
+                    bool rotated;                          // true while rotation differs from home
+                    lv_display_rotation_t user_rotation;   // user's preferred rotation (persists across visits)
+                    bool has_user_rotation;                // true after first manual rotation
 
                     // Draggable divider state
                     lv_obj_t *divider;
@@ -304,6 +306,10 @@ namespace Lvgl_Ui
                     lv_obj_t *list_panel;
                     lv_obj_t *list_header;
                     int32_t divider_y;  // current Y position of divider
+
+                    // Sort state
+                    int sort_col;        // adsb_sort_col_t value (0=DIST default)
+                    bool sort_asc = true; // true = ascending (nearest first for DIST)
                 } adsb;
 
                 struct
@@ -519,6 +525,7 @@ namespace Lvgl_Ui
 
         // ADS-B status
         bool _adsb_connected = false;
+        bool _adsb_error = false;    // device seen but transfer buffer failed
         int  _adsb_aircraft_count = 0;
 
         // SD card status
@@ -675,7 +682,7 @@ namespace Lvgl_Ui
         void set_battery_level(uint16_t battery_level);
         void set_wifi_connect_status(bool status);
         void set_gps_status(bool fix_valid, int sats);
-        void set_adsb_status(bool connected, int aircraft_count);
+        void set_adsb_status(bool connected, bool error, int aircraft_count);
         void set_sd_status(bool mounted, bool logging);
 
         void add_event_cb_win_return_to_cit(lv_obj_t *obj);

@@ -50,6 +50,7 @@ static volatile uint32_t s_msg_count_window = 0;  // messages in current 1s wind
 static volatile float    s_msg_rate = 0.0f;       // messages per second
 static volatile int64_t  s_msg_window_start = 0;  // start of current rate window
 static volatile bool     s_rtlsdr_connected = false;
+static volatile bool     s_rtlsdr_error = false;  // device seen but transfer buffer failed
 
 // ============================================================
 // CPR cache with timestamps — linear-probed hash table
@@ -246,6 +247,7 @@ adsb_stats_t adsb_get_stats(void) {
     stats.total_messages = s_total_messages;
     stats.msg_rate = s_msg_rate;
     stats.rtlsdr_connected = s_rtlsdr_connected;
+    stats.rtlsdr_error = s_rtlsdr_error;
 
     // Count active aircraft
     int count = 0;
@@ -291,6 +293,15 @@ adsb_stats_t adsb_get_stats(void) {
     return stats;
 }
 
+// --- Sort state for on-device aircraft list ---
+static adsb_sort_col_t s_sort_col = ADSB_SORT_DIST;
+static bool s_sort_asc = true;
+
+void adsb_set_sort(int col, bool ascending) {
+    s_sort_col = (adsb_sort_col_t)col;
+    s_sort_asc = ascending;
+}
+
 int adsb_format_aircraft_list(char *buf, int bufsize) {
     int pos = 0;
     int64_t now = esp_timer_get_time();
@@ -301,7 +312,7 @@ int adsb_format_aircraft_list(char *buf, int bufsize) {
         return pos;
     }
 
-    // Collect active aircraft indices sorted by distance (nearest first)
+    // Collect active aircraft with precomputed sort keys
     typedef struct { int idx; double dist_km; } ac_entry_t;
     ac_entry_t entries[AIRCRAFT_TABLE_SIZE];
     int count = 0;
@@ -320,11 +331,37 @@ int adsb_format_aircraft_list(char *buf, int bufsize) {
         count++;
     }
 
-    // Simple insertion sort by distance
+    // Insertion sort by selected column
     for (int i = 1; i < count; i++) {
         ac_entry_t key = entries[i];
+        aircraft_t *ac_key = &aircraft_table[key.idx];
         int j = i - 1;
-        while (j >= 0 && entries[j].dist_km > key.dist_km) {
+        while (j >= 0) {
+            aircraft_t *ac_j = &aircraft_table[entries[j].idx];
+            int cmp = 0;
+            switch (s_sort_col) {
+                case ADSB_SORT_ICAO:
+                    cmp = (int)(ac_j->icao > ac_key->icao) - (int)(ac_j->icao < ac_key->icao);
+                    break;
+                case ADSB_SORT_CALL:
+                    cmp = strcmp(ac_j->callsign, ac_key->callsign);
+                    break;
+                case ADSB_SORT_ALT:
+                    cmp = (ac_j->altitude > ac_key->altitude) - (ac_j->altitude < ac_key->altitude);
+                    break;
+                case ADSB_SORT_SPD:
+                    cmp = (ac_j->speed > ac_key->speed) - (ac_j->speed < ac_key->speed);
+                    break;
+                case ADSB_SORT_HDG:
+                    cmp = (ac_j->heading > ac_key->heading) - (ac_j->heading < ac_key->heading);
+                    break;
+                case ADSB_SORT_DIST:
+                default:
+                    cmp = (entries[j].dist_km > key.dist_km) - (entries[j].dist_km < key.dist_km);
+                    break;
+            }
+            if (!s_sort_asc) cmp = -cmp;
+            if (cmp <= 0) break;
             entries[j + 1] = entries[j];
             j--;
         }
@@ -364,7 +401,7 @@ int adsb_format_aircraft_list(char *buf, int bufsize) {
         }
 
         pos += snprintf(buf + pos, bufsize - pos,
-            "%06lX %s %s %s  %s  %s\n",
+            "%06lX %-8s%s %s %s %s\n",
             (unsigned long)ac->icao, call, alt_str, spd_str, hdg_str, dist_str);
     }
     xSemaphoreGive(aircraft_mutex);
@@ -893,10 +930,21 @@ static void adsb_reader_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(100));
     alloc_adsb_transfer();
 
+    // Only mark connected if the bulk transfer buffer is usable.
+    // Without it, reads fail on every call — CIT and status bar
+    // should reflect the error, not show a green checkmark.
+    if (adsb_transfer_ready()) {
+        s_rtlsdr_connected = true;
+        s_rtlsdr_error = false;
+    } else {
+        s_rtlsdr_connected = false;
+        s_rtlsdr_error = true;  // device enumerated but buffer alloc failed
+        ESP_LOGE(TAG, "RTL-SDR init completed but transfer buffer unavailable — reads will fail");
+    }
+
     ESP_LOGI(TAG, "[APP] Free memory: %ld bytes", esp_get_free_heap_size());
     mode_s_init(&state);
     sd_log_create();
-    s_rtlsdr_connected = true;
     s_msg_window_start = esp_timer_get_time();
 
     // Allocate read buffers and magnitude buffer once — in PSRAM to
@@ -920,6 +968,7 @@ static void adsb_reader_task(void *arg)
     }
 
     // Main read loop — runs until stop flag is set (e.g. device removed)
+    int consecutive_errors = 0;
     while (!s_adsb_reader_stop) {
         int read_ok = 1;
         for (int i = 0; i < DEFAULT_BUF_LENGTH; i += MAX_PACKET_SIZE) {
@@ -938,8 +987,14 @@ static void adsb_reader_task(void *arg)
         }
         if (read_ok && n_read > 0) {
             demodulate(buffer, DEFAULT_BUF_LENGTH);
+            consecutive_errors = 0;  // reset on successful read
         }
         if (!read_ok) {
+            consecutive_errors++;
+            if (consecutive_errors >= 10) {
+                ESP_LOGE(TAG, "Too many consecutive read errors (%d) — assuming device disconnected", consecutive_errors);
+                break;
+            }
             // Back off briefly on read errors before retrying
             vTaskDelay(pdMS_TO_TICKS(50));
         }
@@ -952,6 +1007,16 @@ static void adsb_reader_task(void *arg)
 
 done:
     s_rtlsdr_connected = false;
+    s_rtlsdr_error = false;  // device gone, no longer an error — just disconnected
+    // Close RTL-SDR device (releases USB interface claims)
+    if (rtldev != NULL) {
+        rtlsdr_close(rtldev);
+        rtldev = NULL;
+    }
+    // Keep the bulk transfer buffer allocated — it was pre-allocated early
+    // in boot when internal RAM was contiguous. Freeing it risks never
+    // getting it back due to heap fragmentation.  alloc_adsb_transfer()
+    // will see it's already allocated and skip on reconnect.
     sd_log_close();
     // Release USB event pumping back to class_driver_task
     s_reader_owns_events = false;
@@ -1081,6 +1146,7 @@ static void action_get_str_desc(usb_device_t *device_obj)
 
 static void action_close_dev(usb_device_t *device_obj)
 {
+    if (device_obj->dev_hdl == NULL) return;  // already closed (e.g. by rtlsdr_close)
     ESP_ERROR_CHECK(usb_host_device_close(device_obj->client_hdl, device_obj->dev_hdl));
     device_obj->dev_hdl = NULL;
     device_obj->dev_addr = 0;
@@ -1158,7 +1224,10 @@ void class_driver_task(void *arg)
             // We must NOT call usb_host_client_handle_events concurrently.
             vTaskDelay(pdMS_TO_TICKS(100));
         } else {
-            usb_host_client_handle_events(class_driver_client_hdl, portMAX_DELAY);
+            // Use timeout instead of portMAX_DELAY so we stay responsive
+            // to device reconnection events (USB host lib may need periodic
+            // pumping to complete device enumeration after hot-plug).
+            usb_host_client_handle_events(class_driver_client_hdl, pdMS_TO_TICKS(500));
         }
     }
 

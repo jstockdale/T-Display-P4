@@ -7,9 +7,16 @@
 #define RTLSDR_BUF_LEN (16384 + 512)
 #define CTRL_TRANSFER_MAX_SIZE 1024  // largest control transfer for RTL-SDR
 
+// DMA RAM reservation — allocated early in app_main() before heap fragmentation,
+// freed here right before the USB transfer alloc to guarantee a contiguous hole.
+void *g_usb_dma_reservation = NULL;
+
 class_adsb_dev *adsbdev;
 void init_adsb_dev()
 {
+    // Idempotent — may be called early from main.cpp and again from rtlsdr_open()
+    if (adsbdev != NULL) return;
+
     adsbdev = calloc(1, sizeof(class_adsb_dev));
     if (adsbdev == NULL) {
         ESP_LOGE(TAG_ADSB, "init_adsb_dev: calloc failed");
@@ -30,16 +37,23 @@ void init_adsb_dev()
         ESP_LOGE(TAG_ADSB, "response_buf pre-alloc failed");
     }
 
-    // Pre-allocate bulk transfer buffer NOW, before R820T tuner init
-    // fragments internal DMA-capable RAM.  On RM69A10 (AMOLED) builds
-    // there's ~10 KB less internal RAM, so allocating after tuner init
-    // fails with ESP_ERR_NO_MEM due to fragmentation.
+    // Free the DMA reservation to create a contiguous hole, then immediately
+    // allocate the USB bulk transfer into that space.  The reservation was
+    // made at the very start of app_main() before peripheral init fragmented
+    // the heap.
+    if (g_usb_dma_reservation != NULL) {
+        heap_caps_free(g_usb_dma_reservation);
+        g_usb_dma_reservation = NULL;
+        ESP_LOGI(TAG_ADSB, "Released DMA reservation for USB transfer");
+    }
+
     r = usb_host_transfer_alloc(RTLSDR_BUF_LEN + 512, 0, &adsbdev->transfer);
     if (r != ESP_OK) {
-        ESP_LOGE(TAG_ADSB, "bulk transfer pre-alloc failed: %d", r);
+        ESP_LOGE(TAG_ADSB, "bulk transfer alloc failed: %d (internal free: %ld)",
+                 r, (long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
         adsbdev->transfer = NULL;
     } else {
-        ESP_LOGI(TAG_ADSB, "bulk transfer pre-alloc success");
+        ESP_LOGI(TAG_ADSB, "bulk transfer alloc success");
     }
 }
 
@@ -49,15 +63,33 @@ void alloc_adsb_transfer(void) {
         ESP_LOGI(TAG_ADSB, "transfer alloc: already pre-allocated");
         return;
     }
-    // Fallback: try late allocation if pre-alloc failed
-    ESP_LOGW(TAG_ADSB, "transfer alloc: pre-alloc missed, trying late alloc");
+    // Release DMA reservation to free contiguous hole for the transfer
+    if (g_usb_dma_reservation) {
+        free(g_usb_dma_reservation);
+        g_usb_dma_reservation = NULL;
+        ESP_LOGI(TAG_ADSB, "Released DMA reservation for USB transfer");
+    }
     esp_err_t r = usb_host_transfer_alloc(RTLSDR_BUF_LEN + 512, 0, &adsbdev->transfer);
     if (r != ESP_OK) {
         ESP_LOGE(TAG_ADSB, "transfer alloc failed: %d (internal free: %ld)",
                  r, (long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     } else {
-        ESP_LOGI(TAG_ADSB, "transfer late alloc success");
+        ESP_LOGI(TAG_ADSB, "bulk transfer alloc success");
     }
+}
+
+// Check if bulk transfer buffer is ready for use
+bool adsb_transfer_ready(void) {
+    return (adsbdev != NULL && adsbdev->transfer != NULL);
+}
+
+// Don't free the bulk transfer buffer — it was pre-allocated early when
+// internal RAM was contiguous and can't be re-allocated later due to
+// fragmentation.  The buffer is just DMA-capable memory; the device_handle
+// is set fresh on every esp_libusb_bulk_transfer() call, so it works
+// across device reconnects without re-allocation.
+void free_adsb_transfer(void) {
+    // Intentionally empty — buffer stays allocated for reuse on reconnect
 }
 
 void bulk_transfer_read_cb(usb_transfer_t *transfer)

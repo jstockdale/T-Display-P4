@@ -20,6 +20,7 @@
 #include "esp_lcd_mipi_dsi.h"
 #include "esp_ldo_regulator.h"
 #include "driver/gpio.h"
+#include "driver/i2c_master.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_intr_alloc.h"
@@ -883,7 +884,7 @@ void device_battery_health_task(void *arg)
 
                 // ADS-B status
                 adsb_stats_t stats = adsb_get_stats();
-                System_Ui->set_adsb_status(stats.rtlsdr_connected, stats.active_aircraft);
+                System_Ui->set_adsb_status(stats.rtlsdr_connected, stats.rtlsdr_error, stats.active_aircraft);
 
                 // SD card status
                 extern bool sd_is_mounted(void);
@@ -1402,7 +1403,12 @@ void device_at_task(void *arg)
 
                 // RTL-SDR connection
                 status_str += "RTL-SDR: ";
-                status_str += stats.rtlsdr_connected ? "[OK] connected\n" : "[--] not connected\n";
+                if (stats.rtlsdr_connected)
+                    status_str += "[OK] connected\n";
+                else if (stats.rtlsdr_error)
+                    status_str += "[ERR] buffer alloc failed\n";
+                else
+                    status_str += "[--] not connected\n";
 
                 // Message stats
                 char buf[128];
@@ -1486,8 +1492,13 @@ void device_adsb_app_task(void *arg)
 
                 // Format stats panel
                 int pos = 0;
-                pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
-                    "RTL-SDR: %s", stats.rtlsdr_connected ? "connected" : "disconnected");
+                if (stats.rtlsdr_error) {
+                    pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
+                        "RTL-SDR: ERROR (buffer alloc failed)");
+                } else {
+                    pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
+                        "RTL-SDR: %s", stats.rtlsdr_connected ? "connected" : "disconnected");
+                }
 
                 if (stats.rtlsdr_connected) {
                     pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
@@ -3245,6 +3256,12 @@ static void usb_host_lib_task(void *arg)
         return;
     }
 
+    // Pre-allocate USB transfer buffers NOW, right after host install —
+    // internal DMA RAM is ~94KB and unfragmented here.  If we wait until
+    // rtlsdr_open() (after client register + device enum + tuner init),
+    // the heap is fragmented and the 17KB contiguous DMA block fails.
+    init_adsb_dev();
+
     xTaskNotifyGive(arg);
 
     bool has_clients = true;
@@ -3338,6 +3355,16 @@ void rtlsdr_adsb_start(void)
     // Wait until the USB host library is installed
     ulTaskNotifyTake(false, 1000);
 
+    // Pre-allocate USB transfer buffers NOW while internal RAM is still
+    // contiguous.  The class_driver_task + adsb_reader_task + rtlsdr_open()
+    // will fragment memory before they get around to allocating.
+    // init_adsb_dev() is idempotent — if already called, rtlsdr_open() skips it.
+    printf("[MEM] before USB transfer pre-alloc: internal=%u\n",
+           heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    init_adsb_dev();
+    printf("[MEM] after USB transfer pre-alloc: internal=%u\n",
+           heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+
     task_created = xTaskCreatePinnedToCore(class_driver_task,
                                            "class",
                                            16 * 1024,
@@ -3354,12 +3381,25 @@ void rtlsdr_adsb_start(void)
     ESP_LOGI(TAG, "RTL-SDR ADS-B tasks started");
 }
 
+extern "C" void *g_usb_dma_reservation;
+
 extern "C" void app_main(void)
 {
     printf("Hello world!\n");
     printf("[MEM] boot start: internal=%u PSRAM=%u\n",
            heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
            heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
+    // Reserve a contiguous block of DMA-capable internal RAM NOW, before
+    // peripheral init fragments the heap.  This block will be freed in
+    // init_adsb_dev() right before usb_host_transfer_alloc() needs it,
+    // guaranteeing a contiguous hole for the 17KB USB bulk transfer buffer.
+    g_usb_dma_reservation = heap_caps_malloc(20480, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (g_usb_dma_reservation) {
+        printf("[USB] Reserved 20KB DMA block at %p for USB transfer\n", g_usb_dma_reservation);
+    } else {
+        printf("[USB] WARNING: failed to reserve DMA block\n");
+    }
 
     XL9535->begin();
 
@@ -3403,26 +3443,33 @@ extern "C" void app_main(void)
     XL9535->pin_write(XL9535_ETHERNET_RST, Cpp_Bus_Driver::Xl95x5::Value::HIGH);
 
     // --- Runtime screen detection via I2C probe ---
-    // Both touch ICs share I2C_NUM_0 (SDA=7, SCL=8) with XL9535.
-    // GT9895 (AMOLED) is at 0x5D; HI8561 (LCD) touch is at 0x68.
-    // Probe GT9895 first — if begin() succeeds, this is the AMOLED variant.
-    // Detection MUST happen before Screen_Init_Runtime() and backlight PWM.
+    // Use raw i2c_master_probe() instead of driver begin() for detection,
+    // because GT9895->begin() doesn't reliably return false on probe failure
+    // (LilyGo driver logs error but returns true). Raw probe just sends
+    // address byte and checks for ACK — no side effects, no false positives.
     {
         GT9895_IIC_Bus->set_bus_handle(XL9535_IIC_Bus->get_bus_handle());
         HI8561_T_IIC_Bus->set_bus_handle(XL9535_IIC_Bus->get_bus_handle());
 
-        bool gt9895_found = GT9895->begin();
-        if (gt9895_found) {
+        i2c_master_bus_handle_t i2c_bus = XL9535_IIC_Bus->get_bus_handle();
+
+        // Probe GT9895 touch IC address (0x5D) — present only on AMOLED variant
+        esp_err_t probe_result = i2c_master_probe(i2c_bus, 0x5D, 50);
+        if (probe_result == ESP_OK) {
+            // AMOLED variant — GT9895 responded
+            GT9895->begin();
             g_screen_type = SCREEN_TYPE_RM69A10;
             g_screen_width = RM69A10_SCREEN_WIDTH;
             g_screen_height = RM69A10_SCREEN_HEIGHT;
         } else {
+            // LCD variant — no GT9895, must be HI8561
             HI8561_T->begin();
             g_screen_type = SCREEN_TYPE_HI8561;
             g_screen_width = HI8561_SCREEN_WIDTH;
             g_screen_height = HI8561_SCREEN_HEIGHT;
         }
-        printf("[SCREEN] Detected: %s\n", screen_type_name());
+        printf("[SCREEN] Detected: %s (probe 0x5D: %s)\n",
+               screen_type_name(), probe_result == ESP_OK ? "ACK" : "NACK");
 
         // Update UI layout dimensions to match detected screen
 #if defined SCREEN_ROTATION_DIRECTION_0
@@ -3534,9 +3581,15 @@ extern "C" void app_main(void)
         esp_register_shutdown_handler(sd_safe_shutdown);
 
     // ---------------------------------------------------------------
-    // RTL-SDR / ADS-B USB host moved to after WiFi init — both need
-    // internal DMA RAM, WiFi SDIO must claim its share first.
+    // RTL-SDR / ADS-B USB host — started as early as possible after
+    // SD mount so ADS-B logging begins ASAP.  USB host has no LVGL
+    // or peripheral task dependency.  The 17KB DMA bulk transfer
+    // buffer allocates cleanly here with ~189KB internal RAM free.
     // ---------------------------------------------------------------
+    printf("[MEM] before USB host: internal=%u PSRAM=%u\n",
+           heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+           heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    rtlsdr_adsb_start();
 
     // ---------------------------------------------------------------
     // Now init LVGL and the startup screen.
@@ -3817,36 +3870,12 @@ extern "C" void app_main(void)
     System_Ui->begin(false);  // wallpaper disabled — no images on SD card
     _lock_release(&lvgl_api_lock);
 
-    // ---------------------------------------------------------------
-    // ADSB table — created on the live screen after System_Ui->begin()
-    // Column structure set here at creation time so LVGL never needs
-    // to free/realloc the column array later (avoids crash if USB DMA
-    // corrupts adjacent heap metadata during RTL-SDR init).
-    // ---------------------------------------------------------------
-    _lock_acquire(&lvgl_api_lock);
-    lv_obj_t *adsb_table = lv_table_create(lv_scr_act());
-    lv_table_set_column_count(adsb_table, 7);
-    lv_table_set_column_width(adsb_table, 0, 65);   // ICAO
-    lv_table_set_column_width(adsb_table, 1, 65);   // Callsign
-    lv_table_set_column_width(adsb_table, 2, 55);   // Alt
-    lv_table_set_column_width(adsb_table, 3, 50);   // Speed
-    lv_table_set_column_width(adsb_table, 4, 50);   // Heading
-    lv_table_set_column_width(adsb_table, 5, 55);   // Distance
-    lv_table_set_column_width(adsb_table, 6, 50);   // Bearing
-    lv_table_set_cell_value(adsb_table, 0, 0, "ICAO");
-    lv_table_set_cell_value(adsb_table, 0, 1, "Call");
-    lv_table_set_cell_value(adsb_table, 0, 2, "Alt");
-    lv_table_set_cell_value(adsb_table, 0, 3, "Spd");
-    lv_table_set_cell_value(adsb_table, 0, 4, "Hdg");
-    lv_table_set_cell_value(adsb_table, 0, 5, "Dist");
-    lv_table_set_cell_value(adsb_table, 0, 6, "Brg");
-    lv_obj_set_size(adsb_table, 480, 400);
-    lv_obj_align(adsb_table, LV_ALIGN_TOP_MID, 0, 0);
-    lv_timer_create([](lv_timer_t *t) {
-        adsb_update_display((lv_obj_t *)lv_timer_get_user_data(t));
-    }, 1000, adsb_table);
-    _lock_release(&lvgl_api_lock);
+    // ADS-B aircraft display is now handled by the on-device ADS-B app
+    // (init_win_adsb in lvgl_ui.cpp). The old home-screen table is removed.
 
+    // Task stacks in internal RAM — some tasks pass stack-local variables
+    // to I2C/SPI/UART drivers that require DMA-accessible memory.
+    // LVGL task is the exception (no DMA from stack, uses PSRAM via xTaskCreateWithCaps).
     xTaskCreate(device_vibration_task,   "device_vibration_task",   4 * 1024, NULL, 2, &Vibration_Task_Handle);
     xTaskCreate(device_speaker_task,     "device_speaker_task",     4 * 1024, NULL, 3, &Speaker_Task_Handle);
     xTaskCreate(device_microphone_task,  "device_microphone_task",  4 * 1024, NULL, 3, &Microphone_Task_Handle);
@@ -3883,12 +3912,4 @@ extern "C" void app_main(void)
     // TODO: Implement AT firmware TCP bridge, or re-enable when
     // Espressif ships the fix.
     // ---------------------------------------------------------------
-
-    // ---------------------------------------------------------------
-    // RTL-SDR / ADS-B USB host starts after all peripherals
-    // ---------------------------------------------------------------
-    printf("[MEM] before USB host: internal=%u PSRAM=%u\n",
-           heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-           heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-    rtlsdr_adsb_start();
 }

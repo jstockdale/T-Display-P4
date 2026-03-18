@@ -127,7 +127,8 @@ typedef struct {
     uint32_t total_messages;
     float    msg_rate;          // messages per second
     int      active_aircraft;   // aircraft seen within expiry window
-    bool     rtlsdr_connected;  // true while reader task is running
+    bool     rtlsdr_connected;  // true while reader task is running AND transfer buffer OK
+    bool     rtlsdr_error;      // true if device seen but transfer buffer alloc failed
     uint32_t nearest_icao;      // ICAO of nearest aircraft (0 if none)
     double   nearest_dist_nm;   // distance to nearest in nautical miles
     int      nearest_alt;       // altitude of nearest aircraft
@@ -136,9 +137,31 @@ typedef struct {
 
 extern adsb_stats_t adsb_get_stats(void);
 
-// Format aircraft list into text buffer, sorted by distance.
+// Sort column for on-device aircraft list
+typedef enum {
+    ADSB_SORT_DIST = 0,  // default
+    ADSB_SORT_ICAO,
+    ADSB_SORT_CALL,
+    ADSB_SORT_ALT,
+    ADSB_SORT_SPD,
+    ADSB_SORT_HDG,
+} adsb_sort_col_t;
+
+extern void adsb_set_sort(int col, bool ascending);
+
+// Format aircraft list into text buffer, sorted by current sort column.
 // Returns number of aircraft written.
 extern int adsb_format_aircraft_list(char *buf, int bufsize);
+
+// Pre-allocate USB transfer buffers — call after usb_host_install(),
+// before class_driver_task starts.  Idempotent (safe to call from rtlsdr_open too).
+extern void init_adsb_dev(void);
+
+// Check if USB bulk transfer buffer is allocated and ready
+extern bool adsb_transfer_ready(void);
+
+// Free bulk transfer on disconnect — allows re-alloc on reconnect
+extern void free_adsb_transfer(void);
 
 #ifdef __cplusplus
 }

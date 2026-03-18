@@ -1359,7 +1359,13 @@ int rtlsdr_open(rtlsdr_dev_t **out_dev, uint8_t index, usb_host_client_handle_t 
     dev->dev_lost = 1;
 
     driver_obj->client_hdl = client_hdl;
-    ESP_ERROR_CHECK(usb_host_device_open(driver_obj->client_hdl, index, &driver_obj->dev_hdl));
+    esp_err_t open_err = usb_host_device_open(driver_obj->client_hdl, index, &driver_obj->dev_hdl);
+    if (open_err != ESP_OK) {
+        ESP_LOGE("RTLSDR", "usb_host_device_open failed: %d", open_err);
+        free(driver_obj);
+        free(dev);
+        return -EIO;
+    }
     dev->driver_obj = driver_obj;
     init_adsb_dev();
     /* perform a dummy write, if it fails, reset the device */
@@ -1368,7 +1374,14 @@ int rtlsdr_open(rtlsdr_dev_t **out_dev, uint8_t index, usb_host_client_handle_t 
         fprintf(stderr, "Resetting device...\n");
         // libusb_reset_device(dev->devh);
     }
-    ESP_ERROR_CHECK(usb_host_interface_claim(dev->driver_obj->client_hdl, dev->driver_obj->dev_hdl, 0, 0));
+    esp_err_t claim_err = usb_host_interface_claim(dev->driver_obj->client_hdl, dev->driver_obj->dev_hdl, 0, 0);
+    if (claim_err != ESP_OK) {
+        ESP_LOGE("RTLSDR", "usb_host_interface_claim failed: %d", claim_err);
+        usb_host_device_close(driver_obj->client_hdl, driver_obj->dev_hdl);
+        free(driver_obj);
+        free(dev);
+        return -EIO;
+    }
     dev->rtl_xtal = DEF_RTL_XTAL_FREQ;
 
     rtlsdr_init_baseband(dev);
@@ -1482,38 +1495,31 @@ found:
 
 int rtlsdr_close(rtlsdr_dev_t *dev)
 {
-    //     if (!dev)
-    //         return -1;
+    if (!dev)
+        return -1;
 
-    //     if (!dev->dev_lost)
-    //     {
-    //         /* block until all async operations have been completed (if any) */
-    //         while (RTLSDR_INACTIVE != dev->async_status)
-    //         {
-    //             usleep(1000);
-    //         }
+    if (dev->driver_obj) {
+        if (dev->driver_obj->dev_hdl) {
+            // Release USB interface claim, then close device.
+            // Use non-fatal error handling — device may already be gone.
+            esp_err_t err;
+            err = usb_host_interface_release(dev->driver_obj->client_hdl,
+                                              dev->driver_obj->dev_hdl, 0);
+            if (err != ESP_OK)
+                ESP_LOGW("RTLSDR", "interface release: %d (device may be gone)", err);
 
-    //         rtlsdr_deinit_baseband(dev);
-    //     }
+            err = usb_host_device_close(dev->driver_obj->client_hdl,
+                                         dev->driver_obj->dev_hdl);
+            if (err != ESP_OK)
+                ESP_LOGW("RTLSDR", "device close: %d", err);
 
-    //     libusb_release_interface(dev->devh, 0);
+            dev->driver_obj->dev_hdl = NULL;
+        }
+        free(dev->driver_obj);
+        dev->driver_obj = NULL;
+    }
 
-    // #ifdef DETACH_KERNEL_DRIVER
-    //     if (dev->driver_active)
-    //     {
-    //         if (!libusb_attach_kernel_driver(dev->devh, 0))
-    //             fprintf(stderr, "Reattached kernel driver\n");
-    //         else
-    //             fprintf(stderr, "Reattaching kernel driver failed!\n");
-    //     }
-    // #endif
-
-    //     libusb_close(dev->devh);
-
-    //     libusb_exit(dev->ctx);
-
-    //     free(dev);
-
+    free(dev);
     return 0;
 }
 

@@ -8,80 +8,32 @@
 <h1 align="center">ADS-B Receiver – T-Display-P4</h1>
 
 <p align="center">
-  A portable 1090 MHz ADS-B receiver built on the LILYGO T-Display-P4, using a RTL-SDR USB dongle for RF reception and the ESP32-P4's dual RISC-V cores for real-time Mode-S decoding.
+  A portable 1090 MHz ADS-B receiver built on the LILYGO T-Display-P4, using an RTL-SDR USB dongle for RF reception and the ESP32-P4's dual RISC-V cores for real-time Mode-S decoding.
 </p>
 
 ## Overview
 
-This project turns a LILYGO T-Display-P4 development board into a standalone ADS-B receiver. A RTL-SDR dongle connected via USB Host receives 1090 MHz transponder signals, which are decoded in real-time on the ESP32-P4. Decoded aircraft are displayed on the built-in touchscreen, logged to SD card with full positional data, and can be viewed live on a map via the companion web app, ADS-B Scope.
+This project turns a LILYGO T-Display-P4 development board into a standalone ADS-B receiver. An RTL-SDR dongle connected via USB Host receives 1090 MHz transponder signals, which are decoded in real-time on the ESP32-P4. Decoded aircraft are displayed on the built-in touchscreen, logged to SD card with full positional data, and can be viewed live on a map via the companion web app, ADS-B Scope.
 
 ### What works today
 
+- **On-device ADS-B display** – touchscreen UI with aircraft table (ICAO, callsign, altitude, speed, heading, distance), stats panel (message rate, GPS, nearest aircraft, UTC time), draggable divider between panels, 4-way screen rotation toggle (persists across app visits)
+- **Unified firmware** – single binary supports both HI8561 LCD (540×1168) and RM69A10 AMOLED (568×1232) display variants via runtime I2C probe detection at boot
 - **Real-time ADS-B reception** – 15–30 messages/second, 12–30+ simultaneous aircraft tracked
 - **~30 nm range** from Oakland, CA with a 7" telescopic antenna on RTL-SDR
-- **On-device ADS-B app** – live aircraft table sorted by distance with RTL-SDR status, message rate, GPS position, and nearest aircraft info. Radar-green-on-dark aesthetic. Draggable divider between stats and aircraft list. Rotation toggle cycles through all 4 orientations via hardware PPA acceleration.
-- **Status bar indicators** – GPS (fix/searching/offline with satellite count), ADS-B (connected/aircraft count), SD card (logging/mounted/absent), battery level. Color-coded: green = active, yellow = degraded, red = error, gray = offline.
-- **CIT diagnostics** – ADS-B test page in the hardware test menu shows RTL-SDR connection, message stats, aircraft count, nearest aircraft, GPS status, and UTC time.
-- **GPS-based automatic timezone** – 0.1° resolution worldwide timezone grid (~165KB flash) with DST rule support for 61 regions. Correctly handles half-hour offsets (India, Nepal), southern hemisphere DST (Australia, New Zealand), and US/EU spring-forward/fall-back transitions. Manual override available via serial console.
+- **USB hot-plug** – RTL-SDR can be connected/disconnected at any time; firmware detects disconnect (10 consecutive read errors), frees stuck USB transfer, and re-initializes cleanly on reconnect
+- **Three-state RTL-SDR status** – status bar and CIT page distinguish between disconnected (grey), connected (green), and error (red) states
 - **SD card CSV logging** – UTC timestamps, raw Mode-S hex, decoded fields (ICAO, callsign, altitude, speed, heading, vertical rate, position, squawk), receiver GPS metadata (sats, HDOP). PSRAM-buffered writes with periodic flush for clean filesystem state.
-- **GPS time sync** – L76K GNSS (5 Hz) sets the system clock with 650ms serial delay compensation, syncs the PCF8563 RTC in local time
-- **Serial console** – interactive command mode (Ctrl+C) with file management, status, version query, timezone control; ADS-B output buffered and replayed on return to log mode
+- **GPS timezone with DST** – L76K GNSS (5 Hz) sets the system clock with 650ms serial delay compensation; timezone determined from GPS coordinates using a compiled 0.1° grid covering 61 regions with 12 DST rules; syncs the PCF8563 RTC with local time
+- **Serial console** – interactive command mode (Ctrl+C) with file management, status, version query; ADS-B output buffered and replayed on return to log mode
 - **ADS-B Scope** – WebSerial-based live map viewer with firmware flashing, CSV replay, file browser ([adsb-scope.offx1.com](https://adsb-scope.offx1.com))
 - **SD card reliability** – power-cycled on boot via XL9535 GPIO to reset card state machine after hard resets
+- **Status bar** – dynamic icons for GPS (sat count + fix status), ADS-B (aircraft count + connection state), SD card (mounted/logging), and battery level with automatic spacing based on rendered text width
 
 ### Known limitations
 
 - **WiFi disabled** – ESP-Hosted SDIO DMA corrupts internal RAM heap metadata (Espressif Issue #17889); WiFi/NTP unavailable until resolved or AT firmware is deployed on the C6
-- **LVGL table display disabled** – `adsb_update_display()` is a no-op to work around USB DMA heap corruption; the ADS-B app uses a separate label-based approach that avoids the `lv_table_set_cell_value` realloc crash
-- **Settings app placeholder** – visible on home screen but not yet implemented
 - **WebSerial triggers device reboot** – USB-JTAG auto-reset circuit fires on DTR toggle during port open; handled gracefully (scope reconnects, boot log is parsed)
-
-## On-Device UI
-
-### Home Screen
-
-The device boots to a home screen showing local time/date (automatically timezone-adjusted), app icons (CIT, RF, Music, ADS-B), and a dock (Camera, Settings). The status bar displays time, GPS satellite count, ADS-B aircraft count, SD card status, and battery level — all color-coded for at-a-glance status.
-
-### ADS-B App
-
-Tap the ADS-B icon to open a live aircraft display with:
-- **Stats panel** – RTL-SDR connection status, message rate, aircraft count, GPS position, nearest aircraft callsign/distance/altitude, UTC time
-- **Aircraft table** – all tracked aircraft sorted by distance, showing ICAO, callsign, altitude, speed, heading, and distance in nautical miles. Scrollable.
-- **Draggable divider** – resize stats vs. list by dragging the blue bar between panels
-- **Rotation toggle** – cycles through 0°/90°/180°/270° using ESP32-P4's PPA hardware rotation engine. Landscape orientation gives maximum table width. Rotation restores automatically when leaving the app.
-
-### CIT (Hardware Test) Menu
-
-Includes an ADS-B test page alongside the stock hardware tests (touch, screen, vibration, speaker, mic, IMU, battery, GPS, ethernet, RTC). The ADS-B test shows receiver status with PASS/FAIL buttons.
-
-## Timezone System
-
-The device automatically detects the local timezone from GPS coordinates using an offline lookup table. The system uses a 0.1° (~11km) resolution grid covering the entire world, RLE-compressed to ~165KB in flash. It includes DST transition rules for all major regions.
-
-### How it works
-1. GPS fix provides latitude/longitude
-2. Grid lookup maps coordinates to one of 61 timezone regions
-3. Each region specifies a base UTC offset and an optional DST rule
-4. DST rules encode "Nth weekday of month" transitions (e.g., 2nd Sunday of March)
-5. The current UTC date determines whether DST is active
-6. Total offset = base + DST delta
-
-### Regenerating timezone data
-If timezone rules change (rare), regenerate the data file:
-```bash
-pip install geopandas shapely requests numpy
-python3 generate_tz_data.py
-# Outputs: timezone_data.h (~165KB, copy to source directory)
-```
-
-### Serial console timezone commands
-```
-timezone              show current timezone info
-timezone auto         use GPS-based automatic timezone (default)
-timezone UTC-8        set manual offset (PST)
-timezone UTC+5:30     set manual offset (IST)
-tz                    alias for timezone
-```
 
 ## ADS-B Scope
 
@@ -126,7 +78,7 @@ cp <src> <dst>    copy a file
 df                show SD card free space
 status            show receiver status
 version           show firmware version
-timezone [auto|UTC±N] show or set timezone
+tz [hours]        show or set UTC offset (e.g. tz -7)
 mount             mount SD card
 unmount           safely unmount SD card
 reboot            software reset
@@ -138,7 +90,7 @@ Logged to `/sdcard/adsb_YYYY-MM-DDTHHMMSSZ.csv` (or `adsb_bootNNNN.csv` before G
 
 ```
 timestamp_utc,raw_msg,icao,callsign,altitude_ft,speed_kt,heading_deg,vrate_fpm,lat,lon,squawk,rx_lat,rx_lon,range_km,bearing_deg,rx_sats,rx_hdop
-2026-03-17T06:19:14.739Z,8D0D0A08581DB4BF26B6DFB4B0B1,0D0A08,VOI1773,4875,283,255,2560,37.7492,-122.4221,0000,37.8333,-122.2739,8.7,234,8,1.2
+2026-03-16T04:13:35.123Z,8DA105E8582594BADAC53333EE95,A105E8,SKW5567,6425,285,109,-128,37.72680,-122.44730,0000,37.83328,-122.27379,11.0,233,5,2.7
 ```
 
 Timestamps are ISO-8601 UTC with millisecond resolution. Raw Mode-S hex is the second column for easy replay. Every row includes receiver GPS sats/HDOP for data quality assessment.
@@ -151,9 +103,9 @@ Timestamps are ISO-8601 UTC with millisecond resolution. Raw Mode-S hex is the s
 |---|---|
 | **SoC** | ESP32-P4, 360 MHz dual RISC-V, 32 MB PSRAM, 16 MB flash |
 | **Coprocessor** | ESP32-C6-MINI-1U (WiFi 6 / BLE 5 via SDIO) |
-| **Display** | HI8561 4.05" MIPI DSI touchscreen, 540×1168, 326 PPI |
-| **GPS** | Quectel L76K (UART, 9600→115200 baud auto-detect, 5 Hz) |
-| **RTC** | PCF8563 (I²C, stores local time via GPS timezone lookup) |
+| **Display** | HI8561 LCD 540×1168 or RM69A10 AMOLED 568×1232 (auto-detected at boot) |
+| **GPS** | Quectel L76K (UART, 9600→115200 baud auto-detect) |
+| **RTC** | PCF8563 (I²C, stores local time with GPS-derived timezone) |
 | **LoRa** | SX1262 via SPI (HPD16A module) |
 | **Audio** | ES8311 DAC + NS4150B amplifier + electret mic |
 | **IMU** | ICM20948 9-axis (I²C) |
@@ -166,65 +118,78 @@ Timestamps are ISO-8601 UTC with millisecond resolution. Raw Mode-S hex is the s
 
 Connected via the ESP32-P4's USB 2.0 Host port. The firmware implements a custom USB host driver that initializes the RTL2832U + R820T tuner, tunes to 1090 MHz at 2 MS/s, and reads IQ samples via USB bulk transfers.
 
+## Source Files
+
+All ADS-B firmware source is in `main/examples/lvgl_9_ui/`:
+
+| File | Description |
+|---|---|
+| `main.cpp` | Boot, peripheral init, GPS task, LVGL UI, task orchestration, screen detection, USB pre-alloc |
+| `class_driver.c / .h` | USB host, RTL-SDR reader task, aircraft table, SD logging, stats with error state |
+| `mode-s.c / .h` | Mode S decoder (from dump1090/libmodes) |
+| `serial_console.c / .h` | Interactive console with command mode and PSRAM replay buffer |
+| `lvgl_ui.cpp / .h` | LVGL UI: ADS-B app, status bar, CIT tests, generic TouchPoint, rotation persistence |
+| `esp_libusb.c / .h` | USB-to-librtlsdr shim, idempotent init, early DMA pre-alloc |
+| `librtlsdr.c` | RTL-SDR driver (adapted from osmocom) |
+| `tz_lookup.c / .h` | GPS coordinate → timezone offset with DST |
+| `timezone_data.h` | Generated 0.1° grid (61 regions, 12 DST rules) |
+| `generate_tz_data.py` | Timezone data generator script |
+| `screen_detect.h` | Runtime screen type detection (HI8561 vs RM69A10) |
+| `t_display_p4_driver.cpp / .h` | Runtime MIPI DSI panel creation for both display variants |
+| `adsb_scope.html` | ADS-B Scope companion web app |
+
 ## Architecture
 
 ```
 RTL-SDR (1090 MHz, 2 MS/s IQ)
-    │ USB bulk transfer (PSRAM buffers)
+    │ USB bulk transfer (17KB DMA buffer, pre-allocated at boot)
     ▼
 ESP32-P4 USB Host Driver (class_driver.c)
     │ magnitude → Mode-S demodulator (mode-s.c)
     ▼
-Aircraft Table (64 slots, 60s expiry)
+Aircraft Table (256 slots, 60s expiry)
     │
-    ├──→ On-device ADS-B app (LVGL labels, sorted by distance)
-    ├──→ Status bar (aircraft count, RTL-SDR status, GPS, SD card)
+    ├──→ On-device LVGL display (lvgl_ui.cpp, aircraft table + stats panel)
     ├──→ Serial output (serial_console.c, buffered during CMD mode)
-    ├──→ SD card CSV log (PSRAM buffer, periodic flush)
-    └──→ ADS-B Scope (via WebSerial)
+    └──→ SD card CSV log (PSRAM buffer, periodic flush)
 
 L76K GPS (UART, 5 Hz NMEA)
     │
     ├──→ Receiver position → range/bearing calculation
     ├──→ System clock (settimeofday + 650ms serial delay compensation)
-    ├──→ Timezone lookup (0.1° grid + DST rules → local time)
+    ├──→ Timezone lookup (tz_lookup.c, 0.1° grid with DST)
     └──→ PCF8563 RTC (local time, every 60s)
+
+Runtime Screen Detection (screen_detect.h)
+    │ I2C probe: GT9895 (0x5D) → AMOLED, else → LCD
+    ▼
+Screen_Init_Runtime (t_display_p4_driver.cpp)
+    │ MIPI DSI panel creation with variant-specific timing
+    ▼
+LVGL Display (g_screen_width × g_screen_height)
 
 Serial Console (serial_console.c)
     │
     ├──→ LOG mode: streaming ADS-B/GNSS output
-    ├──→ CMD mode: file management, status, version, timezone
+    ├──→ CMD mode: file management, status, timezone, version
     └──→ Replay buffer: 500 lines in PSRAM, flushed on return to LOG
 ```
-
-## Source Files
-
-All in `main/examples/lvgl_9_ui/`:
-
-| File | Description | License |
-|---|---|---|
-| `main.cpp` | Boot, peripheral init, GPS task, LVGL UI, task orchestration | GPL 3.0 (LILYGO) |
-| `class_driver.c/h` | USB host, RTL-SDR reader, CPR decode, aircraft table, SD logging | BSD 3-Clause |
-| `mode-s.c/h` | Mode S preamble detection, CRC, decode | BSD 2-Clause |
-| `serial_console.c/h` | Interactive serial console with PSRAM replay buffer | BSD 3-Clause |
-| `lvgl_ui.cpp/h` | LVGL UI framework, ADS-B app, status bar, CIT tests | GPL 3.0 (LILYGO) |
-| `tz_lookup.c/h` | GPS-based timezone lookup with DST support | BSD 3-Clause |
-| `timezone_data.h` | Generated 0.1° timezone grid (61 regions, 12 DST rules) | Public domain |
-| `esp_libusb.c/h` | USB-to-librtlsdr shim | GPL 2.0 |
-| `librtlsdr.c` | RTL-SDR driver (R820T2 only) | GPL 2.0 |
-| `adsb_scope.html` | Web companion app (v1.0.3) | BSD 3-Clause |
-| `generate_tz_data.py` | Timezone data generator (runs on host) | BSD 3-Clause |
 
 ## Memory Budget
 
 | Stage | Internal RAM Free |
 |---|---|
-| Boot | 267 KB |
-| After SD mount | 222 KB |
-| After USB host install | 222 KB |
-| Before LVGL | 213 KB |
-| After UI + all tasks | ~116 KB |
-| PSRAM free | ~20 MB |
+| Boot | 253 KB |
+| After USB DMA reservation | 233 KB |
+| After SD mount | ~189 KB |
+| After USB host + pre-alloc | ~179 KB |
+| Before LVGL task | ~179 KB |
+| After LVGL init | ~149 KB |
+| After ICM20948 | ~135 KB |
+| After UI + all tasks | ~83 KB |
+| PSRAM free | ~19 MB |
+
+USB bulk transfer buffer (17 KB) is pre-allocated immediately after `usb_host_install()` while internal RAM is still contiguous. A 20 KB DMA reservation block is held from the very start of boot and released just before allocation to guarantee a contiguous hole even under fragmentation.
 
 ## Quick Start – Pre-built Binary
 
@@ -249,7 +214,7 @@ If the device doesn't enter bootloader mode automatically, hold **BOOT** + tap *
 
 ```bash
 esptool.py --chip esp32p4 --port /dev/tty.usbmodem* \
-    write_flash 0x0 release.bin
+    write_flash 0x0 jstockdale-adsb_receiver-t_display_p4-260317.bin
 ```
 
 On Windows, replace `/dev/tty.usbmodem*` with the appropriate COM port (e.g., `COM3`).
@@ -258,7 +223,7 @@ After flashing, press RESET. The device will boot, initialize all peripherals, a
 
 ### Hardware needed
 
-- LILYGO T-Display-P4 V1.0
+- LILYGO T-Display-P4 V1.0 (either LCD or AMOLED variant)
 - RTL-SDR USB dongle (RTL2832U + R820T/R820T2)
 - Antenna – the included telescopic whip works, ~30 nm range from a window
 
@@ -298,20 +263,27 @@ cd build && esptool.py --chip esp32p4 merge_bin -o ../release.bin \
 - `CONFIG_HEAP_POISONING_LIGHT=y` – enabled for heap corruption debugging
 - ESP-Hosted and esp_wifi_remote are commented out in `idf_component.yml`
 - `CPP_BUS_DRIVER_LOG_LEVEL_DEBUG` is commented out in `config.h` to suppress raw NMEA dumps
+- `sdkconfig` retains `CONFIG_SCREEN_TYPE_HI8561=y` for compile-time header constants; runtime detection overrides all display-dependent behavior
 
 ## Pending Work
 
-1. **On-device ADS-B radar scope** – canvas-drawn aircraft positions on a map view (currently text table only)
-2. **Settings app** – timezone manual selection UI, display brightness, SD card format, WiFi configuration
-3. **Restore WiFi** – either fix ESP-Hosted SDIO DMA or flash C6 with AT firmware
-4. **Fix USB DMA heap corruption** – root cause of LVGL table crash; USB bulk transfers corrupt internal RAM heap metadata; current workaround avoids lv_table realloc
-5. **TDOA geolocation network** – distributed GNSS-disciplined SDR nodes for passive aircraft tracking (design phase)
-6. ~~Fix screen~~ – **fixed**: `esp_lcd_panel_reset()` was wiping DSI lane config after `Screen_Init()`; removed reset, reordered `App_Video_Init()` before `Screen_Init()` to match stock LILYGO init order
-7. ~~Fix timezone~~ – **fixed**: replaced hardcoded UTC+8 with GPS-based timezone lookup using 0.1° worldwide grid with DST rules
-8. ~~Investigate WebSerial reset~~ – DTR race handled gracefully; scope deasserts DTR/RTS and parses reboot log
-9. ~~SD card corruption on reboot~~ – fixed: power-cycle SD card via XL9535 SD_EN early in boot to reset card state machine
-10. ~~Heading display~~ – fixed: ground speed heading (DF17 TC19 subtypes 1/2) now correctly applied
-11. ~~ADS-B decoding~~ – fixed: removed double-decode in on_msg that zeroed all messages via memset
+1. **Restore WiFi** – either fix ESP-Hosted SDIO DMA or flash C6 with AT firmware
+2. **On-device radar scope** – canvas-drawn aircraft positions on map
+3. **Settings app** – timezone UI, brightness, SD format, WiFi config
+4. **Seed POSIX clock from RTC at boot** – so timestamps are approximately correct before GPS fix
+5. **SD card graceful handling** – detect "no card" early, skip retries, suppress runtime re-mount attempts
+6. **Smaller font for aircraft table** – enable montserrat_14/16 in LVGL config for more rows
+7. **tz-embedded open source release** – timezone library as standalone repo
+8. ~~Fix screen~~ – fixed: root cause was `esp_lcd_panel_reset()` called after `Screen_Init()` wiping DSI lane config
+9. ~~Fix USB DMA heap corruption~~ – fixed: early pre-alloc of 17KB bulk transfer buffer before heap fragmentation
+10. ~~Re-enable LVGL aircraft display~~ – fixed: on-device ADS-B app with stats panel, aircraft table, rotation toggle
+11. ~~Investigate WebSerial reset~~ – DTR race handled gracefully; scope deasserts DTR/RTS and parses reboot log
+12. ~~SD card corruption on reboot~~ – fixed: power-cycle SD card via XL9535 SD_EN early in boot to reset card state machine
+13. ~~Heading display~~ – fixed: ground speed heading (DF17 TC19 subtypes 1/2) now correctly applied
+14. ~~ADS-B decoding~~ – fixed: removed double-decode in on_msg that zeroed all messages via memset
+15. ~~Timezone~~ – fixed: GPS-derived timezone with DST support, 0.1° resolution grid covering 61 regions
+16. ~~Runtime screen detection~~ – fixed: single firmware supports both HI8561 LCD and RM69A10 AMOLED via I2C probe
+17. ~~USB hot-plug~~ – fixed: consecutive error detection, transfer buffer free/re-alloc, three-state status
 
 ## Acknowledgments
 
@@ -326,8 +298,6 @@ This project builds on the work of several open source authors:
 - **[LILYGO](https://github.com/Xinyuan-LilyGO/T-Display-P4)** — T-Display-P4 hardware design and the base ESP-IDF project with LVGL UI framework, peripheral drivers, and board support package.
 
 - **[osmocom / Steve Markgraf](https://github.com/steve-m/librtlsdr)** — Original librtlsdr and the R820T/R828D tuner drivers.
-
-- **[timezone-boundary-builder](https://github.com/evansiroky/timezone-boundary-builder)** — Open timezone boundary GeoJSON data used to generate the embedded timezone lookup grid.
 
 ## License
 
@@ -541,4 +511,3 @@ For pin definitions, please refer to the configuration file:
 
 * Q. Why is WiFi not working?
 * A. ESP-Hosted SDIO DMA on the ESP32-P4 corrupts internal RAM heap metadata. This is tracked in [Espressif Issue #17889](https://github.com/espressif/esp-hosted/issues/17889). WiFi components are commented out in `idf_component.yml`. The planned fix is to flash the ESP32-C6 with AT firmware for synchronous WiFi.
-
