@@ -95,6 +95,35 @@ timestamp_utc,raw_msg,icao,callsign,altitude_ft,speed_kt,heading_deg,vrate_fpm,l
 
 Timestamps are ISO-8601 UTC with millisecond resolution. Raw Mode-S hex is the second column for easy replay. Every row includes receiver GPS sats/HDOP for data quality assessment.
 
+## Timezone System
+
+The device automatically detects the local timezone from GPS coordinates using an offline lookup table. The system uses a 0.1° (~11km) resolution grid covering the entire world, RLE-compressed to ~165KB in flash. It includes DST transition rules for all major regions.
+
+### How it works
+1. GPS fix provides latitude/longitude
+2. Grid lookup maps coordinates to one of 61 timezone regions
+3. Each region specifies a base UTC offset and an optional DST rule
+4. DST rules encode "Nth weekday of month" transitions (e.g., 2nd Sunday of March)
+5. The current UTC date determines whether DST is active
+6. Total offset = base + DST delta
+
+### Regenerating timezone data
+If timezone rules change (rare), regenerate the data file:
+```bash
+pip install geopandas shapely requests numpy
+python3 generate_tz_data.py
+# Outputs: timezone_data.h (~165KB, copy to source directory)
+```
+
+### Serial console timezone commands
+```
+timezone              show current timezone info
+timezone auto         use GPS-based automatic timezone (default)
+timezone UTC-8        set manual offset (PST)
+timezone UTC+5:30     set manual offset (IST)
+tz                    alias for timezone
+```
+
 ## Hardware
 
 ### Board: LILYGO T-Display-P4 V1.0
