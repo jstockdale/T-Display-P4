@@ -53,6 +53,7 @@
 
 #include "class_driver.h"  // for adsb_get_receiver_pos, aircraft count
 #include "tz_lookup.h"     // for timezone lookup and manual override
+#include "device_settings.h"
 
 static const char *CONSOLE_TAG = "CONSOLE";
 
@@ -164,11 +165,16 @@ bool serial_console_print(const char *fmt, ...) {
         return true;
     }
 
-    // CMD mode — format into a temp buffer and push to replay ring
-    char tmp[REPLAY_LINE_MAX];
+    // CMD mode — format into static buffer (avoids 384 bytes on caller's stack,
+    // which matters for Meshy RX/TX tasks with tight 6KB internal RAM stacks)
+    static char tmp[REPLAY_LINE_MAX];
+    static SemaphoreHandle_t print_mutex = NULL;
+    if (!print_mutex) print_mutex = xSemaphoreCreateMutex();
+    if (print_mutex) xSemaphoreTake(print_mutex, portMAX_DELAY);
     vsnprintf(tmp, sizeof(tmp), fmt, ap);
     va_end(ap);
     replay_push(tmp);
+    if (print_mutex) xSemaphoreGive(print_mutex);
     return false;
 }
 
@@ -209,6 +215,7 @@ static void cmd_help(void) {
         "  \033[32mstatus\033[0m            show receiver status\n"
         "  \033[32mversion\033[0m           show firmware version\n"
         "  \033[32mtimezone\033[0m [auto|UTC±N] show or set timezone\n"
+        "  \033[32mheartbeat\033[0m [on|off|5-255] show/set console heartbeat\n"
         "  \033[32mmount\033[0m             mount SD card\n"
         "  \033[32munmount\033[0m           safely unmount SD card\n"
         "  \033[32mreboot\033[0m            software reset\n"
@@ -591,6 +598,30 @@ static void dispatch_command(char *line) {
                 printf(" (manual)\n");
             }
         }
+    } else if (strcmp(cmd, "heartbeat") == 0 || strcmp(cmd, "hb") == 0) {
+        if (!arg1) {
+            printf("  Heartbeat: %s, period: %ds\n",
+                   g_settings.heartbeat_enabled ? "on" : "off",
+                   g_settings.heartbeat_period_s);
+        } else if (strcmp(arg1, "on") == 0) {
+            g_settings.heartbeat_enabled = true;
+            settings_save();
+            printf("  Heartbeat enabled (%ds)\n", g_settings.heartbeat_period_s);
+        } else if (strcmp(arg1, "off") == 0) {
+            g_settings.heartbeat_enabled = false;
+            settings_save();
+            printf("  Heartbeat disabled\n");
+        } else {
+            int p = atoi(arg1);
+            if (p >= 5 && p <= 255) {
+                g_settings.heartbeat_period_s = (uint8_t)p;
+                g_settings.heartbeat_enabled = true;
+                settings_save();
+                printf("  Heartbeat period set to %ds\n", p);
+            } else {
+                printf("  Usage: heartbeat [on|off|5-255]\n");
+            }
+        }
     } else if (strcmp(cmd, "reboot") == 0) {
         printf("  Shutting down SD card...\n");
         extern void sd_safe_shutdown(void);
@@ -615,13 +646,25 @@ static void serial_console_task(void *arg) {
     fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
 
     ESP_LOGI(CONSOLE_TAG, "Serial console ready (Ctrl+C for command mode)");
+    printf("[CONSOLE] Serial console ready\n");
+
+    uint32_t heartbeat_next = esp_log_timestamp() + (g_settings.heartbeat_period_s * 1000);
 
     while (1) {
         uint8_t ch;
         int n = read(STDIN_FILENO, &ch, 1);
 
         if (n <= 0) {
-            // No data available, yield
+            // Heartbeat in log mode
+            if (s_mode == MODE_LOG && g_settings.heartbeat_enabled &&
+                esp_log_timestamp() >= heartbeat_next) {
+                printf("[CONSOLE] Serial console heartbeat\n");
+                printf("[MEM] internal: %u free, %u largest | psram: %u free\n",
+                       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                       (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+                heartbeat_next = esp_log_timestamp() + (g_settings.heartbeat_period_s * 1000);
+            }
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
@@ -671,5 +714,11 @@ static void serial_console_task(void *arg) {
 void serial_console_init(void) {
     s_mode_mutex = xSemaphoreCreateMutex();
     replay_init();
-    xTaskCreate(serial_console_task, "console", 8192, NULL, 2, NULL);
+    // Console task does file I/O and stdin reads — no SPI/DMA, safe for PSRAM stack.
+    // Must use PSRAM because internal RAM is exhausted by meshy SPI tasks.
+    BaseType_t ret = xTaskCreateWithCaps(serial_console_task, "console", 8192, NULL, 2, NULL, MALLOC_CAP_SPIRAM);
+    if (ret != pdPASS) {
+        // Fallback to internal RAM (smaller stack)
+        xTaskCreate(serial_console_task, "console", 4096, NULL, 2, NULL);
+    }
 }

@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ADS-B Scope — Off by One</title>
+<title>ADS-B Scope – Off by One</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
@@ -20,7 +20,8 @@
   #topbar .logo{font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:15px;color:var(--accent);letter-spacing:-0.5px;white-space:nowrap}
   #topbar .logo span{color:var(--text-dim);font-weight:400}
   .scope-ver{font-size:10px;opacity:0.5}
-  .stat{display:flex;align-items:center;gap:5px;color:var(--text-dim)}.stat .val{color:var(--text);font-weight:600}.stat .val.live{color:var(--accent)}
+  .stat{display:flex;align-items:center;gap:5px;color:var(--text-dim)}.stat .val{color:var(--text);font-weight:600;font-variant-numeric:tabular-nums}.stat .val.live{color:var(--accent)}
+  #stats-bar{display:flex;align-items:center;gap:14px;flex-shrink:0}
   .topbtn{background:transparent;color:var(--text-dim);border:1px solid var(--panel-border);padding:4px 10px;border-radius:4px;font-family:inherit;font-size:11px;font-weight:600;cursor:pointer;text-transform:uppercase;letter-spacing:0.5px;white-space:nowrap;min-height:32px;touch-action:manipulation}
   .topbtn:hover{border-color:var(--text-dim);color:var(--text)}.topbtn.active{border-color:var(--accent);color:var(--accent)}
   #connect-btn{background:var(--accent);color:var(--bg);border:none;padding:6px 16px;border-radius:4px;font-family:inherit;font-size:12px;font-weight:700;cursor:pointer;text-transform:uppercase;letter-spacing:0.5px;white-space:nowrap;min-height:36px;touch-action:manipulation}
@@ -29,6 +30,8 @@
   #label-modes{display:flex;gap:3px;flex-shrink:0}
   #color-modes button,#label-modes button{background:transparent;color:var(--text-dim);border:1px solid var(--panel-border);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:10px;cursor:pointer;font-weight:600;white-space:nowrap;min-height:28px;min-width:32px;touch-action:manipulation}
   #color-modes button:hover,#label-modes button:hover{border-color:var(--text-dim)}#color-modes button.active,#label-modes button.active{border-color:var(--accent);color:var(--accent)}
+  #ac-map-btn,#mesh-map-btn{background:transparent;color:var(--text-dim);border:1px solid var(--panel-border);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:10px;cursor:pointer;font-weight:600;white-space:nowrap;min-height:28px;touch-action:manipulation}
+  #ac-map-btn:hover,#mesh-map-btn:hover{border-color:var(--text-dim)}#ac-map-btn.active{border-color:var(--accent);color:var(--accent)}#mesh-map-btn.active{border-color:var(--blue);color:var(--blue)}
   #panel{position:absolute;bottom:0;left:0;right:0;z-index:1000;background:linear-gradient(0deg,rgba(10,14,20,0.97),rgba(10,14,20,0.85));backdrop-filter:blur(10px);border-top:1px solid var(--panel-border);height:35vh;overflow:hidden;display:flex;flex-direction:column}
   #panel.collapsed{height:32px}
   #panel-drag{height:12px;cursor:ns-resize;flex-shrink:0;display:flex;align-items:center;justify-content:center;touch-action:none}
@@ -47,8 +50,8 @@
   .col-vr.climbing{color:var(--accent)}.col-vr.descending{color:var(--warning)}.col-dist{color:var(--text-dim)}
   .leaflet-div-icon{background:none!important;border:none!important}
   .leaflet-control-zoom{display:none!important}
-  #zoom-ctrl{position:absolute;right:12px;z-index:1000;display:flex;flex-direction:column;gap:2px}
-  #zoom-ctrl button{width:40px;height:40px;background:var(--panel);color:var(--text);border:1px solid var(--panel-border);border-radius:4px;font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-family:inherit;touch-action:manipulation}
+  #zoom-ctrl{position:absolute;right:12px;z-index:1000;display:flex;flex-direction:row;gap:8px}
+  #zoom-ctrl button{width:36px;height:36px;background:var(--panel);color:var(--text);border:1px solid var(--panel-border);border-radius:4px;font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-family:inherit;touch-action:manipulation}
   #zoom-ctrl button:hover{background:var(--panel-border);color:#fff}
   #legend{display:none;position:absolute;left:12px;z-index:999;background:rgba(17,24,32,0.9);border:1px solid var(--panel-border);border-radius:6px;padding:8px 10px;font-size:10px;color:var(--text-dim)}
   #legend.visible{display:block}
@@ -57,6 +60,9 @@
   #legend .lrange{display:flex;justify-content:space-between;font-size:9px}
   #gnss-info{position:absolute;top:66px;left:12px;z-index:999;background:rgba(17,24,32,0.9);border:1px solid var(--panel-border);border-radius:6px;padding:8px 12px;font-size:11px;color:var(--text-dim);line-height:1.6}
   #gnss-info .fix{color:var(--accent);font-weight:600}#gnss-info .nofix{color:var(--warning);font-weight:600}
+  #session-panel{position:absolute;top:52px;right:12px;z-index:999;font-size:10px;font-family:'JetBrains Mono',monospace;line-height:1.5;display:none;grid-template-columns:auto auto;gap:0 6px;background:rgba(17,24,32,0.85);border:1px solid var(--panel-border);border-radius:4px;padding:4px 8px}
+  #session-panel.visible{display:grid}
+  #session-panel .sess-on{color:var(--accent)}#session-panel .sess-off{color:#ff6b6b}
   #sd-info{color:var(--text-dim);font-size:10px;margin-top:4px;padding-top:4px;border-top:1px solid var(--panel-border)}
   #sd-info .sd-ok{color:var(--accent)}#sd-info .sd-err{color:var(--warning)}#sd-info .sd-wait{color:var(--text-dim)}
   #detail-wrap{position:absolute;top:66px;right:12px;bottom:40vh;z-index:1000;overflow-y:auto;overflow-x:hidden;display:none;flex-direction:column;gap:8px;width:240px;padding-bottom:8px;-webkit-overflow-scrolling:touch}
@@ -75,9 +81,28 @@
   #log-controls label{font-size:10px;color:var(--text-dim);display:flex;align-items:center;gap:4px;cursor:pointer;min-height:32px;touch-action:manipulation}
   #log-controls input[type="checkbox"]{accent-color:var(--accent);width:16px;height:16px}
   #log-output{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:8px 12px;font-size:10px;line-height:1.5;color:var(--text);white-space:pre;font-family:'JetBrains Mono',monospace}
-  .log-adsb{color:var(--accent)}.log-gnss{color:var(--blue)}.log-info{color:var(--text-dim)}.log-error{color:var(--warning)}.log-scope{color:#c792ea}
+  .log-adsb{color:var(--accent)}.log-gnss{color:var(--blue)}.log-info{color:var(--text-dim)}.log-error{color:var(--warning)}.log-scope{color:#c792ea}.log-meshy{color:var(--blue)}.log-console{color:#e5c07b}
+  #meshy-panel{display:none;position:absolute;top:160px;right:12px;z-index:1001;width:min(480px,calc(100vw - 24px));height:min(400px,calc(100vh - 220px));background:rgba(10,14,20,0.96);border:1px solid var(--panel-border);border-radius:6px;overflow:hidden;flex-direction:column;resize:both;min-width:240px;min-height:200px}
+  #meshy-panel.visible{display:flex}
+  #meshy-header{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid var(--panel-border);font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:0.5px;flex-shrink:0;cursor:grab;user-select:none;touch-action:none}
+  #meshy-header.dragging{cursor:grabbing}
+  #meshy-header button{background:none;border:none;color:var(--text-dim);font-size:14px;cursor:pointer;padding:4px 8px;min-width:32px;min-height:32px;touch-action:manipulation}#meshy-header button:hover{color:var(--text)}
+  #meshy-stats{padding:6px 12px;border-bottom:1px solid var(--panel-border);font-size:10px;color:var(--text-dim);flex-shrink:0}
+  #meshy-controls{display:flex;gap:10px;align-items:center;padding:4px 12px;border-bottom:1px solid var(--panel-border);flex-shrink:0}
+  #meshy-controls label{font-size:10px;color:var(--text-dim);display:flex;align-items:center;gap:4px;cursor:pointer;min-height:28px;touch-action:manipulation}
+  #meshy-controls input[type="checkbox"]{accent-color:var(--accent);width:14px;height:14px}
+  #meshy-output{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:4px 10px;font-size:10px;line-height:1.4;color:var(--text)}
+  .meshy-msg{padding:1px 0;cursor:pointer}.meshy-msg:hover{background:rgba(0,229,160,0.05)}
+  .meshy-msg.selected{background:rgba(77,171,247,0.12);border-left:2px solid var(--blue);padding-left:4px}
+  .meshy-msg .mn{color:var(--accent);font-weight:600}.meshy-msg .mt{color:var(--text)}.meshy-msg .mp{color:var(--text-dim)}.meshy-msg .mj{color:var(--blue);font-style:italic}
+  .meshy-msg .mr{color:var(--text-dim);font-size:9px;opacity:0.5}.meshy-msg .mx{color:var(--accent);font-size:9px;font-weight:600;cursor:pointer;padding:2px 4px;border-radius:3px}.meshy-msg .mx:hover{background:rgba(0,229,160,0.2)}
+  .meshy-msg .ml{color:var(--blue);font-size:9px;opacity:0.6;margin-right:2px}
+  .meshy-msg .md{display:none;padding:2px 0 2px 12px;font-size:9px;color:var(--text-dim);line-height:1.3;border-left:1px solid var(--panel-border);margin:1px 0 1px 4px}
+  .meshy-msg.expanded .md{display:block}
   .ac-label{display:inline-block;background:rgba(10,14,20,0.8);border:1px solid rgba(255,255,255,0.08);border-radius:3px;padding:2px 5px;font-family:'JetBrains Mono',monospace;font-size:10px;white-space:nowrap;cursor:pointer;pointer-events:auto;text-shadow:0 0 3px rgba(0,0,0,0.9),0 0 6px rgba(0,0,0,0.7)}
   .ac-label.sel{outline:1.5px solid currentColor;outline-offset:1px;background:rgba(10,14,20,0.85);text-shadow:0 0 6px currentColor,0 0 2px rgba(0,0,0,0.9)}
+  .mesh-label{display:inline-block;font-family:'JetBrains Mono',monospace;font-size:9px;color:#4dabf7;white-space:nowrap;text-shadow:0 0 3px rgba(0,0,0,0.9),0 0 6px rgba(0,0,0,0.7);pointer-events:none}
+  .mesh-bubble{display:inline-block;font-family:'JetBrains Mono',monospace;font-size:9px;color:#4dabf7;background:rgba(10,14,20,0.85);border:1px solid rgba(77,171,247,0.5);border-radius:3px;padding:2px 6px;white-space:nowrap;max-width:220px;overflow:hidden;text-overflow:ellipsis;text-shadow:0 0 6px rgba(77,171,247,0.6),0 0 2px rgba(0,0,0,0.9);pointer-events:none}
   .ac-icon{font-size:18px}
   /* Timeline */
   #timeline{display:none;position:absolute;top:0;left:0;right:0;z-index:1000;background:rgba(10,14,20,0.95);border-bottom:1px solid var(--panel-border);padding:8px 16px;align-items:center;gap:12px;font-size:11px}
@@ -96,7 +121,8 @@
   #files-panel{display:none;position:absolute;top:160px;left:12px;z-index:1002;width:min(500px,calc(100vw - 24px));height:min(400px,calc(100vh - 220px));background:rgba(10,14,20,0.97);border:1px solid var(--panel-border);border-radius:6px;overflow:hidden;flex-direction:column;resize:both}
   @media(min-width:1100px){#files-panel.side-by-side{left:calc(12px + min(640px,calc(100vw - 24px)) + 12px);width:min(500px,calc(100vw - 688px))}}
   #files-panel.visible{display:flex}
-  #files-header{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid var(--panel-border);font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:0.5px;flex-shrink:0}
+  #files-header{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid var(--panel-border);font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:0.5px;flex-shrink:0;cursor:grab;user-select:none;touch-action:none}
+  #files-header.dragging{cursor:grabbing}
   #files-header button{background:none;border:none;color:var(--text-dim);font-size:14px;cursor:pointer;padding:4px 8px;min-width:32px;min-height:32px;touch-action:manipulation}#files-header button:hover{color:var(--text)}
   #files-path{padding:6px 12px;font-size:11px;color:var(--accent);border-bottom:1px solid var(--panel-border);flex-shrink:0}
   #files-status{padding:4px 12px;font-size:10px;color:var(--text-dim);border-bottom:1px solid var(--panel-border);flex-shrink:0;min-height:22px;position:relative;overflow:hidden}
@@ -127,6 +153,7 @@
     #panel{height:30vh}
 
     #log-panel{top:auto!important;bottom:0!important;left:0!important;right:0!important;width:100%!important;height:50vh!important;border-radius:6px 6px 0 0;resize:none}
+    #meshy-panel{top:auto!important;bottom:0!important;left:0!important;right:0!important;width:100%!important;height:50vh!important;border-radius:6px 6px 0 0;resize:none}
     #files-panel{top:auto!important;bottom:0!important;left:0!important;right:0!important;width:100%!important;height:50vh!important;border-radius:6px 6px 0 0;resize:none}
     #flash-panel{width:calc(100vw - 20px);max-height:90vh;overflow-y:auto}
 
@@ -135,7 +162,6 @@
     #tl-scrub{min-width:0}
 
     #zoom-ctrl{right:8px}
-    #zoom-ctrl button{width:44px;height:44px}
 
     #ac-table{font-size:10px}
     #ac-table th,#ac-table td{padding:5px 6px}
@@ -174,10 +200,12 @@
 </head>
 <body>
 <div id="topbar">
-  <div class="logo">ADS-B SCOPE <span>/ Off by One <span class="scope-ver">v1.0.3</span></span></div>
-  <div class="stat"><span>AC</span><span class="val live" id="ac-count">0</span></div>
-  <div class="stat hm"><span>MSG</span><span class="val" id="msg-count">0</span></div>
-  <div class="stat hm"><span>MSG/s</span><span class="val" id="msg-rate">0</span></div>
+  <div class="logo">ADS-B SCOPE <span>/ Off by One <span class="scope-ver">v1.0.4</span></span></div>
+  <div id="stats-bar">
+    <div class="stat"><span>AC</span><span class="val live" id="ac-count">0</span></div>
+    <div class="stat hm"><span>MSG</span><span class="val" id="msg-count">0</span></div>
+    <div class="stat hm"><span>MSG/s</span><span class="val" id="msg-rate">0</span></div>
+  </div>
   <div id="color-modes">
     <button class="active" onclick="setCM('mono')" id="cm-mono" title="Terminal green">MONO</button>
     <button onclick="setCM('rainbow')" id="cm-rainbow" title="Rainbow by aircraft">🌈</button>
@@ -188,10 +216,13 @@
     <button class="active" onclick="setLM('alt')" id="lm-alt" title="Show altitude on labels">↕ ALT</button>
     <button onclick="setLM('dist')" id="lm-dist" title="Show distance on labels">↔ DIST</button>
   </div>
+  <button id="ac-map-btn" class="active" onclick="toggleAcMap()" title="Show aircraft on map">✈ AC</button>
+  <button id="mesh-map-btn" onclick="toggleMeshyMap()" title="Show Meshtastic nodes on map">⬡ MESH</button>
   <div id="topbar-spacer"></div>
   <div id="topbar-right">
     <button class="topbtn" id="log-btn" onclick="toggleLog()">Log</button>
     <button class="topbtn" id="files-btn" onclick="toggleFiles()">Files</button>
+    <button class="topbtn" id="meshy-btn" onclick="toggleMeshy()">Meshy</button>
     <button id="csv-btn" onclick="document.getElementById('csv-file').click()">Load CSV</button>
     <input type="file" id="csv-file" accept=".csv" style="display:none" onchange="loadCSV(this)">
     <button class="topbtn" id="flash-btn" onclick="toggleFlash()">Flash<span id="flash-badge"></span></button>
@@ -211,15 +242,28 @@
 <div id="sd-info">SD: <span id="sd-status" class="sd-wait">waiting</span></div>
 </div>
 <div id="detail-wrap"></div>
+<div id="session-panel"></div>
 <div id="log-panel">
   <div id="log-header"><span>Serial Log</span><div style="display:flex;gap:4px"><button onclick="clearLog()">⌫</button><button onclick="toggleLog()">✕</button></div></div>
   <div id="log-controls">
     <label><input type="checkbox" id="f-a" checked onchange="refilterLog()"> ADS-B</label>
     <label><input type="checkbox" id="f-g" checked onchange="refilterLog()"> GNSS</label>
+    <label><input type="checkbox" id="f-m" checked onchange="refilterLog()"> Meshy</label>
     <label><input type="checkbox" id="f-o" checked onchange="refilterLog()"> Other</label>
     <label><input type="checkbox" id="f-s" checked> Live</label>
   </div>
   <div id="log-output"></div>
+</div>
+<div id="meshy-panel">
+  <div id="meshy-header"><span>Meshy</span><div style="display:flex;gap:4px"><button onclick="clearMeshy()">⌫</button><button onclick="toggleMeshy()">✕</button></div></div>
+  <div id="meshy-stats">Waiting for data...</div>
+  <div id="meshy-controls">
+    <label><input type="checkbox" id="mf-text" checked onchange="refilterMeshy()"> Text</label>
+    <label><input type="checkbox" id="mf-join" checked onchange="refilterMeshy()"> Joins</label>
+    <label><input type="checkbox" id="mf-pos" checked onchange="refilterMeshy()"> Position</label>
+    <label><input type="checkbox" id="mf-telem" checked onchange="refilterMeshy()"> Telemetry</label>
+  </div>
+  <div id="meshy-output"></div>
 </div>
 <div id="legend">
   <div class="ltitle" id="leg-title">Altitude</div>
@@ -227,8 +271,8 @@
   <div class="lrange"><span id="leg-lo">0</span><span id="leg-hi">45,000 ft</span></div>
 </div>
 <div id="zoom-ctrl">
-  <button onclick="map.zoomIn()" title="Zoom in">+</button>
-  <button onclick="map.zoomOut()" title="Zoom out">−</button>
+  <button onclick="zoomSel(-1)" title="Zoom out">−</button>
+  <button onclick="zoomSel(1)" title="Zoom in">+</button>
 </div>
 <div id="files-panel">
   <div id="files-header">
@@ -244,10 +288,10 @@
 </div>
 <div id="flash-overlay" onclick="toggleFlash()"></div>
 <div id="flash-panel">
-  <div id="flash-header"><span>Firmware Update</span><div style="display:flex;align-items:center;gap:8px"><span style="font-size:10px;color:var(--text-dim);font-weight:400;text-transform:none;letter-spacing:0">ADS-B Scope v1.0.3</span><button onclick="toggleFlash()">✕</button></div></div>
+  <div id="flash-header"><span>Firmware Update</span><div style="display:flex;align-items:center;gap:8px"><span style="font-size:10px;color:var(--text-dim);font-weight:400;text-transform:none;letter-spacing:0">ADS-B Scope v1.0.4</span><button onclick="toggleFlash()">✕</button></div></div>
   <div id="flash-body">
-    <div class="flash-row"><span class="fl">Device Version</span><span class="fv" id="flash-dev-ver">—</span></div>
-    <div class="flash-row"><span class="fl">Latest Version</span><span class="fv" id="flash-latest-ver">—</span></div>
+    <div class="flash-row"><span class="fl">Device Version</span><span class="fv" id="flash-dev-ver">–</span></div>
+    <div class="flash-row"><span class="fl">Latest Version</span><span class="fv" id="flash-latest-ver">–</span></div>
     <div class="flash-row"><span class="fl">Firmware URL</span><span class="fv" id="flash-fw-url" style="font-size:10px;word-break:break-all">latest.bin</span></div>
     <div class="flash-row"><span class="fl">Status</span><span class="fv" id="flash-status">Ready</span></div>
     <div id="flash-progress">
@@ -271,9 +315,19 @@
   </div>
 </div>
 <script>
-const SCOPE_VERSION='1.0.3';
-const A=new Map();let rxP=null,map,rxM,rxR=[],rxRL=[],port,reader,conn=false,totM=0,mTs=[],logN=0,selSet=new Set(),cMode='mono',lMode='alt';
+const SCOPE_VERSION='1.0.4';
+const A=new Map();let rxP=null,map,rxM,rxR=[],rxRL=[],meshyR=[],meshyRL=[],port,reader,conn=false,totM=0,mTs=[],logN=0,selSet=new Set(),cMode='mono',lMode='alt';
+let sessStart=null,sessEnd=null; // session timestamps
+let consoleReady=false; // set when firmware prints "Serial console ready"
 const EXP=180000,TMAX=60,LMAX=1000;
+
+// Haversine distance in nm between two lat/lon points
+function distNm(lat1,lon1,lat2,lon2){
+  const R=3440.065;// earth radius in nm
+  const dLat=(lat2-lat1)*Math.PI/180,dLon=(lon2-lon1)*Math.PI/180;
+  const a=Math.sin(dLat/2)**2+Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)**2;
+  return 2*R*Math.asin(Math.sqrt(a));
+}
 
 // --- Color ---
 function acCol(ic,ac){
@@ -319,16 +373,45 @@ function setLM(m){
   document.querySelectorAll('#label-modes button').forEach(b=>b.classList.remove('active'));
   document.getElementById('lm-'+m)?.classList.add('active');
   for(const[i,a]of A)updAc(i,a);
+  // Refresh meshy labels (markers + peeks) for new label mode
+  for(const id in meshyMarkers){
+    if(meshyMarkers[id].lb&&!meshyMsgBubbles[id])
+      meshyMarkers[id].lb.setIcon(meshyNodeLabel(id));
+  }
+  for(const id in meshyPeeks){
+    if(meshyPeeks[id].lb&&!meshyMsgBubbles[id])
+      meshyPeeks[id].lb.setIcon(meshyNodeLabel(id));
+  }
 }
 
 // --- Map ---
 function initMap(){
   map=L.map('map',{center:[37.83,-122.27],zoom:11,zoomControl:false,attributionControl:false});
   L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{maxZoom:19}).addTo(map);
+  map.on('zoom',()=>updRxRings());
+  map.on('dragend',()=>{map._userMoved=true});
+}
+// Zoom anchored to selected aircraft (or map center if none selected)
+function zoomSel(dir){
+  if(selSet.size===1){
+    const ic=[...selSet][0];
+    const ac=A.get(ic);
+    if(ac&&ac.hasPos&&!ac.expired){
+      const pt=L.latLng(ac.lat,ac.lon);
+      map.setZoomAround(pt,map.getZoom()+dir);
+      return;
+    }
+  }
+  if(dir>0)map.zoomIn();else map.zoomOut();
 }
 
 // --- Aircraft ---
-function nowTime(){return csvRows.length&&csvNow?csvNow:Date.now()}
+function nowTime(){
+  if(csvRows.length&&csvNow)return csvNow;
+  // Freeze time when disconnected – ages stop, display stays introspectable
+  if(!conn&&sessEnd)return sessEnd.getTime();
+  return Date.now();
+}
 function acStale(ac){
   const age=nowTime()-ac.ls;
   if(age<30000)return{opacity:1,gray:false};      // fresh
@@ -341,7 +424,7 @@ function mkIcon(h,c,sel,st){
   const op=st?st.opacity:1;
   const g=sel?`filter:drop-shadow(0 0 8px ${col})drop-shadow(0 0 3px #fff);`:`filter:drop-shadow(0 0 4px ${col}55);`;
   if(h==null){
-    // No heading data — show a dot instead of a misleading arrow
+    // No heading data – show a dot instead of a misleading arrow
     return L.divIcon({html:`<div style="display:flex;align-items:center;justify-content:center;width:${s}px;height:${s}px;font-size:${Math.round(s*0.5)}px;color:${col};opacity:${op};${g}">●</div>`,iconSize:[s,s],iconAnchor:[s/2,s/2],className:''});
   }
   return L.divIcon({html:`<div style="display:flex;align-items:center;justify-content:center;width:${s}px;height:${s}px;font-size:${s}px;color:${col};opacity:${op};${g}"><div style="transform:rotate(${h-90}deg);line-height:1">✈</div></div>`,iconSize:[s,s],iconAnchor:[s/2,s/2],className:''});
@@ -369,7 +452,7 @@ function trailHdg(ac){
 }
 
 function updAc(ic,ac){
-  if(!ac.hasPos||ac.expired)return;
+  if(!acMapVisible||!ac.hasPos||ac.expired)return;
   const st=acStale(ac);
   const c=acCol(ic,ac),sel=selSet.has(ic),tw=sel?2.5:1.5;
   const to=sel?Math.max(st.opacity,0.8):(st.gray?0.2:st.opacity*0.6);
@@ -409,6 +492,14 @@ function sel0(ic,ev){
 }
 function deselOne(ic){selSet.delete(ic);for(const[i,a]of A)updAc(i,a);updDet()}
 function desel(){selSet.clear();updDet();for(const[i,a]of A)updAc(i,a)}
+function dismissAc(ic,ev){
+  ev.stopPropagation();
+  selSet.delete(ic);
+  const ac=A.get(ic);
+  if(ac){ac.pinned=false;rmAc(ac)}
+  for(const[i,a]of A)updAc(i,a);
+  updDet();
+}
 function updDet(){
   const wrap=document.getElementById('detail-wrap');
   wrap.classList.toggle('visible',selSet.size>0);
@@ -440,13 +531,14 @@ const AR=/\s(-?\d+)ft/,SR=/\s(\d+)kt\s+(\d+)°/,VR=/\s([+-]\d+)fpm/;
 const PR=/\((\d+\.\d+)([NS]),(\d+\.\d+)([EW])\)/,DR=/(\d+\.\d+)nm@(\d+)°/;
 
 function parse(l){
-  // Detect device reboot — reset all status indicators, expire all aircraft
+  // Detect device reboot – reset all status indicators, expire all aircraft
   if(/^ESP-ROM:|^rst:0x/.test(l)){
     updSD('wait',null);
     rxP=null;updGnss();
     for(const[ic,ac]of A){if(!ac.expired){rmAc(ac);ac.expired=true}}
     selSet.clear();
     deviceVersion='';updFlashVer();
+    consoleReady=false;
   }
   // Parse device version from boot log
   const verM=/App version:\s+(\S+)/.exec(l);
@@ -462,13 +554,13 @@ function parse(l){
     const el=document.getElementById('flash-dev-ver');
     if(el&&deviceVersion)el.textContent=deviceVersion+' ('+ctM[1].trim()+')';
   }
-  // SD card status — check failures first (some contain substrings of success patterns)
+  // SD card status – check failures first (some contain substrings of success patterns)
   if(/Failed to reopen/.test(l)){
     // Had a log, lost it (e.g. card removed mid-write)
     const fn=l.match(/(\/\S+\.csv)/);
     updSD('lost',fn?fn[1]:null);
   }else if(/Failed.*open SD log/.test(l)){
-    // Never opened — card not mounted or filesystem issue
+    // Never opened – card not mounted or filesystem issue
     updSD('no-card',null);
   }else if(/failed to mount filesystem|sdmmc_card_init failed|Sdmmc_Init fail/.test(l)){
     updSD('no-card',null);
@@ -485,14 +577,14 @@ function parse(l){
     updSD('mounted',null);
   }
   const gm=GR.exec(l);
-  if(gm){const la=parseFloat(gm[2]),lo=parseFloat(gm[3]);if(gm[1]==='A'&&la&&lo){rxP={lat:la,lon:lo,sats:parseInt(gm[4]),hdop:parseFloat(gm[5]),fix:true};updRx();if(!map._p){map.setView([la,lo],11);map._p=true}}updGnss();return}
+  if(gm){const la=parseFloat(gm[2]),lo=parseFloat(gm[3]);if(gm[1]==='A'&&la&&lo){rxP={lat:la,lon:lo,sats:parseInt(gm[4]),hdop:parseFloat(gm[5]),fix:true};updRx();if(!map._p&&!map._userMoved){map.setView([la,lo],11);map._p=true}}updGnss();return}
   const mm=MR.exec(l);if(!mm)return;
   const ic=mm[1],af=l.substring(mm[0].length),cm=af.match(/^([\w]{2,8})\s/),cs=(cm&&/[A-Z]/.test(cm[1]))?cm[1]:null;
   totM++;
   let ac=A.get(ic);
   if(!ac){ac={cs:null,alt:null,speed:null,hdg:null,vr:null,lat:null,lon:null,hasPos:false,expired:false,dist:null,brg:null,ls:Date.now(),mk:null,lb:null,tr:null};A.set(ic,ac)}
   ac.ls=Date.now();if(cs)ac.cs=cs;
-  // Revive if expired — new message means it's back
+  // Revive if expired – new message means it's back
   if(ac.expired){ac.expired=false;ac.mk=null;ac.lb=null;ac.tr=null;}
   let m;
   if(m=AR.exec(l))ac.alt=parseInt(m[1]);
@@ -512,30 +604,151 @@ function parse(l){
 }
 
 // --- RX ---
+const RING_NMS=[1,2,5,10,25,50,100,150,200];
 function updRx(){
   if(!rxP)return;
   if(!rxM){
-    rxM=L.circleMarker([rxP.lat,rxP.lon],{radius:7,color:'#00e5a0',fillColor:'#00e5a0',fillOpacity:0.8,weight:2}).addTo(map).bindPopup('Receiver');
-    [10,25,50].forEach(nm=>{
-      rxR.push(L.circle([rxP.lat,rxP.lon],{radius:nm*1852,color:'rgba(0,229,160,0.35)',fillColor:'transparent',weight:1.5}).addTo(map));
-      // Label at top of each ring
+    rxM=L.circleMarker([rxP.lat,rxP.lon],{radius:5,color:'#00e5a0',fillColor:'#00e5a0',fillOpacity:0.8,weight:2}).addTo(map).bindPopup('Receiver');
+    RING_NMS.forEach(nm=>{
+      const c=L.circle([rxP.lat,rxP.lon],{radius:nm*1852,color:'rgba(0,229,160,0.3)',fillColor:'transparent',weight:1.5}).addTo(map);
+      rxR.push(c);
       const latOffset=nm*1852/111320;
       const lbl=L.marker([rxP.lat+latOffset,rxP.lon],{interactive:false,icon:L.divIcon({
         html:`<div style="color:rgba(0,229,160,0.5);font-family:JetBrains Mono,monospace;font-size:10px;white-space:nowrap;text-align:center;pointer-events:none">${nm} nm</div>`,
         iconSize:[0,0],iconAnchor:[0,12],className:''
       })}).addTo(map);
       rxRL.push(lbl);
+      // Blue meshy rings (hidden initially)
+      const mc=L.circle([rxP.lat,rxP.lon],{radius:nm*1852,color:'rgba(77,171,247,0.3)',fillColor:'transparent',weight:1.5});
+      meshyR.push(mc);
+      const mlbl=L.marker([rxP.lat+latOffset,rxP.lon],{interactive:false,icon:L.divIcon({
+        html:`<div style="color:rgba(77,171,247,0.5);font-family:JetBrains Mono,monospace;font-size:10px;white-space:nowrap;text-align:center;pointer-events:none">${nm} nm</div>`,
+        iconSize:[0,0],iconAnchor:[0,12],className:''
+      })});
+      meshyRL.push(mlbl);
     });
+    updRxRings();
   }else{
     rxM.setLatLng([rxP.lat,rxP.lon]);
-    let ri=0;
-    [10,25,50].forEach(nm=>{
-      rxR[ri].setLatLng([rxP.lat,rxP.lon]);
+    RING_NMS.forEach((nm,i)=>{
+      rxR[i].setLatLng([rxP.lat,rxP.lon]);
+      meshyR[i].setLatLng([rxP.lat,rxP.lon]);
       const latOffset=nm*1852/111320;
-      rxRL[ri].setLatLng([rxP.lat+latOffset,rxP.lon]);
-      ri++;
+      rxRL[i].setLatLng([rxP.lat+latOffset,rxP.lon]);
+      meshyRL[i].setLatLng([rxP.lat+latOffset,rxP.lon]);
     });
   }
+}
+// Show rings only up to the first ring that covers all targets.
+// Green = ADS-B aircraft. Blue = Meshtastic nodes (only beyond green).
+// Always display at least one green ring if there are any aircraft.
+function updRxRings(){
+  if(!rxR.length||!rxP)return;
+
+  // Update receiver dot color: green when AC visible, blue when only mesh
+  if(rxM){
+    const col=(!acMapVisible&&!meshyMapVisible)?'#778899':(!acMapVisible&&meshyMapVisible)?'#4dabf7':'#00e5a0';
+    rxM.setStyle({color:col,fillColor:col});
+  }
+
+  const MIN_PX=30;
+  const metersPerPx=40075016.686/(256*Math.pow(2,map.getZoom()));
+
+  // Find farthest ADS-B aircraft
+  let maxAcDist=0;
+  for(const[,ac]of A){if(!ac.expired&&ac.dist!=null&&ac.dist>maxAcDist)maxAcDist=ac.dist}
+
+  // Find farthest meshy node (only if mesh map is active)
+  let maxMeshDist=0;
+  if(meshyMapVisible){
+    for(const id in meshyNodes){
+      const n=meshyNodes[id];
+      if(n.lat!=null)maxMeshDist=Math.max(maxMeshDist,distNm(rxP.lat,rxP.lon,n.lat,n.lon));
+    }
+  }
+
+  // Green rings: show up to the first ring >= farthest aircraft (only when AC visible)
+  let greenShowUpTo=-1;
+  if(maxAcDist>0&&acMapVisible){
+    for(let i=0;i<RING_NMS.length;i++){
+      if(RING_NMS[i]>=maxAcDist){greenShowUpTo=i;break}
+      if(i===RING_NMS.length-1)greenShowUpTo=i;
+    }
+    // Target 3 visible rings – extend outward if we'd only show 1 or 2
+    // (only when mesh layer is off – fusion display keeps rings tight)
+    if(!meshyMapVisible){
+      let visCount=0;
+      for(let i=0;i<=greenShowUpTo;i++){
+        if((RING_NMS[i]*1852)/metersPerPx>=MIN_PX)visCount++;
+      }
+      while(visCount<3&&greenShowUpTo<RING_NMS.length-1){
+        greenShowUpTo++;
+        if((RING_NMS[greenShowUpTo]*1852)/metersPerPx>=MIN_PX)visCount++;
+      }
+    }
+  }
+
+  // Blue rings: cover meshy range, only beyond green
+  let blueShowUpTo=-1;
+  if(maxMeshDist>0&&meshyMapVisible){
+    for(let i=0;i<RING_NMS.length;i++){
+      if(RING_NMS[i]>=maxMeshDist){blueShowUpTo=i;break}
+      if(i===RING_NMS.length-1)blueShowUpTo=i;
+    }
+  }
+
+  // First pass: determine which green rings are visible after size filter
+  let anyGreenVisible=false;
+  const greenVisible=RING_NMS.map((nm,i)=>{
+    const radiusPx=(nm*1852)/metersPerPx;
+    const vis=(i<=greenShowUpTo&&radiusPx>=MIN_PX);
+    if(vis)anyGreenVisible=true;
+    return vis;
+  });
+
+  // Guarantee at least one green ring: if all green rings were filtered out,
+  // force the outermost green ring to show (it's the most important one)
+  if(!anyGreenVisible&&greenShowUpTo>=0){
+    greenVisible[greenShowUpTo]=true;
+    anyGreenVisible=true;
+  }
+
+  // If no green rings visible but aircraft are enabled, promote first blue to green
+  let promoteBlueIdx=-1;
+  if(!anyGreenVisible&&acMapVisible&&blueShowUpTo>=0){
+    for(let i=0;i<=blueShowUpTo;i++){
+      const radiusPx=(RING_NMS[i]*1852)/metersPerPx;
+      if(radiusPx>=MIN_PX){promoteBlueIdx=i;break}
+    }
+    // If all blue too small, just show the outermost
+    if(promoteBlueIdx<0)promoteBlueIdx=blueShowUpTo;
+  }
+
+  RING_NMS.forEach((nm,i)=>{
+    const radiusPx=(nm*1852)/metersPerPx;
+    const tooSmall=(radiusPx<MIN_PX);
+
+    // Green ring
+    const greenVis=greenVisible[i];
+    if(greenVis&&!map.hasLayer(rxR[i])){rxR[i].addTo(map);rxRL[i].addTo(map)}
+    if(!greenVis&&map.hasLayer(rxR[i])){map.removeLayer(rxR[i]);map.removeLayer(rxRL[i])}
+
+    // Blue ring: visible beyond green, up to meshy range, not too small
+    // If promoted to green, hide the blue version and show green instead
+    let blueVis=(i<=blueShowUpTo&&i>greenShowUpTo&&!tooSmall);
+    if(i===promoteBlueIdx){
+      // Promote: show as green, hide blue
+      blueVis=false;
+      if(!map.hasLayer(rxR[i])){rxR[i].addTo(map);rxRL[i].addTo(map)}
+    }
+    if(blueVis&&!map.hasLayer(meshyR[i])){meshyR[i].addTo(map);meshyRL[i].addTo(map)}
+    if(!blueVis&&map.hasLayer(meshyR[i])){map.removeLayer(meshyR[i]);map.removeLayer(meshyRL[i])}
+
+    // Clean up promoted green ring if no longer promoted
+    if(i!==promoteBlueIdx&&!greenVisible[i]&&map.hasLayer(rxR[i])){
+      map.removeLayer(rxR[i]);map.removeLayer(rxRL[i]);
+    }
+  });
 }
 function updGnss(){
   const s=document.getElementById('gnss-status'),d=document.getElementById('gnss-detail');
@@ -570,12 +783,14 @@ function updSD(ok,path){
 let logPaused=[];  // buffer lines while paused
 function logType(l){
   if(/^\[scope\]/.test(l))return 'scope';
+  if(/\[CONSOLE\]|CONSOLE:|Command mode|Entering log mode|buffered lines replayed/.test(l))return 'console';
   if(/\[GNSS\]/.test(l))return 'gnss';
-  if(/\[[\dA-Fa-f]{14,28}\]/.test(l))return 'adsb';
+  if(/MESHY|meshy_|Meshy/.test(l))return 'meshy';
+  if(MR.test(l))return 'adsb';
   if(/error|fail/i.test(l))return 'error';
   return 'other';
 }
-const logCls={adsb:'log-adsb',gnss:'log-gnss',scope:'log-scope',error:'log-error',other:'log-info'};
+const logCls={adsb:'log-adsb',gnss:'log-gnss',scope:'log-scope',error:'log-error',other:'log-info',meshy:'log-meshy',console:'log-console'};
 
 function addLog(l){
   const live=document.getElementById('f-s').checked;
@@ -585,7 +800,9 @@ function addLog(l){
   appendLogLine(el,l);
   el.scrollTop=el.scrollHeight;
 }
+function stripAnsi(s){return s.replace(/\x1b\[[0-9;]*[a-zA-Z]/g,'')}
 function appendLogLine(el,l){
+  l=stripAnsi(l);
   const t=logType(l);
   const d=document.createElement('div');
   d.className=logCls[t]||'log-info';
@@ -598,7 +815,9 @@ function appendLogLine(el,l){
 function isTypeVisible(t){
   if(t==='adsb')return document.getElementById('f-a').checked;
   if(t==='gnss')return document.getElementById('f-g').checked;
+  if(t==='meshy')return document.getElementById('f-m').checked;
   if(t==='scope')return true;
+  if(t==='console')return true;
   if(t==='error')return true;
   return document.getElementById('f-o').checked;
 }
@@ -611,6 +830,452 @@ function refilterLog(){
 }
 function clearLog(){document.getElementById('log-output').innerHTML='';logN=0;logPaused=[]}
 function toggleLog(){document.getElementById('log-panel').classList.toggle('visible');document.getElementById('log-btn').classList.toggle('active');syncPanelLayout()}
+
+// --- Meshy panel ---
+const meshyNodes={};  // nodeId -> {short:'', long:''}
+let meshyCount=0;
+const MESHY_MAX=5000;
+const meshyDedup={};  // dedupKey -> {el, receptions:[], count}
+const MESHY_DEDUP_WINDOW=120000; // 2min – same message within this window merges
+function toggleMeshy(){
+  if(csvRows.length){alert('Meshy is disabled during CSV replay.');return}
+  const p=document.getElementById('meshy-panel');
+  p.classList.toggle('visible');
+  document.getElementById('meshy-btn').classList.toggle('active');
+}
+function clearMeshy(){document.getElementById('meshy-output').innerHTML='';meshyCount=0;Object.keys(meshyDedup).forEach(k=>delete meshyDedup[k])}
+function parseMeshyLine(l){
+  const m=/MESHY:\s+\[(\w+)\]\s+!([0-9a-fA-F]{8})\s+\(([^)]*)\)\s+RSSI:([\-\d.]+)\s+SNR:([\-\d.]+)\s+hop:(\d+)\/(\d+)/.exec(l);
+  if(!m)return null;
+  return{type:m[1],node:m[2],name:m[3]!=='?'?m[3]:'',rssi:parseFloat(m[4]),snr:parseFloat(m[5]),hop:parseInt(m[6]),hopStart:parseInt(m[7])};
+}
+let meshyPendingText=null;
+let meshyPendingNode=null;
+let meshyPendingTelem=null;
+function handleMeshyLine(l){
+  const qt=/MESHY:\s+"(.+)"/.exec(l);
+  if(qt&&meshyPendingText){
+    meshyPendingText.text=qt[1];
+    addMeshyMsg(meshyPendingText);
+    meshyPendingText=null;
+    return;
+  }
+  const pc=/MESHY:\s+pos:([\-\d.]+),([\-\d.]+)\s+alt:([\-\d]+)/.exec(l);
+  if(pc&&meshyPendingNode){
+    updateNodePosition(meshyPendingNode,parseFloat(pc[1]),parseFloat(pc[2]),parseInt(pc[3]));
+    meshyPendingNode=null;
+    return;
+  }
+  const tc=/MESHY:\s+bat:(\d+)%\s+([\d.]+)V\s+chUtil:([\d.]+)%\s+airTx:([\d.]+)%/.exec(l);
+  if(tc&&meshyPendingTelem){
+    meshyPendingTelem.bat=parseInt(tc[1]);
+    meshyPendingTelem.volt=parseFloat(tc[2]);
+    meshyPendingTelem.chUtil=parseFloat(tc[3]);
+    meshyPendingTelem.airTx=parseFloat(tc[4]);
+    addMeshyMsg(meshyPendingTelem);
+    meshyPendingTelem=null;
+    return;
+  }
+  meshyPendingNode=null;
+  meshyPendingTelem=null;
+  const p=parseMeshyLine(l);
+  if(!p)return;
+  if(p.name)learnNodeName(p.node,p.name);
+  const displayName=p.name||(meshyNodes[p.node]?.short)||p.node;
+  const base={from:displayName,node:p.node,rssi:p.rssi,snr:p.snr,hop:p.hop,hopStart:p.hopStart};
+  if(p.type==='TEXT'){meshyPendingText={...base,kind:'text',text:''};return;}
+  if(p.type==='NODE'){addMeshyMsg({...base,kind:'join'});return;}
+  if(p.type==='POS'){meshyPendingNode=p.node;addMeshyMsg({...base,kind:'pos'});return;}
+  if(p.type==='TELEM'){meshyPendingTelem={...base,kind:'telem',bat:0,volt:0,chUtil:0,airTx:0};return;}
+}
+function handleMeshyNodeInfo(l){
+  const m=/MESHY:\s+Node\s+!([0-9a-fA-F]{8}):\s+(.+?)\s+\((\w+)\)/.exec(l);
+  if(m)learnNodeName(m[1],m[3],m[2]);
+}
+function learnNodeName(nodeId,short,long){
+  const prev=meshyNodes[nodeId];
+  const n=meshyNodes[nodeId]||{};
+  n.short=short;
+  if(long)n.long=long;
+  meshyNodes[nodeId]=n;
+  if(prev?.short===short)return;
+  for(const key in meshyDedup){
+    const entry=meshyDedup[key];
+    if(entry.msg.node===nodeId){entry.msg.from=short;renderMeshyLine(entry)}
+  }
+  if(n.lat!=null)updateMeshyMapNode(nodeId); // re-render label with new name
+}
+function updateNodePosition(nodeId,lat,lon,alt){
+  const n=meshyNodes[nodeId]||{};
+  const hadPos = n.lat != null;
+  n.lat=lat;n.lon=lon;n.alt=alt;
+  meshyNodes[nodeId]=n;
+  updateMeshyMapNode(nodeId);
+  // Backfill has_pos on older messages from this node that didn't have position
+  if(!hadPos){
+    for(const key in meshyDedup){
+      const entry=meshyDedup[key];
+      if(entry.msg.node===nodeId&&!entry.has_pos){
+        entry.has_pos=true;
+        renderMeshyLine(entry);
+      }
+    }
+  }
+}
+// --- Meshy map layer ---
+let meshyMapVisible=false;
+let acMapVisible=true;
+const meshyMarkers={};  // nodeId -> {mk, lb}
+function toggleAcMap(){
+  acMapVisible=!acMapVisible;
+  document.getElementById('ac-map-btn').classList.toggle('active',acMapVisible);
+  if(!acMapVisible){
+    // Remove all aircraft from map
+    for(const[,ac]of A){if(!ac.expired)rmAc(ac)}
+  }else{
+    // Re-add all aircraft
+    for(const[ic,ac]of A){if(!ac.expired&&ac.hasPos){ac.mk=null;ac.lb=null;ac.tr=null;updAc(ic,ac)}}
+  }
+  updRxRings();
+}
+function toggleMeshyMap(){
+  if(csvRows.length){alert('Mesh map is disabled during CSV replay.');return}
+  meshyMapVisible=!meshyMapVisible;
+  document.getElementById('mesh-map-btn').classList.toggle('active',meshyMapVisible);
+  if(meshyMapVisible){
+    // Show all nodes, remove peeks (they're now visible as regular markers)
+    hideAllPeeks();
+    for(const id in meshyNodes){if(meshyNodes[id].lat!=null)updateMeshyMapNode(id)}
+    // Re-apply any active bubbles to the new label markers
+    for(const id in meshyMsgBubbles){
+      const b=meshyMsgBubbles[id];
+      const n=meshyNodes[id];
+      if(n){
+        const name=n.short||id;
+        const bubbleIcon=L.divIcon({html:'<div class="mesh-bubble"><b>'+esc(name)+'</b> '+esc(b.text)+'</div>',iconSize:[0,0],iconAnchor:[-8,4],className:''});
+        if(meshyMarkers[id]&&meshyMarkers[id].lb)meshyMarkers[id].lb.setIcon(bubbleIcon);
+      }
+    }
+    // Apply dim state if anything is selected
+    dimMeshyNodes();
+  }else{
+    // Remove all mesh markers
+    for(const id in meshyMarkers){
+      if(meshyMarkers[id].mk)map.removeLayer(meshyMarkers[id].mk);
+      if(meshyMarkers[id].lb)map.removeLayer(meshyMarkers[id].lb);
+    }
+    Object.keys(meshyMarkers).forEach(k=>delete meshyMarkers[k]);
+    // Bubbles map layers are gone with markers, but keep the data so
+    // they restore when toggling back on
+    // Recreate peeks for any currently selected nodes
+    meshySelected.forEach(id=>{
+      if(nodeHasPosition(id))showMeshyPeek(id);
+    });
+    // Re-apply any active message bubbles to the peek labels
+    for(const id in meshyMsgBubbles){
+      const b=meshyMsgBubbles[id];
+      const n=meshyNodes[id];
+      if(n&&meshyPeeks[id]&&meshyPeeks[id].lb){
+        const name=n.short||id;
+        const bubbleIcon=L.divIcon({html:'<div class="mesh-bubble"><b>'+esc(name)+'</b> '+esc(b.text)+'</div>',iconSize:[0,0],iconAnchor:[-8,4],className:''});
+        meshyPeeks[id].lb.setIcon(bubbleIcon);
+      }
+    }
+  }
+  updRxRings();
+}
+function meshyNodeIcon(){
+  return L.divIcon({html:'<div style="font-size:14px;color:#4dabf7;text-shadow:0 0 6px #4dabf7,0 0 12px rgba(77,171,247,0.4);line-height:1">⬡</div>',iconSize:[14,14],iconAnchor:[7,7],className:''});
+}
+function meshyNodeLabel(id){
+  const n=meshyNodes[id]||{};
+  const name=n.short||id;
+  let info='';
+  if(lMode==='dist'&&rxP&&n.lat!=null){
+    info=' '+distNm(rxP.lat,rxP.lon,n.lat,n.lon).toFixed(1)+'nm';
+  } else if(lMode==='alt'&&n.alt!=null&&n.alt>0){
+    info=' '+n.alt+'m';
+  }
+  return L.divIcon({html:'<div class="mesh-label">'+esc(name)+info+'</div>',iconSize:[0,0],iconAnchor:[-8,4],className:''});
+}
+function updateMeshyMapNode(id){
+  if(!meshyMapVisible)return;
+  const n=meshyNodes[id];
+  if(!n||n.lat==null)return;
+  const existing=meshyMarkers[id];
+  if(existing){
+    existing.mk.setLatLng([n.lat,n.lon]);
+    existing.lb.setLatLng([n.lat,n.lon]).setIcon(meshyNodeLabel(id));
+  }else{
+    const mk=L.marker([n.lat,n.lon],{icon:meshyNodeIcon(),interactive:true,zIndexOffset:-100}).addTo(map);
+    const lb=L.marker([n.lat,n.lon],{icon:meshyNodeLabel(id),interactive:false,zIndexOffset:-100}).addTo(map);
+    mk.bindPopup(()=>{const nn=meshyNodes[id]||{};return'<b>'+(nn.short||id)+'</b>'+(nn.long?' – '+nn.long:'')+'<br>'+n.lat.toFixed(5)+', '+n.lon.toFixed(5)+(n.alt?' alt:'+n.alt+'m':'')});
+    meshyMarkers[id]={mk,lb};
+  }
+}
+// --- Meshy map message bubbles ---
+const meshyMsgBubbles={}; // nodeId -> {mk, ts, text}
+const MESHY_MSG_FADE_START=60000;   // start fading after 60s
+const MESHY_MSG_FADE_END=120000;    // fully removed after 120s
+// Temporary multi-node peek (when mesh layer is off)
+const meshyPeeks={}; // nodeId -> {mk, lb}
+const meshySelected=new Set(); // currently selected node IDs
+let meshyLastClickedEl=null;   // last clicked .meshy-msg element (for shift-range)
+function showMeshyPeek(nodeId){
+  if(meshyPeeks[nodeId])return; // already peeking
+  const n=meshyNodes[nodeId];
+  if(!n||n.lat==null)return;
+  const mk=L.marker([n.lat,n.lon],{icon:meshyNodeIcon(),interactive:false,zIndexOffset:200}).addTo(map);
+  const lb=L.marker([n.lat,n.lon],{icon:meshyNodeLabel(nodeId),interactive:false,zIndexOffset:200}).addTo(map);
+  meshyPeeks[nodeId]={mk,lb};
+}
+function hideMeshyPeek(nodeId){
+  const p=meshyPeeks[nodeId];
+  if(!p)return;
+  map.removeLayer(p.mk);
+  map.removeLayer(p.lb);
+  delete meshyPeeks[nodeId];
+}
+function hideAllPeeks(){
+  for(const id in meshyPeeks)hideMeshyPeek(id);
+}
+function meshySelectRange(fromEl,toEl){
+  const rows=Array.from(document.querySelectorAll('#meshy-output .meshy-msg'));
+  const a=rows.indexOf(fromEl), b=rows.indexOf(toEl);
+  if(a<0||b<0)return;
+  const lo=Math.min(a,b), hi=Math.max(a,b);
+  // Add all nodes in range to selection (don't clear existing)
+  for(let i=lo;i<=hi;i++){
+    const el=rows[i];
+    if(el.style.display==='none')continue; // skip filtered-out rows
+    if(el.classList.contains('selected'))continue; // already selected
+    const nodeId=el.dataset.node;
+    el.classList.add('selected');
+    meshySelected.add(nodeId);
+    // Show on map
+    if(nodeHasPosition(nodeId)){
+      if(!meshyMapVisible)showMeshyPeek(nodeId);
+      // Find the dedup entry for bubble text
+      const key=Object.keys(meshyDedup).find(k=>meshyDedup[k].el===el);
+      if(key){
+        const m=meshyDedup[key].msg;
+        const txt=m.kind==='text'?m.text:m.kind==='join'?m.from+' joined':m.kind;
+        showMeshyMapMsg(nodeId,txt);
+      }
+    }
+  }
+  if(meshyMapVisible)dimMeshyNodes();
+  meshyLastClickedEl=toEl;
+}
+function meshySelectNode(nodeId,entry,multi){
+  const was=entry.el.classList.contains('selected');
+  if(!multi)meshyDeselectAll();
+  if(was&&!multi){
+    // Deselecting this row
+    entry.el.classList.remove('selected');
+    meshySelected.delete(nodeId);
+    if(!meshyMapVisible){hideMeshyPeek(nodeId);removeMeshyBubble(nodeId)}
+    else dimMeshyNodes();
+    return;
+  }
+  if(was&&multi){
+    // Multi-click on already selected row = deselect it
+    entry.el.classList.remove('selected');
+    // Only remove node from meshySelected if no other rows from this node are selected
+    const still=document.querySelector('.meshy-msg.selected[data-node="'+nodeId+'"]');
+    if(!still){
+      meshySelected.delete(nodeId);
+      if(!meshyMapVisible){hideMeshyPeek(nodeId);removeMeshyBubble(nodeId)}
+    }
+    if(meshyMapVisible)dimMeshyNodes();
+    return;
+  }
+  meshySelected.add(nodeId);
+  entry.el.classList.add('selected');
+  const n=meshyNodes[nodeId];
+  if(n&&n.lat!=null){
+    const m=entry.msg;
+    const txt=m.kind==='text'?m.text:m.kind==='join'?m.from+' joined':m.kind;
+    if(!meshyMapVisible)showMeshyPeek(nodeId);
+    showMeshyMapMsg(nodeId,txt);
+    if(meshyMapVisible)dimMeshyNodes();
+  }
+}
+function meshyDeselectAll(){
+  meshySelected.forEach(id=>{
+    // Remove peek markers for deselected
+    if(!meshyMapVisible){hideMeshyPeek(id);removeMeshyBubble(id)}
+  });
+  meshySelected.clear();
+  document.querySelectorAll('.meshy-msg.selected').forEach(el=>el.classList.remove('selected'));
+  if(meshyMapVisible)dimMeshyNodes();
+}
+function removeMeshyBubble(nodeId){
+  if(meshyMsgBubbles[nodeId]){
+    revertMeshyLabel(nodeId);
+    delete meshyMsgBubbles[nodeId];
+  }
+}
+function dimMeshyNodes(){
+  // If nothing selected, restore all to full opacity
+  if(meshySelected.size===0){
+    for(const id in meshyMarkers){
+      if(meshyMarkers[id].mk)meshyMarkers[id].mk.setOpacity(1);
+      if(meshyMarkers[id].lb)meshyMarkers[id].lb.setOpacity(1);
+    }
+    return;
+  }
+  // Dim non-selected, brighten selected
+  for(const id in meshyMarkers){
+    const sel=meshySelected.has(id);
+    if(meshyMarkers[id].mk)meshyMarkers[id].mk.setOpacity(sel?1:0.25);
+    if(meshyMarkers[id].lb)meshyMarkers[id].lb.setOpacity(sel?1:0.25);
+  }
+}
+function nodeHasPosition(nodeId){
+  const n=meshyNodes[nodeId];
+  return n&&n.lat!=null;
+}
+function showMeshyMapMsg(nodeId,text){
+  if(!meshyMapVisible&&!meshyPeeks[nodeId]&&!meshySelected.has(nodeId))return;
+  const n=meshyNodes[nodeId];
+  if(!n||n.lat==null)return;
+  const name=n.short||nodeId;
+  // Upgrade the label marker to a bubble (same position, no separate marker)
+  const bubbleIcon=L.divIcon({
+    html:'<div class="mesh-bubble"><b>'+esc(name)+'</b> '+esc(text)+'</div>',
+    iconSize:[0,0],iconAnchor:[-8,4],className:''
+  });
+  // Find the label marker – could be in meshyMarkers (mesh layer on) or meshyPeeks (peek)
+  const src=meshyMarkers[nodeId]||meshyPeeks[nodeId];
+  if(src&&src.lb)src.lb.setIcon(bubbleIcon);
+  // Track bubble state for aging/revert
+  const old=meshyMsgBubbles[nodeId];
+  meshyMsgBubbles[nodeId]={ts:Date.now(),text,nodeId};
+}
+function revertMeshyLabel(nodeId){
+  // Revert label from bubble back to plain name
+  const src=meshyMarkers[nodeId]||meshyPeeks[nodeId];
+  if(src&&src.lb)src.lb.setIcon(meshyNodeLabel(nodeId));
+}
+function ageMeshyMsgBubbles(){
+  const now=Date.now();
+  for(const id in meshyMsgBubbles){
+    const b=meshyMsgBubbles[id];
+    const age=now-b.ts;
+    if(age>MESHY_MSG_FADE_END){
+      revertMeshyLabel(id);
+      delete meshyMsgBubbles[id];
+    }else if(age>MESHY_MSG_FADE_START){
+      const src=meshyMarkers[id]||meshyPeeks[id];
+      if(src&&src.lb){
+        const op=Math.max(0.3,1-((age-MESHY_MSG_FADE_START)/(MESHY_MSG_FADE_END-MESHY_MSG_FADE_START)));
+        src.lb.setOpacity(op);
+      }
+    }
+  }
+}
+setInterval(ageMeshyMsgBubbles,2000);
+function fmtRx(r){
+  const hops=r.hopStart>0?(r.hopStart-r.hop):0;
+  return `RSSI:${r.rssi} SNR:${r.snr}${hops>0?' +'+hops+'hop':''}${r.hop>0?' relay':' direct'}`;
+}
+function meshyDedupKey(m){
+  if(m.kind==='text')return m.node+':text:'+m.text;
+  return m.node+':'+m.kind;
+}
+function renderMeshyLine(entry){
+  const m=entry.msg;const c=entry.count;const latest=entry.receptions[entry.receptions.length-1];
+  const meta=fmtRx(latest);
+  const hasPos=entry.has_pos;
+  const pin=hasPos?'<span class="ml">\u2299</span>':'';
+  const cx=c>1?` <span class="mx" data-expand="1">x${c}</span>`:'';
+  let html='';
+  switch(m.kind){
+    case'text':html=`${pin}<span class="mn">${esc(m.from)}</span> <span class="mt">${esc(m.text)}</span>${cx} <span class="mr">${meta}</span>`;break;
+    case'join':html=`${pin}<span class="mj">${esc(m.from)} joined</span>${cx} <span class="mr">${meta}</span>`;break;
+    case'pos':html=`${pin}<span class="mp">${esc(m.from)} position</span>${cx} <span class="mr">${meta}</span>`;break;
+    case'telem':{
+      const tv=m.bat?` ${m.bat}% ${m.volt.toFixed(1)}V ch:${m.chUtil.toFixed(0)}% air:${m.airTx.toFixed(0)}%`:'';
+      html=`${pin}<span class="mp">${esc(m.from)}${tv}</span>${cx} <span class="mr">${meta}</span>`;break;
+    }
+  }
+  if(c>1){
+    html+=`<div class="md">${entry.receptions.map((r,i)=>`${i+1}. ${fmtRx(r)}`).join('<br>')}</div>`;
+  }
+  entry.el.innerHTML=html;
+}
+function addMeshyMsg(m){
+  const el=document.getElementById('meshy-output');
+  const now=Date.now();
+  const key=meshyDedupKey(m);
+  const rx={rssi:m.rssi,snr:m.snr,hop:m.hop,hopStart:m.hopStart};
+  // Check for existing dedup entry within time window
+  const existing=meshyDedup[key];
+  if(existing&&(now-existing.ts)<MESHY_DEDUP_WINDOW){
+    existing.count++;
+    existing.receptions.push(rx);
+    existing.ts=now;
+    // Update position flag if node gained position since first reception
+    if(!existing.has_pos && nodeHasPosition(m.node)) existing.has_pos=true;
+    renderMeshyLine(existing);
+    if(el.scrollHeight-el.scrollTop-el.clientHeight<60)el.scrollTop=el.scrollHeight;
+    if(m.kind==='text')showMeshyMapMsg(m.node,m.text);
+    updateMeshyStats();
+    return;
+  }
+  // New entry
+  const d=document.createElement('div');
+  d.className='meshy-msg';
+  d.dataset.mk=m.kind;
+  d.dataset.node=m.node;
+  d.style.display=isMeshyKindVisible(m.kind)?'':'none';
+  const entry={el:d,msg:m,count:1,receptions:[rx],ts:now,has_pos:m.kind==='pos'||nodeHasPosition(m.node)};
+  meshyDedup[key]=entry;
+  d.addEventListener('click',(ev)=>{
+    // If clicking the count badge (x3, x4...), toggle expand
+    if(ev.target.dataset.expand){
+      d.classList.toggle('expanded');
+      ev.stopPropagation();
+      return;
+    }
+    // Shift+click = range select from last click
+    if(ev.shiftKey&&meshyLastClickedEl){
+      meshySelectRange(meshyLastClickedEl,d);
+      return;
+    }
+    // Cmd/Ctrl+click = toggle individual
+    const toggle=ev.metaKey||ev.ctrlKey;
+    meshySelectNode(m.node,entry,toggle);
+    meshyLastClickedEl=d;
+  });
+  renderMeshyLine(entry);
+  el.appendChild(d);meshyCount++;
+  while(meshyCount>MESHY_MAX&&el.firstChild){el.removeChild(el.firstChild);meshyCount--}
+  if(el.scrollHeight-el.scrollTop-el.clientHeight<60)el.scrollTop=el.scrollHeight;
+  if(m.kind==='text')showMeshyMapMsg(m.node,m.text);
+  updateMeshyStats();
+}
+function updateMeshyStats(){
+  const st=document.getElementById('meshy-stats');
+  const nodeCount=Object.keys(meshyNodes).length;
+  st.textContent=`Nodes: ${nodeCount}  Messages: ${meshyCount}`;
+}
+function esc(s){const d=document.createElement('span');d.textContent=s;return d.innerHTML}
+function isMeshyKindVisible(k){
+  if(k==='text')return document.getElementById('mf-text').checked;
+  if(k==='join')return document.getElementById('mf-join').checked;
+  if(k==='pos')return document.getElementById('mf-pos').checked;
+  if(k==='telem')return document.getElementById('mf-telem').checked;
+  return true;
+}
+function refilterMeshy(){
+  const lines=document.getElementById('meshy-output').children;
+  for(let i=0;i<lines.length;i++){
+    const k=lines[i].dataset.mk;
+    lines[i].style.display=isMeshyKindVisible(k)?'':'none';
+  }
+}
 
 // --- Table sort ---
 let sortCol=null, sortDir=0; // 0=default, 1=asc, -1=desc
@@ -644,27 +1309,53 @@ function sortVal(ic,ac,n){
 }
 
 // --- Tick ---
+function fmtTime(d){return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false})}
+function fmtDur(ms){
+  const s=Math.floor(ms/1000),m=Math.floor(s/60),h=Math.floor(m/60);
+  return String(h).padStart(2,'0')+':'+String(m%60).padStart(2,'0')+':'+String(s%60).padStart(2,'0');
+}
+function updSessionInfo(){
+  const el=document.getElementById('session-panel');
+  if(!sessStart){el.classList.remove('visible');el.innerHTML='';return}
+  el.classList.add('visible');
+  const now=sessEnd||new Date();
+  const dur=now-sessStart;
+  let html='<span class="sess-on">CONNECTED:</span><span class="sess-on">'+fmtTime(sessStart)+'</span>';
+  html+='<span>DURATION:</span><span>'+fmtDur(dur)+'</span>';
+  if(sessEnd)html+='<span class="sess-off">DISCONNECTED:</span><span class="sess-off">'+fmtTime(sessEnd)+'</span>';
+  el.innerHTML=html;
+}
 function tick(){
   const n=nowTime();
-  // Only expire when receiving data — freeze state when idle
+  // Only expire when receiving data – freeze state when idle
   if(conn||csvPlaying){
     for(const[ic,ac]of A){
       const age=n-ac.ls;
       if(age>EXP&&!ac.expired){
-        // Remove from map but keep in table
         rmAc(ac);
         ac.expired=true;
-        selSet.delete(ic);
+        // Keep selected aircraft in selection – they get an X dismiss in the table
+        if(selSet.has(ic))ac.pinned=true;
+        else selSet.delete(ic);
       }
     }
   }
   // Refresh map visuals for staleness transitions (only non-expired)
   for(const[ic,ac]of A){if(!ac.expired)updAc(ic,ac)}
+  updRxRings();
   const liveCount=[...A.values()].filter(ac=>!ac.expired).length;
   document.getElementById('ac-count').textContent=liveCount;
   document.getElementById('msg-count').textContent=totM.toLocaleString();
   document.getElementById('msg-rate').textContent=(mTs.length/5).toFixed(1);
+  // Lock stat widths – only grow, never shrink
+  ['ac-count','msg-count','msg-rate'].forEach(id=>{
+    const el=document.getElementById(id);
+    const w=el.scrollWidth;
+    const cur=parseInt(el.style.minWidth)||0;
+    if(w>cur)el.style.minWidth=w+'px';
+  });
   if(selSet.size)updDet();
+  updSessionInfo();
   const tb=document.getElementById('ac-tbody');
   // Sort: expired always at bottom, then by user-selected column or default (distance)
   const so=[...A.entries()].sort((a,b)=>{
@@ -682,7 +1373,8 @@ function tick(){
     const sel=selSet.has(ic)?' selected':'';
     const c=acCol(ic,ac);
     if(ac.expired){
-      return`<tr style="opacity:0.25" onclick="sel0('${ic}',event)"><td class="col-icao" style="color:#556">${ic}</td><td class="col-cs" style="color:#556">${ac.cs||'---'}</td><td style="color:#556">${ac.alt!=null?ac.alt.toLocaleString():'---'}</td><td style="color:#556">${ac.speed||'---'}</td><td style="color:#556">${ac.hdg!=null?ac.hdg+'°':'---'}</td><td style="color:#556">${ac.vr?(ac.vr>0?'+':'')+ac.vr:'---'}</td><td style="color:#556">${ac.dist!=null?ac.dist.toFixed(1)+'nm':'---'}</td><td style="color:#556">${ac.brg!=null?ac.brg+'°':'---'}</td><td style="color:#556">${age}s</td></tr>`;
+      const dismiss=ac.pinned?`<span style="cursor:pointer;color:#ff6b6b;margin-left:4px" onclick="dismissAc('${ic}',event)">✕</span>`:'';
+      return`<tr style="opacity:0.25" onclick="sel0('${ic}',event)"><td class="col-icao" style="color:#556">${ic}${dismiss}</td><td class="col-cs" style="color:#556">${ac.cs||'---'}</td><td style="color:#556">${ac.alt!=null?ac.alt.toLocaleString():'---'}</td><td style="color:#556">${ac.speed||'---'}</td><td style="color:#556">${ac.hdg!=null?ac.hdg+'°':'---'}</td><td style="color:#556">${ac.vr?(ac.vr>0?'+':'')+ac.vr:'---'}</td><td style="color:#556">${ac.dist!=null?ac.dist.toFixed(1)+'nm':'---'}</td><td style="color:#556">${ac.brg!=null?ac.brg+'°':'---'}</td><td style="color:#556">${age}s</td></tr>`;
     }
     const st=acStale(ac);
     const rowOp=st.gray?'opacity:0.35':st.opacity<1?'opacity:0.5':'';
@@ -709,6 +1401,66 @@ let panelH=Math.round(window.innerHeight*0.35);
   window.addEventListener('touchend',onEnd);
 })();
 
+// --- Meshy panel: drag to move (header), CSS resize:both for corner ---
+(function(){
+  const panel=document.getElementById('meshy-panel');
+  const header=document.getElementById('meshy-header');
+  let dragActive=false,dragX,dragY,panelX,panelY;
+  function dragStart(x,y,e){
+    if(e.target.tagName==='BUTTON')return;
+    dragActive=true;dragX=x;dragY=y;
+    const r=panel.getBoundingClientRect();panelX=r.left;panelY=r.top;
+    panel.style.transition='none';header.classList.add('dragging');
+    document.body.style.userSelect='none';
+  }
+  function dragMove(x,y){if(!dragActive)return;
+    const nx=Math.max(0,Math.min(window.innerWidth-60,panelX+(x-dragX)));
+    const ny=Math.max(0,Math.min(window.innerHeight-60,panelY+(y-dragY)));
+    panel.style.left=nx+'px';panel.style.top=ny+'px';panel.style.right='auto';panel.dataset.dragged='1';
+  }
+  function dragEnd(){if(!dragActive)return;dragActive=false;panel.style.transition='';header.classList.remove('dragging');document.body.style.userSelect=''}
+  header.addEventListener('mousedown',e=>{e.preventDefault();dragStart(e.clientX,e.clientY,e)});
+  window.addEventListener('mousemove',e=>{if(dragActive)dragMove(e.clientX,e.clientY)});
+  window.addEventListener('mouseup',dragEnd);
+  header.addEventListener('touchstart',e=>{dragStart(e.touches[0].clientX,e.touches[0].clientY,e)},{passive:true});
+  window.addEventListener('touchmove',e=>{if(dragActive){e.preventDefault();dragMove(e.touches[0].clientX,e.touches[0].clientY)}},{passive:false});
+  window.addEventListener('touchend',dragEnd);
+})();
+
+// --- Files panel: drag to move (header), CSS resize:both for corner ---
+(function(){
+  const panel=document.getElementById('files-panel');
+  const header=document.getElementById('files-header');
+  let dragActive=false,dragX,dragY,panelX,panelY;
+  function dragStart(x,y,e){
+    if(e.target.tagName==='BUTTON')return;
+    dragActive=true;dragX=x;dragY=y;
+    const r=panel.getBoundingClientRect();panelX=r.left;panelY=r.top;
+    panel.style.transition='none';header.classList.add('dragging');
+    document.body.style.userSelect='none';
+  }
+  function dragMove(x,y){if(!dragActive)return;
+    const nx=Math.max(0,Math.min(window.innerWidth-60,panelX+(x-dragX)));
+    const ny=Math.max(0,Math.min(window.innerHeight-60,panelY+(y-dragY)));
+    panel.style.left=nx+'px';panel.style.top=ny+'px';panel.style.right='auto';panel.dataset.dragged='1';
+  }
+  function dragEnd(){if(!dragActive)return;dragActive=false;panel.style.transition='';header.classList.remove('dragging');document.body.style.userSelect=''}
+  header.addEventListener('mousedown',e=>{e.preventDefault();dragStart(e.clientX,e.clientY,e)});
+  window.addEventListener('mousemove',e=>{if(dragActive)dragMove(e.clientX,e.clientY)});
+  window.addEventListener('mouseup',dragEnd);
+  header.addEventListener('touchstart',e=>{dragStart(e.touches[0].clientX,e.touches[0].clientY,e)},{passive:true});
+  window.addEventListener('touchmove',e=>{if(dragActive){e.preventDefault();dragMove(e.touches[0].clientX,e.touches[0].clientY)}},{passive:false});
+  window.addEventListener('touchend',dragEnd);
+})();
+
+// --- Window stacking: click any panel to bring it to front ---
+let panelZ=1001;
+function bringToFront(el){el.style.zIndex=++panelZ}
+['log-panel','files-panel','meshy-panel'].forEach(id=>{
+  document.getElementById(id).addEventListener('mousedown',function(){bringToFront(this)});
+  document.getElementById(id).addEventListener('touchstart',function(){bringToFront(this)},{passive:true});
+});
+
 // --- Serial ---
 let lb='';
 async function toggleSerial(){
@@ -719,25 +1471,25 @@ async function toggleSerial(){
   try{
     port=await navigator.serial.requestPort();
     await port.open({baudRate:115200,flowControl:'none'});
-    // Deassert DTR/RTS as fast as possible — but Chrome may have already
+    // Deassert DTR/RTS as fast as possible – but Chrome may have already
     // toggled DTR during open(), triggering the ESP32-P4 USB-JTAG reset.
     // We handle the resulting reboot gracefully in readLoop.
     await port.setSignals({dataTerminalReady:false,requestToSend:false});
-    conn=true;document.getElementById('connect-btn').textContent='Disconnect';document.getElementById('connect-btn').classList.add('connected');
-    addLog('[scope] Serial connected — device may reboot (DTR race), waiting for data...');
+    conn=true;sessStart=new Date();sessEnd=null;consoleReady=false;updSessionInfo();document.getElementById('connect-btn').textContent='Disconnect';document.getElementById('connect-btn').classList.add('connected');
+    addLog('[scope] Serial connected – device may reboot (DTR race), waiting for data...');
     fetchLatestVersion(); // check for firmware updates
-    // Deferred version query: if the device doesn't reboot (no boot log),
-    // ask for the version after things settle.  10s gives the DTR reboot
-    // plenty of time to complete — if we already have the version from
-    // the boot log by then, this is a no-op.
-    setTimeout(async()=>{
-      if(conn&&!deviceVersion&&!cmdWaiting){
+    // Deferred version query: wait for console to be ready, then ask for version
+    // if we didn't already get it from the boot log.
+    (async()=>{
+      // Wait up to 30s for consoleReady
+      for(let i=0;i<300&&conn&&!consoleReady;i++)await new Promise(r=>setTimeout(r,100));
+      if(conn&&!deviceVersion&&!cmdWaiting&&consoleReady){
         try{
           const r=await sendCmdResume('version',3000);
           if(r){r.split('\n').forEach(l=>parse(l))}
-        }catch(e){/* device busy or not responding — not critical */}
+        }catch(e){/* device busy or not responding – not critical */}
       }
-    },10000);
+    })();
     readLoop();
   }catch(e){addLog('[scope] Serial error: '+e.message)}
 }
@@ -760,6 +1512,9 @@ function cmdResetTO(){
   cmdTO=setTimeout(()=>{cmdWaiting=false;const r=cmdResolve;cmdResolve=null;r(null);},cmdInactivityMs);
 }
 function handleLine(l){
+  l=stripAnsi(l);
+  // Always check for console ready, even during cmd exchange
+  if(/\[CONSOLE\] Serial console (ready|heartbeat)/.test(l))consoleReady=true;
   if(cmdWaiting){
     if(l.includes('adsb>')){
       if(cmdSkipPrompts>0){cmdSkipPrompts--;cmdBuf=[];return;} // skip Ctrl+C prompt
@@ -774,7 +1529,7 @@ function handleLine(l){
     if(clean.startsWith('── Command mode')||clean==='')return;
     cmdBuf.push(l);
     cmdBytes+=l.length;
-    cmdResetTO(); // data flowing — reset inactivity timer
+    cmdResetTO(); // data flowing – reset inactivity timer
     // Update progress in file status
     const st=document.getElementById('files-status');
     if(st&&st.dataset.dl){
@@ -787,6 +1542,7 @@ function handleLine(l){
     return;
   }
   parse(l);addLog(l);
+  if(l.includes('MESHY')){handleMeshyLine(l);handleMeshyNodeInfo(l);}
 }
 async function serialWrite(t){if(!conn||!port?.writable)return;const w=port.writable.getWriter();try{await w.write(new TextEncoder().encode(t))}finally{w.releaseLock()}}
 async function sendCmd(cmd,inactMs){
@@ -823,7 +1579,7 @@ async function sendCmd(cmd,inactMs){
 }
 async function sendCmdResume(cmd,inactMs){
   const r=await sendCmd(cmd,inactMs);
-  // Return to log mode — 'log' command doesn't produce a prompt,
+  // Return to log mode – 'log' command doesn't produce a prompt,
   // so just wait briefly then stop capturing. Any lines received
   // during the transition get flushed to the normal parser.
   cmdBuf=[];cmdWaiting=true;cmdSkipPrompts=0;
@@ -841,19 +1597,73 @@ async function sendCmdResume(cmd,inactMs){
 
 // --- File browser ---
 let filesPath='/sdcard';
-function toggleFiles(){const p=document.getElementById('files-panel'),b=document.getElementById('files-btn');p.classList.toggle('visible');b.classList.toggle('active');syncPanelLayout();if(p.classList.contains('visible'))filesRefresh()}
+async function toggleFiles(){
+  const p=document.getElementById('files-panel'),b=document.getElementById('files-btn');
+  if(p.classList.contains('visible')){
+    p.classList.remove('visible');b.classList.remove('active');syncPanelLayout();return;
+  }
+  p.classList.add('visible');b.classList.add('active');syncPanelLayout();
+  // Wait for serial console ready + SD card mounted before listing
+  const sd=document.getElementById('sd-status');
+  if(!consoleReady||!sd.classList.contains('sd-ok')){
+    const st=document.getElementById('files-status');
+    const list=document.getElementById('files-list');
+    st.textContent='Waiting for device...';list.innerHTML='';
+    const ok=await new Promise(res=>{
+      let checks=0;
+      const iv=setInterval(()=>{
+        if(consoleReady&&sd.classList.contains('sd-ok')){clearInterval(iv);res(true)}
+        else if(++checks>120){clearInterval(iv);res(false)} // 60s timeout
+      },500);
+    });
+    if(!ok){st.textContent=!consoleReady?'Serial console not ready':'SD card not ready';return}
+  }
+  filesRefresh();
+}
 function syncPanelLayout(){
   const logVis=document.getElementById('log-panel').classList.contains('visible');
   const filesVis=document.getElementById('files-panel').classList.contains('visible');
   document.getElementById('files-panel').classList.toggle('side-by-side',logVis&&filesVis);
 }
+let filesCache={}; // path -> {files, time}
+function renderFiles(files,path,suffix){
+  const list=document.getElementById('files-list'),st=document.getElementById('files-status');
+  document.getElementById('files-path').textContent=path;
+  st.textContent=files.length+' items'+(suffix||'');
+  let html='';
+  if(path!=='/sdcard')html+='<div class="file-row" onclick="fileNav(\'..\')">\u2B06 <span class="file-name dir">..</span></div>';
+  for(const f of files){
+    const ic=f.isDir?'\uD83D\uDCC1':'\uD83D\uDCC4';
+    const cls=f.isDir?'dir':'';
+    const isAdsbCsv=f.name.endsWith('.csv')&&!f.name.startsWith('meshy_');
+    const isActive=(!f.isDir&&sdActiveFile&&f.name===sdActiveFile)?'active-log':'';
+    const n=f.name.replace(/'/g,"\\'");
+    let acts='';
+    if(!f.isDir){
+      acts='<div class="file-actions">';
+      if(isAdsbCsv)acts+='<button onclick="event.stopPropagation();fileReplay(\''+n+'\',\''+f.size+'\')">Replay</button>';
+      acts+='<button onclick="event.stopPropagation();fileDL(\''+n+'\',\''+f.size+'\')">DL</button>';
+      acts+='<button onclick="event.stopPropagation();fileDel(\''+n+'\')">Del</button>';
+      acts+='</div>';
+    }
+    const ck=f.isDir?'onclick="fileNav(\''+n+'\')"':'';
+    html+='<div class="file-row '+isActive+'" '+ck+'><span class="file-icon">'+ic+'</span><span class="file-name '+cls+'">'+f.name+'</span><span class="file-size">'+f.size+'</span>'+acts+'</div>';
+  }
+  list.innerHTML=html;
+}
 async function filesRefresh(){
   const list=document.getElementById('files-list'),st=document.getElementById('files-status');
-  if(!conn){st.textContent='Connect serial first';list.innerHTML='';return}
-  st.textContent='Loading...';list.innerHTML='';
+  // Show cached listing immediately while refreshing
+  if(filesCache[filesPath]){
+    renderFiles(filesCache[filesPath].files,filesPath,' (cached)');
+  }
+  if(!conn){
+    if(filesCache[filesPath]){renderFiles(filesCache[filesPath].files,filesPath,' (cached)');return}
+    st.textContent='Connect serial first';list.innerHTML='';return;
+  }
+  if(!filesCache[filesPath]){st.textContent='Loading...';list.innerHTML='';}
   try{
     const raw=await sendCmdResume('ls '+filesPath,5000);
-    // Check for error in response
     const rawClean=raw.replace(/\x1b\[[0-9;]*m/g,'');
     if(rawClean.includes('error:')||rawClean.includes('No such file')||rawClean.includes('cannot open')){
       st.textContent='SD card not mounted';
@@ -870,28 +1680,8 @@ async function filesRefresh(){
       if(fm)files.push({name:fm[1].trim(),isDir:false,size:fm[2]+' '+fm[3]});
     }
     files.sort((a,b)=>{if(a.isDir!==b.isDir)return a.isDir?-1:1;return a.name.localeCompare(b.name)});
-    document.getElementById('files-path').textContent=filesPath;
-    st.textContent=files.length+' items';
-    let html='';
-    if(filesPath!=='/sdcard')html+='<div class="file-row" onclick="fileNav(\'..\')">\u2B06 <span class="file-name dir">..</span></div>';
-    for(const f of files){
-      const ic=f.isDir?'\uD83D\uDCC1':'\uD83D\uDCC4';
-      const cls=f.isDir?'dir':'';
-      const isC=f.name.endsWith('.csv');
-      const isActive=(!f.isDir&&sdActiveFile&&f.name===sdActiveFile)?'active-log':'';
-      const n=f.name.replace(/'/g,"\\'");
-      let acts='';
-      if(!f.isDir){
-        acts='<div class="file-actions">';
-        if(isC)acts+='<button onclick="event.stopPropagation();fileReplay(\''+n+'\',\''+f.size+'\')">Replay</button>';
-        acts+='<button onclick="event.stopPropagation();fileDL(\''+n+'\',\''+f.size+'\')">DL</button>';
-        acts+='<button onclick="event.stopPropagation();fileDel(\''+n+'\')">Del</button>';
-        acts+='</div>';
-      }
-      const ck=f.isDir?'onclick="fileNav(\''+n+'\')"':'';
-      html+='<div class="file-row '+isActive+'" '+ck+'><span class="file-icon">'+ic+'</span><span class="file-name '+cls+'">'+f.name+'</span><span class="file-size">'+f.size+'</span>'+acts+'</div>';
-    }
-    list.innerHTML=html;
+    filesCache[filesPath]={files,time:Date.now()};
+    renderFiles(files,filesPath,'');
   }catch(e){st.textContent='Error: '+e.message}
 }
 function fileNav(name){
@@ -950,18 +1740,9 @@ async function fileDel(name){
   catch(e){document.getElementById('files-status').textContent='Failed: '+e.message}
 }
 async function discon(){
-  // Try to safely unmount SD card before disconnecting (hard 3s limit)
-  if(conn&&port?.writable){
-    try{
-      addLog('[scope] Unmounting SD card...');
-      await Promise.race([
-        sendCmd('unmount',5000),
-        new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')),3000))
-      ]);
-      addLog('[scope] SD card unmounted');
-    }catch(e){addLog('[scope] Unmount skipped: '+e.message)}
-  }
-  conn=false;document.getElementById('connect-btn').textContent='Connect Serial';document.getElementById('connect-btn').classList.remove('connected');
+  conn=false;sessEnd=new Date();consoleReady=false;updSessionInfo();
+  const btn=document.getElementById('connect-btn');
+  btn.textContent='Connect Serial';btn.classList.remove('connected');
   try{if(reader){await reader.cancel();reader.releaseLock()}}catch(e){}
   try{if(port)await port.setSignals({dataTerminalReady:false,requestToSend:false})}catch(e){}
   try{if(port)await port.close()}catch(e){}
@@ -1016,6 +1797,15 @@ function parseCSVText(text,filename){
   if(rxRow){rxP={lat:rxRow.rxLat,lon:rxRow.rxLon,sats:rxRow.sats,hdop:rxRow.hdop,fix:true};updRx();updGnss();map.setView([rxRow.rxLat,rxRow.rxLon],11)}
   updTlTime();
   addLog('[scope] CSV loaded: '+csvRows.length+' rows, '+filename);
+  // Disable meshy during replay
+  if(meshyMapVisible){meshyMapVisible=false;document.getElementById('mesh-map-btn').classList.remove('active');
+    for(const id in meshyMarkers){if(meshyMarkers[id].mk)map.removeLayer(meshyMarkers[id].mk);if(meshyMarkers[id].lb)map.removeLayer(meshyMarkers[id].lb)}
+    Object.keys(meshyMarkers).forEach(k=>delete meshyMarkers[k]);updRxRings();
+  }
+  document.getElementById('meshy-panel').classList.remove('visible');
+  document.getElementById('meshy-btn').classList.remove('active');
+  document.getElementById('meshy-btn').style.opacity='0.4';
+  document.getElementById('mesh-map-btn').style.opacity='0.4';
   tlPlay();
 }
 
@@ -1117,6 +1907,9 @@ function tlClose(){
   for(const[ic,ac]of A){rmAc(ac)}
   A.clear();selSet.clear();totM=0;
   addLog('[scope] CSV replay closed');
+  // Re-enable meshy buttons
+  document.getElementById('meshy-btn').style.opacity='';
+  document.getElementById('mesh-map-btn').style.opacity='';
 }
 
 // --- Flash Firmware ---
@@ -1133,7 +1926,7 @@ async function fetchLatestVersion(){
     if(!r.ok)return;
     latestVersion=await r.json();
     updFlashVer();
-  }catch(e){/* latest.version.json not available yet — silent */}
+  }catch(e){/* latest.version.json not available yet – silent */}
 }
 
 function versionsMatch(){
@@ -1152,7 +1945,7 @@ function updFlashVer(){
 
   // Device version
   if(el){
-    el.textContent=deviceVersion||'—';
+    el.textContent=deviceVersion||'–';
     const match=versionsMatch();
     if(match===true)el.className='fv ok';
     else if(match===false)el.className='fv warn';
@@ -1263,7 +2056,7 @@ async function fetchFirmware(url){
     return data;
   }catch(e){
     if(e.message.includes('Failed to fetch')||e.message.includes('NetworkError')){
-      flashLog('Download failed — CORS or network error.','fl-err');
+      flashLog('Download failed – CORS or network error.','fl-err');
       flashLog('Ensure '+url+' has Access-Control-Allow-Origin header,','fl-err');
       flashLog('or use "Local .bin" button to pick a file from disk.','fl-info');
     }else{
@@ -1280,14 +2073,14 @@ async function doFlash(binData){
   document.getElementById('flash-go-btn').disabled=true;
   flashBusy=true;
 
-  // Save the port reference before disconnecting — requestPort() returns
+  // Save the port reference before disconnecting – requestPort() returns
   // the same SerialPort object for the same physical device, which Chrome
   // considers "already open" even after close() if the OS hasn't fully
   // released it.  Reusing our existing reference avoids the picker AND
   // the stale-open race.
   let flashPort=port||null;
 
-  // Disconnect serial if connected — fully release the port
+  // Disconnect serial if connected – fully release the port
   if(conn){
     flashLog('Disconnecting serial...','fl-info');
     try{await discon()}catch(e){}
@@ -1301,7 +2094,7 @@ async function doFlash(binData){
     await new Promise(r=>setTimeout(r,500));
     flashLog('Using previously connected port.','fl-info');
   }else{
-    // No prior connection — ask user to pick a port
+    // No prior connection – ask user to pick a port
     flashLog('Select the serial port for the device...','fl-info');
     flashStatus('Waiting for port...','');
     try{
@@ -1315,7 +2108,7 @@ async function doFlash(binData){
     }
   }
 
-  // Create transport and loader — esptool-js opens the port itself
+  // Create transport and loader – esptool-js opens the port itself
   flashLog('Connecting to bootloader...','fl-info');
   flashStatus('Connecting...','');
   flashLog('If device does not respond: hold BOOT, press RESET, release BOOT.','fl-info');
@@ -1325,7 +2118,7 @@ async function doFlash(binData){
     transport=new mod.Transport(flashPort,true);
     loader=new mod.ESPLoader({
       transport,
-      baudrate:115200,     // keep same as ROM — USB-CDC ignores baud rate
+      baudrate:115200,     // keep same as ROM – USB-CDC ignores baud rate
       romBaudrate:115200,
       terminal:{
         clean(){},
@@ -1379,7 +2172,7 @@ async function doFlash(binData){
   // Reset
   flashLog('Resetting device...','fl-info');
   try{await loader.hardReset()}catch(e){
-    flashLog('Auto-reset failed — please press RESET button.','fl-info');
+    flashLog('Auto-reset failed – please press RESET button.','fl-info');
   }
 
   try{await transport.disconnect()}catch(e){}
@@ -1389,7 +2182,7 @@ async function doFlash(binData){
   flashBusy=false;
   document.getElementById('flash-go-btn').disabled=false;
 
-  // Auto-reconnect — device needs a few seconds to reboot
+  // Auto-reconnect – device needs a few seconds to reboot
   setTimeout(async()=>{
     try{
       flashLog('Reconnecting...','fl-info');
@@ -1447,10 +2240,22 @@ function posTopbar(){
   const top=(tb+tlH+8)+'px';
   document.getElementById('gnss-info').style.top=top;
   document.getElementById('detail-wrap').style.top=top;
+  document.getElementById('session-panel').style.top=top;
+  // Position log/files panels below gnss-info
+  const gi=document.getElementById('gnss-info');
+  const logTop=(gi.offsetTop+gi.offsetHeight+8)+'px';
+  document.getElementById('log-panel').style.top=logTop;
+  // Files panel: only set initial top (it's draggable, don't override after drag)
+  const fp=document.getElementById('files-panel');
+  if(!fp.dataset.dragged)fp.style.top=logTop;
+  // Meshy panel: only set initial top (it's draggable, don't override after drag)
+  const mp=document.getElementById('meshy-panel');
+  if(!mp.dataset.dragged)mp.style.top=logTop;
 }
 posZoom();posTopbar();
 new MutationObserver(posZoom).observe(document.getElementById('panel'),{attributes:true,attributeFilter:['style','class']});
 new ResizeObserver(posTopbar).observe(document.getElementById('topbar'));
+new ResizeObserver(posTopbar).observe(document.getElementById('gnss-info'));
 window.addEventListener('resize',posTopbar);
 if(!('serial' in navigator)){const b=document.getElementById('connect-btn');b.textContent='No WebSerial';b.disabled=true;b.style.opacity=0.4}
 </script>

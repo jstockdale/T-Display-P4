@@ -93,6 +93,9 @@ namespace Lvgl_Ui
 #endif
             CAMERA,
             ADSB,
+            MESHY,
+            SCOPE,
+            SETTINGS,
             RF,
             RF_SETINGS,
             MUSIC,
@@ -296,21 +299,78 @@ namespace Lvgl_Ui
                     lv_obj_t *root;
                     lv_obj_t *stats_label;
                     lv_obj_t *list_label;
-                    bool rotated;                          // true while rotation differs from home
-                    lv_display_rotation_t user_rotation;   // user's preferred rotation (persists across visits)
-                    bool has_user_rotation;                // true after first manual rotation
+                    bool rotated = false;
+                    lv_display_rotation_t user_rotation = LV_DISPLAY_ROTATION_0;
+                    bool has_user_rotation = false;
 
                     // Draggable divider state
                     lv_obj_t *divider;
                     lv_obj_t *stats_panel;
                     lv_obj_t *list_panel;
                     lv_obj_t *list_header;
-                    int32_t divider_y;  // current Y position of divider
+                    int32_t divider_y = 0;  // current Y position of divider
 
                     // Sort state
                     int sort_col;        // adsb_sort_col_t value (0=DIST default)
                     bool sort_asc = true; // true = ascending (nearest first for DIST)
                 } adsb;
+
+                struct
+                {
+                    lv_obj_t *root;
+                    lv_obj_t *stats_label;
+                    lv_obj_t *msg_label;       // fallback if canvas fails
+                    lv_obj_t *msg_canvas;       // emoji-capable message display
+                    void     *msg_canvas_buf;
+                    int32_t   msg_canvas_w;
+                    int32_t   msg_canvas_max_h;
+                } meshy;
+
+                struct
+                {
+                    lv_obj_t *root;
+                    lv_obj_t *scroll_container;
+                } settings;
+
+                struct
+                {
+                    lv_obj_t *root = nullptr;
+                    lv_obj_t *canvas = nullptr;
+                    void     *canvas_buf = nullptr;   // PSRAM canvas buffer
+                    int32_t   canvas_w = 0;
+                    int32_t   canvas_h = 0;
+                    lv_obj_t *info_label = nullptr;   // bottom info text
+                    lv_obj_t *detail_label = nullptr;  // selected aircraft detail
+                    lv_timer_t *redraw_timer = nullptr; // LVGL timer for periodic redraw
+                    // Pan/zoom state
+                    float     pan_x = 0;              // pixel offset from center
+                    float     pan_y = 0;
+                    float     zoom = 1.0f;            // 1.0 = auto-range, >1 = zoomed in
+                    float     range_nm = 10.0f;       // current display range
+                    // Touch tracking
+                    bool      touch_active = false;
+                    int32_t   touch_start_x = 0;
+                    int32_t   touch_start_y = 0;
+                    float     pan_start_x = 0;
+                    float     pan_start_y = 0;
+                    // Pinch zoom
+                    bool      pinch_active = false;
+                    float     pinch_start_dist = 0;
+                    float     zoom_start = 1.0f;
+                    // Selected aircraft
+                    uint32_t  selected_icao = 0;
+                    // Color mode: 0=Mono(green), 1=Rainbow, 2=ALT, 3=SPD
+                    int       color_mode = 0;
+                    // Tap-cycle state (for clustered aircraft)
+                    uint32_t  tap_candidates[8] = {0};
+                    int       tap_candidate_count = 0;
+                    int       tap_cycle_idx = 0;
+                    int32_t   last_tap_x = -1;
+                    int32_t   last_tap_y = -1;
+                    // Render timing (adaptive FPS)
+                    uint32_t  last_render_us = 0;    // microseconds for last frame
+                    int       visible_count = 0;     // aircraft drawn on screen last frame
+                } scope;
 
                 struct
                 {
@@ -648,6 +708,8 @@ namespace Lvgl_Ui
         void (*_win_camera_status_callback)(bool status) = nullptr;
 
         void (*_win_adsb_status_callback)(bool status) = nullptr;
+        void (*_win_meshy_status_callback)(bool status) = nullptr;
+        void (*_win_scope_status_callback)(bool status) = nullptr;
 
         bool (*_win_rf_config_sx1262_params_callback)(Device_Sx1262 device_sx1262) = nullptr;
 
@@ -747,6 +809,11 @@ namespace Lvgl_Ui
 
         void init_win_adsb(void);
         void win_adsb_update(const char *stats_text, const char *list_text);
+        void init_win_meshy(void);
+        void win_meshy_update(const char *stats_text, const char *msg_text);
+        void init_win_scope(void);
+        void init_win_settings(void);
+        void win_scope_redraw(void);
 
         void init_win_rf(void);
         void win_rf_chat_message_data_update(std::vector<Win_Rf_Chat_Message> wlcm);

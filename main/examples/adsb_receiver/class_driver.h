@@ -163,6 +163,29 @@ extern bool adsb_transfer_ready(void);
 // Free bulk transfer on disconnect — allows re-alloc on reconnect
 extern void free_adsb_transfer(void);
 
+// Aircraft data for scope radar display
+typedef struct {
+    uint32_t icao;
+    char callsign[9];
+    int altitude;
+    int speed;
+    int heading;
+    int vert_rate;
+    double lat, lon;
+    int has_position;
+    double dist_nm;
+    double bearing_deg;
+    uint32_t msg_count;
+    int32_t age_ms;      // milliseconds since last seen
+} scope_aircraft_t;
+
+// Get active aircraft with computed distance/bearing from receiver.
+// Returns number of aircraft copied.
+extern int adsb_get_aircraft_for_scope(scope_aircraft_t *out, int max_count);
+
+// Persistent scope trail recording — call after ADS-B init, records at 1Hz from boot.
+extern void scope_trail_init(void);
+
 #ifdef __cplusplus
 }
 #endif

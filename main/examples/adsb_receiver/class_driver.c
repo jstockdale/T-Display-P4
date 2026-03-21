@@ -165,6 +165,7 @@ typedef struct {
     int has_position;
     int64_t last_seen;
     int active;
+    uint32_t msg_count;
 } aircraft_t;
 
 static aircraft_t aircraft_table[AIRCRAFT_TABLE_SIZE];
@@ -713,6 +714,7 @@ void on_msg(mode_s_t *self, struct mode_s_msg *mm)
     xSemaphoreTake(aircraft_mutex, portMAX_DELAY);
     aircraft_t *ac = aircraft_get(icao);
     ac->last_seen = esp_timer_get_time();
+    ac->msg_count++;
 
     // --- Update aircraft state from this message ---
 
@@ -1256,4 +1258,47 @@ void class_driver_client_deregister(void)
     s_driver_obj->mux_protected.flags.shutdown = 1;
     xSemaphoreGive(s_driver_obj->constant.mux_lock);
     ESP_ERROR_CHECK(usb_host_client_unblock(s_driver_obj->constant.client_hdl));
+}
+
+int adsb_get_aircraft_for_scope(scope_aircraft_t *out, int max_count)
+{
+    if (!aircraft_mutex || !out || max_count <= 0) return 0;
+    xSemaphoreTake(aircraft_mutex, portMAX_DELAY);
+
+    receiver_pos_t rx = adsb_get_receiver_pos();
+    int64_t now_us = esp_timer_get_time();
+    int count = 0;
+
+    for (int i = 0; i < AIRCRAFT_TABLE_SIZE && count < max_count; i++) {
+        aircraft_t *a = &aircraft_table[i];
+        if (!a->active) continue;
+        int64_t age_us = now_us - a->last_seen;
+        if (age_us > 180000000LL) continue; // 180s = 3 minutes, matches webapp EXP
+
+        scope_aircraft_t *s = &out[count];
+        s->icao = a->icao;
+        memcpy(s->callsign, a->callsign, 9);
+        s->altitude = a->altitude;
+        s->speed = a->speed;
+        s->heading = a->heading;
+        s->lat = a->lat;
+        s->lon = a->lon;
+        s->has_position = a->has_position;
+        s->vert_rate = a->vert_rate;
+        s->msg_count = a->msg_count;
+        s->age_ms = (int32_t)(age_us / 1000);
+        s->dist_nm = 0;
+        s->bearing_deg = 0;
+
+        if (a->has_position && rx.fix_valid) {
+            double dist_km, brg;
+            haversine(rx.lat, rx.lon, a->lat, a->lon, &dist_km, &brg);
+            s->dist_nm = dist_km * 0.539957;
+            s->bearing_deg = brg;
+        }
+        count++;
+    }
+
+    xSemaphoreGive(aircraft_mutex);
+    return count;
 }

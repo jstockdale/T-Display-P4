@@ -6,6 +6,18 @@
  * @License: GPL 3.0
  */
 #include "lvgl_ui.h"
+#include "class_driver.h"
+#include <math.h>
+#include <string.h>
+#include "esp_heap_caps.h"
+#include "esp_timer.h"
+#include "esp_log.h"
+#include "emoji_sprites.h"
+#include "emoji_draw.h"
+#include "device_settings.h"
+#include "screen_detect.h"
+#include "esp_app_desc.h"
+#include "esp_system.h"
 #include "esp_chip_info.h"
 #include "esp_mac.h"
 #include "esp_flash.h"
@@ -16,12 +28,93 @@ extern "C" {
     extern void adsb_set_sort(int col, bool ascending);
 }
 
+// ═══════════════════════════════════════════════════════
+// Persistent scope trail recording — runs from boot via esp_timer
+// Independent of scope UI — records aircraft positions at 1Hz
+// so trails are available immediately when the user opens Scope.
+// ═══════════════════════════════════════════════════════
+
+#define SCOPE_TRAIL_DEPTH 600   // 10 minutes at 1 position/second
+#define SCOPE_TRAIL_MAX   32
+
+struct ScopeTrailPt { double lat, lon; };
+struct ScopeTrailAC {
+    uint32_t icao;
+    int head;       // next write position (ring buffer)
+    int count;      // valid entries (up to SCOPE_TRAIL_DEPTH)
+    int64_t last_update_us; // esp_timer_get_time() of last position update
+    ScopeTrailPt pts[SCOPE_TRAIL_DEPTH];
+};
+
+static ScopeTrailAC *g_trails = nullptr;
+static int g_trail_count = 0;
+
+// Timer callback — records aircraft positions at 1Hz
+static void scope_trail_timer_cb(void *arg) {
+    if (!g_trails) return;
+
+    static scope_aircraft_t ac_buf[SCOPE_TRAIL_MAX];
+    int ac_count = adsb_get_aircraft_for_scope(ac_buf, SCOPE_TRAIL_MAX);
+    int64_t now = esp_timer_get_time();
+
+    for (int i = 0; i < ac_count; i++) {
+        if (!ac_buf[i].has_position) continue;
+        if (ac_buf[i].lat == 0.0 && ac_buf[i].lon == 0.0) continue;
+
+        int slot = -1;
+        for (int t = 0; t < g_trail_count; t++) {
+            if (g_trails[t].icao == ac_buf[i].icao) { slot = t; break; }
+        }
+        // No existing slot — try to allocate or evict
+        if (slot < 0) {
+            if (g_trail_count < SCOPE_TRAIL_MAX) {
+                slot = g_trail_count++;
+            } else {
+                // Evict the oldest (least recently updated) trail
+                int oldest = 0;
+                for (int t = 1; t < g_trail_count; t++) {
+                    if (g_trails[t].last_update_us < g_trails[oldest].last_update_us)
+                        oldest = t;
+                }
+                slot = oldest;
+            }
+            g_trails[slot].icao = ac_buf[i].icao;
+            g_trails[slot].head = 0;
+            g_trails[slot].count = 0;
+        }
+        g_trails[slot].pts[g_trails[slot].head] = { ac_buf[i].lat, ac_buf[i].lon };
+        g_trails[slot].head = (g_trails[slot].head + 1) % SCOPE_TRAIL_DEPTH;
+        if (g_trails[slot].count < SCOPE_TRAIL_DEPTH) g_trails[slot].count++;
+        g_trails[slot].last_update_us = now;
+    }
+}
+
+// Call from app_main after USB host and ADS-B are initialized
+extern "C" void scope_trail_init(void) {
+    if (g_trails) return; // already initialized
+    g_trails = (ScopeTrailAC *)heap_caps_calloc(SCOPE_TRAIL_MAX, sizeof(ScopeTrailAC), MALLOC_CAP_SPIRAM);
+    if (!g_trails) {
+        printf("[TRAIL] Failed to allocate trail buffer in PSRAM\n");
+        return;
+    }
+    printf("[TRAIL] Allocated %d trail slots (%d KB PSRAM)\n",
+           SCOPE_TRAIL_MAX, (int)(SCOPE_TRAIL_MAX * sizeof(ScopeTrailAC) / 1024));
+
+    // Start 1Hz periodic timer
+    esp_timer_handle_t timer;
+    esp_timer_create_args_t args = {};
+    args.callback = scope_trail_timer_cb;
+    args.name = "scope_trail";
+    esp_timer_create(&args, &timer);
+    esp_timer_start_periodic(timer, 1000000); // 1 second
+    printf("[TRAIL] 1Hz trail recording started\n");
+}
+
 namespace Lvgl_Ui
 {
     const System::Win_Home_App_Icon System::_win_home_app_icon_list[] =
         {
             {"Cit", &win_home_app_icon_cit_110x110px_rgb565a8},
-            {"Rf", &win_home_app_icon_rf_110x110px_rgb565a8},
             {"Music", &win_home_app_icon_music_110x110px_rgb565a8},
     };
 
@@ -529,22 +622,6 @@ namespace Lvgl_Ui
                                 switch (code)
                                 {
                                 case LV_EVENT_CLICKED:
-                                self->init_win_rf();
-
-                                lv_screen_load_anim(self->_registry.win.rf.root, LV_SCR_LOAD_ANIM_FADE_OUT, 500, 0, true);
-                                break;
-                                default:
-                                break;
-                                } }, LV_EVENT_ALL, this);
-
-        lv_obj_add_event_cb(image_button[2], [](lv_event_t *e)
-                            {
-                                System *self = static_cast<System *>(lv_event_get_user_data(e));
-                                lv_event_code_t code = lv_event_get_code(e);
-
-                                switch (code)
-                                {
-                                case LV_EVENT_CLICKED:
                                 self->init_win_music();
 
                                 lv_screen_load_anim(self->_registry.win.music.root, LV_SCR_LOAD_ANIM_FADE_OUT, 500, 0, true);
@@ -552,6 +629,48 @@ namespace Lvgl_Ui
                                 default:
                                 break;
                                 } }, LV_EVENT_ALL, this);
+
+        // Meshy app button (3rd position — styled button, green mesh icon)
+        {
+            lv_obj_t *meshy_btn = lv_button_create(tileview_tile_1);
+            lv_obj_set_size(meshy_btn, APP_STYLE_ICON_WIDTH_HEIGHT, APP_STYLE_ICON_WIDTH_HEIGHT);
+            lv_obj_set_style_radius(meshy_btn, 20, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_bg_color(meshy_btn, lv_color_hex(0x2D8C3A), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(meshy_btn, LV_OPA_COVER, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_shadow_width(meshy_btn, 0, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_border_width(meshy_btn, 0, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_bg_color(meshy_btn, lv_color_hex(0x1A6628), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_PRESSED);
+#if defined SCREEN_ROTATION_DIRECTION_0
+            lv_obj_align(meshy_btn, LV_ALIGN_TOP_LEFT,
+                         _app_style.icon.edge_distance.width + (APP_STYLE_ICON_WIDTH_HEIGHT * 2) + (_app_style.icon.icon_distance.width * 2),
+                         _app_style.icon.edge_distance.height + 300);
+#elif defined SCREEN_ROTATION_DIRECTION_90
+            lv_obj_align(meshy_btn, LV_ALIGN_TOP_LEFT,
+                         _app_style.icon.edge_distance.width + (APP_STYLE_ICON_WIDTH_HEIGHT * 2) + (_app_style.icon.icon_distance.width * 2) + 400,
+                         _app_style.icon.edge_distance.height);
+#endif
+            lv_obj_t *icon_lbl = lv_label_create(meshy_btn);
+            lv_label_set_text(icon_lbl, LV_SYMBOL_WIFI);
+            lv_obj_set_style_text_font(icon_lbl, &lv_font_montserrat_48, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_text_color(icon_lbl, lv_color_white(), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_center(icon_lbl);
+
+            lv_obj_t *meshy_label = lv_label_create(tileview_tile_1);
+            lv_label_set_text(meshy_label, "Meshy");
+            lv_obj_set_style_text_align(meshy_label, LV_TEXT_ALIGN_CENTER, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_text_font(meshy_label, &lv_font_montserrat_22, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_size(meshy_label, _app_style.label.width, _app_style.label.height);
+            lv_obj_set_style_text_color(meshy_label, lv_color_white(), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_align_to(meshy_label, meshy_btn, LV_ALIGN_OUT_BOTTOM_MID, 0, 0);
+
+            lv_obj_add_event_cb(meshy_btn, [](lv_event_t *e)
+                                {
+                                    System *self = static_cast<System *>(lv_event_get_user_data(e));
+                                    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+                                    self->init_win_meshy();
+                                    lv_screen_load_anim(self->_registry.win.meshy.root, LV_SCR_LOAD_ANIM_FADE_OUT, 500, 0, true);
+                                }, LV_EVENT_ALL, this);
+        }
 
         // ADS-B app button (4th position — no icon image, uses styled button)
         {
@@ -617,6 +736,48 @@ namespace Lvgl_Ui
                                     default:
                                         break;
                                     } }, LV_EVENT_ALL, this);
+        }
+
+        // Scope app button (row 2, position 0 — under CIT)
+        {
+            lv_obj_t *scope_btn = lv_button_create(tileview_tile_1);
+            lv_obj_set_size(scope_btn, APP_STYLE_ICON_WIDTH_HEIGHT, APP_STYLE_ICON_WIDTH_HEIGHT);
+            lv_obj_set_style_radius(scope_btn, 20, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_bg_color(scope_btn, lv_color_hex(0x0E2640), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(scope_btn, LV_OPA_COVER, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_shadow_width(scope_btn, 0, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_border_width(scope_btn, 0, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_bg_color(scope_btn, lv_color_hex(0x091A30), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_PRESSED);
+#if defined SCREEN_ROTATION_DIRECTION_0
+            lv_obj_align(scope_btn, LV_ALIGN_TOP_LEFT,
+                         _app_style.icon.edge_distance.width,
+                         _app_style.icon.edge_distance.height + 300 + _app_style.icon.icon_distance.height);
+#elif defined SCREEN_ROTATION_DIRECTION_90
+            lv_obj_align(scope_btn, LV_ALIGN_TOP_LEFT,
+                         _app_style.icon.edge_distance.width + 400,
+                         _app_style.icon.edge_distance.height + _app_style.icon.icon_distance.height);
+#endif
+            lv_obj_t *icon_lbl = lv_label_create(scope_btn);
+            lv_label_set_text(icon_lbl, LV_SYMBOL_EYE_OPEN);
+            lv_obj_set_style_text_font(icon_lbl, &lv_font_montserrat_48, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_text_color(icon_lbl, lv_color_hex(0x00e5a0), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_center(icon_lbl);
+
+            lv_obj_t *scope_label = lv_label_create(tileview_tile_1);
+            lv_label_set_text(scope_label, "Scope");
+            lv_obj_set_style_text_align(scope_label, LV_TEXT_ALIGN_CENTER, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_text_font(scope_label, &lv_font_montserrat_22, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_size(scope_label, _app_style.label.width, _app_style.label.height);
+            lv_obj_set_style_text_color(scope_label, lv_color_white(), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_align_to(scope_label, scope_btn, LV_ALIGN_OUT_BOTTOM_MID, 0, 0);
+
+            lv_obj_add_event_cb(scope_btn, [](lv_event_t *e)
+                                {
+                                    System *self = static_cast<System *>(lv_event_get_user_data(e));
+                                    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+                                    self->init_win_scope();
+                                    lv_screen_load_anim(self->_registry.win.scope.root, LV_SCR_LOAD_ANIM_FADE_OUT, 500, 0, true);
+                                }, LV_EVENT_ALL, this);
         }
 
         // 时钟
@@ -768,6 +929,15 @@ namespace Lvgl_Ui
                                 default:
                                 break;
                                 } }, LV_EVENT_ALL, this);
+
+        // Settings icon click handler
+        lv_obj_add_event_cb(image_button_fixed[1], [](lv_event_t *e) {
+            System *self = static_cast<System *>(lv_event_get_user_data(e));
+            if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+            self->set_vibration();
+            self->init_win_settings();
+            lv_screen_load_anim(self->_registry.win.settings.root, LV_SCR_LOAD_ANIM_FADE_OUT, 100, 0, true);
+        }, LV_EVENT_ALL, this);
 
         init_status_bar(_registry.win.home.root);
 
@@ -2865,7 +3035,7 @@ namespace Lvgl_Ui
 
         // Title bar
         int32_t status_h = is_landscape ? 0 : 50;  // hide status bar in landscape for max space
-        int32_t title_h = is_landscape ? 40 : 80;
+        int32_t title_h = is_landscape ? 54 : 80;
         lv_obj_t *title_bar = lv_obj_create(_registry.win.adsb.root);
         lv_obj_set_size(title_bar, w, title_h);
         lv_obj_align(title_bar, LV_ALIGN_TOP_MID, 0, status_h);
@@ -2883,7 +3053,7 @@ namespace Lvgl_Ui
 
         // Close / back button (rightmost)
         lv_obj_t *close_btn = lv_button_create(title_bar);
-        lv_obj_set_size(close_btn, is_landscape ? 36 : 50, is_landscape ? 36 : 50);
+        lv_obj_set_size(close_btn, 50, 50);
         lv_obj_align(close_btn, LV_ALIGN_RIGHT_MID, -5, 0);
         lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x404040), (lv_style_selector_t)LV_PART_MAIN);
         lv_obj_set_style_shadow_width(close_btn, 0, (lv_style_selector_t)LV_PART_MAIN);
@@ -2915,7 +3085,7 @@ namespace Lvgl_Ui
 
         // Rotate toggle button (left of close button)
         lv_obj_t *toggle_btn = lv_button_create(title_bar);
-        lv_obj_set_size(toggle_btn, is_landscape ? 100 : 110, is_landscape ? 36 : 50);
+        lv_obj_set_size(toggle_btn, is_landscape ? 100 : 110, 50);
         lv_obj_align_to(toggle_btn, close_btn, LV_ALIGN_OUT_LEFT_MID, -5, 0);
         lv_obj_set_style_bg_color(toggle_btn, lv_color_hex(0x2A5A8C), (lv_style_selector_t)LV_PART_MAIN);
         lv_obj_set_style_shadow_width(toggle_btn, 0, (lv_style_selector_t)LV_PART_MAIN);
@@ -3168,6 +3338,1788 @@ namespace Lvgl_Ui
             lv_label_set_text(_registry.win.adsb.stats_label, stats_text);
         if (_registry.win.adsb.list_label)
             lv_label_set_text(_registry.win.adsb.list_label, list_text);
+    }
+
+    // ================================================================
+    // Meshy — Meshtastic mesh messaging app
+    // ================================================================
+
+    void System::init_win_meshy(void)
+    {
+        if (_win_meshy_status_callback)
+            _win_meshy_status_callback(true);
+
+        lv_display_t *disp = lv_display_get_default();
+        int32_t w = lv_display_get_horizontal_resolution(disp);
+        int32_t h = lv_display_get_vertical_resolution(disp);
+
+        // Root screen — dark green tint
+        _registry.win.meshy.root = lv_obj_create(NULL);
+        lv_obj_set_style_bg_color(_registry.win.meshy.root, lv_color_hex(0x0A1A10), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_size(_registry.win.meshy.root, w, h);
+        lv_obj_set_scrollbar_mode(_registry.win.meshy.root, LV_SCROLLBAR_MODE_OFF);
+
+        // Status bar
+        int32_t status_h = 50;
+        init_status_bar(_registry.win.meshy.root);
+
+        // Title bar
+        int32_t title_h = 80;
+        lv_obj_t *title_bar = lv_obj_create(_registry.win.meshy.root);
+        lv_obj_set_size(title_bar, w, title_h);
+        lv_obj_set_pos(title_bar, 0, status_h);
+        lv_obj_set_style_bg_color(title_bar, lv_color_hex(0x2D8C3A), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(title_bar, LV_OPA_COVER, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_border_width(title_bar, 0, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_radius(title_bar, 0, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_pad_all(title_bar, 8, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_remove_flag(title_bar, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *title_icon = lv_label_create(title_bar);
+        lv_label_set_text(title_icon, LV_SYMBOL_WIFI);
+        lv_obj_set_style_text_font(title_icon, &lv_font_montserrat_28, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_text_color(title_icon, lv_color_white(), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_align(title_icon, LV_ALIGN_LEFT_MID, 0, 0);
+
+        lv_obj_t *title_label = lv_label_create(title_bar);
+        lv_label_set_text(title_label, " Meshy");
+        lv_obj_set_style_text_font(title_label, &lv_font_montserrat_28, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_text_color(title_label, lv_color_white(), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_align_to(title_label, title_icon, LV_ALIGN_OUT_RIGHT_MID, 4, 0);
+
+        // Close button
+        lv_obj_t *close_btn = lv_button_create(title_bar);
+        lv_obj_set_size(close_btn, 50, 50);
+        lv_obj_align(close_btn, LV_ALIGN_RIGHT_MID, -5, 0);
+        lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x1A6628), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_shadow_width(close_btn, 0, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_border_width(close_btn, 0, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_radius(close_btn, 6, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_t *close_lbl = lv_label_create(close_btn);
+        lv_label_set_text(close_lbl, LV_SYMBOL_CLOSE);
+        lv_obj_set_style_text_color(close_lbl, lv_color_white(), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_center(close_lbl);
+        lv_obj_add_event_cb(close_btn, [](lv_event_t *e) {
+            System *self = static_cast<System *>(lv_event_get_user_data(e));
+            if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+            if (self->_win_meshy_status_callback)
+                self->_win_meshy_status_callback(false);
+            lv_display_set_rotation(lv_display_get_default(), self->_home_rotation);
+            self->set_vibration();
+            self->init_win_home();
+            lv_screen_load_anim(self->_registry.win.home.root, LV_SCR_LOAD_ANIM_FADE_OUT, 100, 0, true);
+        }, LV_EVENT_ALL, this);
+
+        // Content area
+        int32_t content_top = status_h + title_h + 4;
+
+        // Stats panel — connection info, node count, freq
+        lv_obj_t *stats_panel = lv_obj_create(_registry.win.meshy.root);
+        lv_obj_set_size(stats_panel, w - 20, 90);
+        lv_obj_set_pos(stats_panel, 10, content_top);
+        lv_obj_set_style_bg_color(stats_panel, lv_color_hex(0x143020), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(stats_panel, LV_OPA_COVER, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_border_color(stats_panel, lv_color_hex(0x2D8C3A), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_border_width(stats_panel, 1, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_radius(stats_panel, 8, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_pad_all(stats_panel, 8, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_remove_flag(stats_panel, LV_OBJ_FLAG_SCROLLABLE);
+
+        _registry.win.meshy.stats_label = lv_label_create(stats_panel);
+        lv_obj_set_style_text_color(_registry.win.meshy.stats_label, lv_color_hex(0x00DD00), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_text_font(_registry.win.meshy.stats_label, &lv_font_montserrat_22, (lv_style_selector_t)LV_PART_MAIN);
+        lv_label_set_text(_registry.win.meshy.stats_label, "Initializing...");
+        lv_obj_set_width(_registry.win.meshy.stats_label, w - 40);
+        lv_obj_align(_registry.win.meshy.stats_label, LV_ALIGN_TOP_LEFT, 0, 0);
+
+        // Message list — fills remaining space
+        int32_t msg_top = content_top + 96;
+        lv_obj_t *msg_panel = lv_obj_create(_registry.win.meshy.root);
+        lv_obj_set_size(msg_panel, w - 20, h - msg_top - 4);
+        lv_obj_set_pos(msg_panel, 10, msg_top);
+        lv_obj_set_style_bg_color(msg_panel, lv_color_hex(0x0A1A10), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(msg_panel, LV_OPA_COVER, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_border_color(msg_panel, lv_color_hex(0x2D8C3A), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_border_width(msg_panel, 1, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_radius(msg_panel, 8, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_pad_all(msg_panel, 8, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_scrollbar_mode(msg_panel, LV_SCROLLBAR_MODE_ACTIVE);
+        lv_obj_add_flag(msg_panel, LV_OBJ_FLAG_SCROLL_MOMENTUM);
+        lv_obj_add_flag(msg_panel, LV_OBJ_FLAG_SCROLL_ELASTIC);
+
+        _registry.win.meshy.msg_label = nullptr;
+        _registry.win.meshy.msg_canvas = nullptr;
+        _registry.win.meshy.msg_canvas_buf = nullptr;
+
+        // Canvas for emoji-capable message display
+        int32_t msg_canvas_w = w - 40;
+        int32_t msg_canvas_max_h = 2800;  // ~100 lines at 28px — ring buffer keeps newest
+        size_t msg_buf_size = msg_canvas_w * msg_canvas_max_h * 2; // RGB565
+        _registry.win.meshy.msg_canvas_w = msg_canvas_w;
+        _registry.win.meshy.msg_canvas_max_h = msg_canvas_max_h;
+        _registry.win.meshy.msg_canvas_buf = heap_caps_aligned_alloc(64, msg_buf_size, MALLOC_CAP_SPIRAM);
+
+        if (_registry.win.meshy.msg_canvas_buf) {
+            _registry.win.meshy.msg_canvas = lv_canvas_create(msg_panel);
+            lv_canvas_set_buffer(_registry.win.meshy.msg_canvas,
+                                 _registry.win.meshy.msg_canvas_buf,
+                                 msg_canvas_w, 100, LV_COLOR_FORMAT_RGB565);
+            lv_canvas_fill_bg(_registry.win.meshy.msg_canvas, lv_color_hex(0x0A1A10), LV_OPA_COVER);
+        } else {
+            // Fallback to plain label if PSRAM alloc fails
+            _registry.win.meshy.msg_label = lv_label_create(msg_panel);
+            lv_obj_set_style_text_color(_registry.win.meshy.msg_label, lv_color_hex(0x88DDAA), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_text_font(_registry.win.meshy.msg_label, &lv_font_montserrat_22, (lv_style_selector_t)LV_PART_MAIN);
+            lv_label_set_text(_registry.win.meshy.msg_label, "Listening...");
+            lv_obj_set_width(_registry.win.meshy.msg_label, w - 40);
+        }
+
+        // Swipe to return home
+        lv_obj_add_event_cb(_registry.win.meshy.root, [](lv_event_t *e) {
+            System *self = static_cast<System *>(lv_event_get_user_data(e));
+            if (lv_event_get_code(e) != LV_EVENT_GESTURE) return;
+            lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_active());
+            if ((dir == LV_DIR_LEFT || dir == LV_DIR_RIGHT) && self->_edge_touch_flag) {
+                if (self->_win_meshy_status_callback)
+                    self->_win_meshy_status_callback(false);
+                lv_display_set_rotation(lv_display_get_default(), self->_home_rotation);
+                self->set_vibration();
+                self->init_win_home();
+                lv_screen_load_anim(self->_registry.win.home.root, LV_SCR_LOAD_ANIM_FADE_OUT, 100, 0, true);
+                self->_edge_touch_flag = false;
+            }
+        }, LV_EVENT_ALL, this);
+
+        lv_obj_update_layout(_registry.win.meshy.root);
+        _current_win = Current_Win::MESHY;
+    }
+
+    void System::win_meshy_update(const char *stats_text, const char *msg_text)
+    {
+        if (_registry.win.meshy.stats_label)
+            lv_label_set_text(_registry.win.meshy.stats_label, stats_text);
+
+        // Canvas path — full color emoji
+        if (_registry.win.meshy.msg_canvas && _registry.win.meshy.msg_canvas_buf) {
+            lv_obj_t *canvas = _registry.win.meshy.msg_canvas;
+            lv_obj_t *panel = lv_obj_get_parent(canvas);
+            int32_t cw = _registry.win.meshy.msg_canvas_w;
+            int32_t max_h = _registry.win.meshy.msg_canvas_max_h;
+            int32_t line_h = 28;  // montserrat_22 line height + spacing
+            lv_color_t text_color = lv_color_hex(0x88DDAA);
+            lv_color_t bg_color = lv_color_hex(0x0A1A10);
+            int32_t max_lines = (max_h - 10) / line_h;
+
+            // Collect pointers to the start of each line
+            // Only keep the most recent max_lines lines
+            static const char *line_starts[200];
+            static int line_lens[200];
+            int total_lines = 0;
+            const char *p = msg_text;
+            while (*p && total_lines < 200) {
+                line_starts[total_lines] = p;
+                const char *eol = p;
+                while (*eol && *eol != '\n') eol++;
+                line_lens[total_lines] = eol - p;
+                total_lines++;
+                p = *eol ? eol + 1 : eol;
+            }
+
+            // Only render the newest lines that fit
+            int render_start = 0;
+            int render_count = total_lines;
+            if (render_count > max_lines) {
+                render_start = total_lines - max_lines;
+                render_count = max_lines;
+            }
+
+            int32_t content_h = render_count * line_h + 10;
+            if (content_h < 100) content_h = 100;
+
+            // Check scroll position before update
+            bool at_bottom = true;
+            if (panel) {
+                int32_t scroll_remaining = lv_obj_get_scroll_bottom(panel);
+                at_bottom = (scroll_remaining < 60);
+            }
+
+            // Set canvas to content height and clear
+            lv_canvas_set_buffer(canvas, _registry.win.meshy.msg_canvas_buf,
+                                 cw, content_h, LV_COLOR_FORMAT_RGB565);
+            lv_canvas_fill_bg(canvas, bg_color, LV_OPA_COVER);
+
+            // Draw messages line by line with emoji support
+            draw_text_emoji_reset_pool();
+            lv_layer_t layer;
+            lv_canvas_init_layer(canvas, &layer);
+
+            int32_t y = 4;
+            static char line_buf[512];
+            for (int i = render_start; i < render_start + render_count && y < content_h - line_h; i++) {
+                int len = line_lens[i];
+                if (len > (int)sizeof(line_buf) - 1) len = sizeof(line_buf) - 1;
+                memcpy(line_buf, line_starts[i], len);
+                line_buf[len] = '\0';
+
+                draw_text_with_emoji((uint16_t *)_registry.win.meshy.msg_canvas_buf,
+                                     cw, content_h, &layer,
+                                     line_buf, 4, y,
+                                     &lv_font_montserrat_22, text_color);
+                y += line_h;
+            }
+
+            lv_canvas_finish_layer(canvas, &layer);
+
+            // Force LVGL to see new content
+            lv_canvas_set_buffer(canvas, _registry.win.meshy.msg_canvas_buf,
+                                 cw, content_h, LV_COLOR_FORMAT_RGB565);
+            lv_obj_invalidate(canvas);
+
+            // Auto-scroll to bottom if user was at bottom
+            if (panel && at_bottom) {
+                lv_obj_scroll_to_y(panel, LV_COORD_MAX, LV_ANIM_OFF);
+            }
+            return;
+        }
+
+        // Fallback: plain label (no emoji)
+        if (_registry.win.meshy.msg_label) {
+            lv_obj_t *panel = lv_obj_get_parent(_registry.win.meshy.msg_label);
+            bool at_bottom = true;
+            if (panel) {
+                int32_t scroll_remaining = lv_obj_get_scroll_bottom(panel);
+                at_bottom = (scroll_remaining < 60);
+            }
+
+            lv_label_set_text(_registry.win.meshy.msg_label, msg_text);
+
+            if (panel && at_bottom) {
+                lv_obj_scroll_to_y(panel, LV_COORD_MAX, LV_ANIM_OFF);
+            }
+        }
+    }
+
+    // ================================================================
+    // Scope — Radar-style aircraft display
+    // ================================================================
+
+    void System::init_win_scope(void)
+    {
+        if (_win_scope_status_callback)
+            _win_scope_status_callback(true);
+
+        lv_display_t *disp = lv_display_get_default();
+        int32_t w = lv_display_get_horizontal_resolution(disp);
+        int32_t h = lv_display_get_vertical_resolution(disp);
+
+        // Root screen — dark radar background
+        _registry.win.scope.root = lv_obj_create(NULL);
+        lv_obj_set_style_bg_color(_registry.win.scope.root, lv_color_hex(0x0a0e14), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_size(_registry.win.scope.root, w, h);
+        lv_obj_set_scrollbar_mode(_registry.win.scope.root, LV_SCROLLBAR_MODE_OFF);
+
+        // Status bar
+        int32_t status_h = 50;
+        init_status_bar(_registry.win.scope.root);
+
+        // Canvas — rectangular, width fills screen, height is 1.5× width (or max available)
+        int32_t canvas_margin = 4;   // minimal margin below status bar
+        int32_t canvas_w = w;
+        int32_t canvas_top = status_h + canvas_margin;
+        int32_t canvas_avail_h = h - canvas_top - 80; // room for info + detail labels below
+        int32_t canvas_h = (int32_t)(canvas_w * 1.5f);
+        if (canvas_h > canvas_avail_h) canvas_h = canvas_avail_h;
+
+        _registry.win.scope.canvas_w = canvas_w;
+        _registry.win.scope.canvas_h = canvas_h;
+
+        // Allocate canvas buffer in PSRAM — 64-byte aligned for LVGL 9 cache line
+        size_t buf_size = canvas_w * canvas_h * 2; // RGB565
+        if (!_registry.win.scope.canvas_buf) {
+            _registry.win.scope.canvas_buf = heap_caps_aligned_alloc(64, buf_size, MALLOC_CAP_SPIRAM);
+            ESP_LOGI("SCOPE", "Canvas %dx%d buf=%zuB at %p (aligned=%d)",
+                     (int)canvas_w, (int)canvas_h, buf_size,
+                     _registry.win.scope.canvas_buf,
+                     _registry.win.scope.canvas_buf ? (((uintptr_t)_registry.win.scope.canvas_buf % 64) == 0) : -1);
+        }
+        if (!_registry.win.scope.canvas_buf) {
+            ESP_LOGE("SCOPE", "Failed to allocate canvas buffer (%zu bytes)", buf_size);
+            return;
+        }
+
+        _registry.win.scope.canvas = lv_canvas_create(_registry.win.scope.root);
+        lv_canvas_set_buffer(_registry.win.scope.canvas,
+                             _registry.win.scope.canvas_buf,
+                             canvas_w, canvas_h, LV_COLOR_FORMAT_RGB565);
+        lv_obj_set_pos(_registry.win.scope.canvas, (w - canvas_w) / 2, canvas_top);
+
+        // Info label below canvas
+        _registry.win.scope.info_label = lv_label_create(_registry.win.scope.root);
+        lv_obj_set_style_text_color(_registry.win.scope.info_label, lv_color_hex(0x5c7080), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_text_font(_registry.win.scope.info_label, &lv_font_montserrat_16, (lv_style_selector_t)LV_PART_MAIN);
+        lv_label_set_text(_registry.win.scope.info_label, "Scope initializing...");
+        lv_obj_set_width(_registry.win.scope.info_label, w - 20);
+        lv_obj_set_style_text_align(_registry.win.scope.info_label, LV_TEXT_ALIGN_CENTER, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_pos(_registry.win.scope.info_label, 10, canvas_top + canvas_h + 4);
+
+        // Detail label for selected aircraft (below info)
+        _registry.win.scope.detail_label = lv_label_create(_registry.win.scope.root);
+        lv_obj_set_style_text_color(_registry.win.scope.detail_label, lv_color_hex(0x4dabf7), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_text_font(_registry.win.scope.detail_label, &lv_font_montserrat_16, (lv_style_selector_t)LV_PART_MAIN);
+        lv_label_set_text(_registry.win.scope.detail_label, "");
+        lv_obj_set_width(_registry.win.scope.detail_label, w - 20);
+        lv_obj_set_style_text_align(_registry.win.scope.detail_label, LV_TEXT_ALIGN_CENTER, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_pos(_registry.win.scope.detail_label, 10, canvas_top + canvas_h + 26);
+
+        // Zoom +/- buttons (bottom-right of canvas, overlaid)
+        int32_t zoom_btn_size = 60;
+        int32_t btn_inset = 8;
+        int32_t canvas_left = (w - canvas_w) / 2;
+        // Zoom +/- at bottom corners of canvas, 5px inset
+        auto make_zoom_btn = [&](const char *symbol, int32_t x_pos, int32_t y_pos) -> lv_obj_t * {
+            lv_obj_t *btn = lv_button_create(_registry.win.scope.root);
+            lv_obj_set_size(btn, zoom_btn_size, zoom_btn_size);
+            lv_obj_set_pos(btn, x_pos, y_pos);
+            lv_obj_set_style_bg_color(btn, lv_color_hex(0x1a3a2a), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(btn, 200, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_shadow_width(btn, 0, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_border_color(btn, lv_color_hex(0x1a5c3a), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_border_width(btn, 1, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_radius(btn, 6, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_t *lbl = lv_label_create(btn);
+            lv_label_set_text(lbl, symbol);
+            lv_obj_set_style_text_color(lbl, lv_color_hex(0x00e5a0), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_22, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_center(lbl);
+            return btn;
+        };
+
+        lv_obj_t *zoom_out_btn = make_zoom_btn(LV_SYMBOL_MINUS, canvas_left + btn_inset, canvas_top + canvas_h - zoom_btn_size - btn_inset);
+        lv_obj_t *zoom_in_btn = make_zoom_btn(LV_SYMBOL_PLUS, canvas_left + canvas_w - zoom_btn_size - btn_inset, canvas_top + canvas_h - zoom_btn_size - btn_inset);
+
+        lv_obj_add_event_cb(zoom_in_btn, [](lv_event_t *e) {
+            System *self = static_cast<System *>(lv_event_get_user_data(e));
+            if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+            auto &s = self->_registry.win.scope;
+            s.zoom *= 1.5f;
+            if (s.zoom > 8.0f) s.zoom = 8.0f;
+        }, LV_EVENT_ALL, this);
+
+        lv_obj_add_event_cb(zoom_out_btn, [](lv_event_t *e) {
+            System *self = static_cast<System *>(lv_event_get_user_data(e));
+            if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+            auto &s = self->_registry.win.scope;
+            s.zoom /= 1.5f;
+            if (s.zoom < 0.25f) { s.zoom = 0.25f; s.pan_x = 0; s.pan_y = 0; }
+        }, LV_EVENT_ALL, this);
+
+        // Close button (top-right, created after canvas so it's on top)
+        lv_obj_t *close_btn = lv_button_create(_registry.win.scope.root);
+        lv_obj_set_size(close_btn, 60, 60);
+        lv_obj_set_pos(close_btn, canvas_left + canvas_w - 60 - btn_inset, canvas_top + btn_inset);
+        lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x1a3a2a), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(close_btn, 200, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_shadow_width(close_btn, 0, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_border_color(close_btn, lv_color_hex(0x1a5c3a), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_border_width(close_btn, 1, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_radius(close_btn, 6, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_t *close_lbl = lv_label_create(close_btn);
+        lv_label_set_text(close_lbl, LV_SYMBOL_CLOSE);
+        lv_obj_set_style_text_color(close_lbl, lv_color_hex(0x00e5a0), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_text_font(close_lbl, &lv_font_montserrat_22, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_center(close_lbl);
+        lv_obj_add_event_cb(close_btn, [](lv_event_t *e) {
+            System *self = static_cast<System *>(lv_event_get_user_data(e));
+            if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+            // Stop redraw timer
+            if (self->_registry.win.scope.redraw_timer) {
+                lv_timer_delete(self->_registry.win.scope.redraw_timer);
+                self->_registry.win.scope.redraw_timer = nullptr;
+            }
+            if (self->_win_scope_status_callback)
+                self->_win_scope_status_callback(false);
+            lv_display_set_rotation(lv_display_get_default(), self->_home_rotation);
+            self->set_vibration();
+            self->init_win_home();
+            lv_screen_load_anim(self->_registry.win.home.root, LV_SCR_LOAD_ANIM_FADE_OUT, 100, 0, true);
+        }, LV_EVENT_ALL, this);
+
+        // Color mode button (top-left of canvas)
+        static const char *color_mode_labels[] = {"MONO", "RNBO", "ALT", "SPD"};
+        lv_obj_t *color_btn = lv_button_create(_registry.win.scope.root);
+        lv_obj_set_size(color_btn, 80, 60);
+        lv_obj_set_pos(color_btn, canvas_left + btn_inset, canvas_top + btn_inset);
+        lv_obj_set_style_bg_color(color_btn, lv_color_hex(0x1a3a2a), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(color_btn, 200, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_shadow_width(color_btn, 0, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_border_color(color_btn, lv_color_hex(0x1a5c3a), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_border_width(color_btn, 1, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_radius(color_btn, 6, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_t *color_lbl = lv_label_create(color_btn);
+        lv_label_set_text(color_lbl, color_mode_labels[_registry.win.scope.color_mode]);
+        lv_obj_set_style_text_color(color_lbl, lv_color_hex(0x00e5a0), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_text_font(color_lbl, &lv_font_montserrat_14, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_center(color_lbl);
+        lv_obj_add_event_cb(color_btn, [](lv_event_t *e) {
+            System *self = static_cast<System *>(lv_event_get_user_data(e));
+            if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+            auto &s = self->_registry.win.scope;
+            s.color_mode = (s.color_mode + 1) % 4;
+            lv_obj_t *lbl = lv_obj_get_child(lv_event_get_target_obj(e), 0);
+            if (lbl) lv_label_set_text(lbl, color_mode_labels[s.color_mode]);
+        }, LV_EVENT_ALL, this);
+
+        // Reset pan/zoom on entry (keep selected_icao and color_mode across visits)
+        _registry.win.scope.pan_x = 0;
+        _registry.win.scope.pan_y = 0;
+        _registry.win.scope.zoom = 1.0f;
+
+        // Touch events on canvas — drag to pan, tap to select aircraft
+        lv_obj_add_flag(_registry.win.scope.canvas, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_remove_flag(_registry.win.scope.canvas, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(_registry.win.scope.canvas, LV_OBJ_FLAG_GESTURE_BUBBLE);
+        lv_obj_add_event_cb(_registry.win.scope.canvas, [](lv_event_t *e) {
+            System *self = static_cast<System *>(lv_event_get_user_data(e));
+            lv_event_code_t code = lv_event_get_code(e);
+            if (code != LV_EVENT_PRESSED && code != LV_EVENT_PRESSING &&
+                code != LV_EVENT_RELEASED && code != LV_EVENT_PRESS_LOST) return;
+            lv_indev_t *indev = lv_indev_active();
+            if (!indev) return;
+            lv_point_t p;
+            lv_indev_get_point(indev, &p);
+
+            auto &s = self->_registry.win.scope;
+            // Track last known good touch position
+            static int32_t last_x = 0, last_y = 0;
+
+            if (code == LV_EVENT_PRESSED) {
+                s.touch_active = true;
+                s.touch_start_x = p.x;
+                s.touch_start_y = p.y;
+                s.pan_start_x = s.pan_x;
+                s.pan_start_y = s.pan_y;
+                last_x = p.x; last_y = p.y;
+            }
+            else if (code == LV_EVENT_PRESSING) {
+                if (s.touch_active) {
+                    s.pan_x = s.pan_start_x + (p.x - s.touch_start_x);
+                    s.pan_y = s.pan_start_y + (p.y - s.touch_start_y);
+                    last_x = p.x; last_y = p.y;
+                }
+            }
+            else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+                if (s.touch_active) {
+                    // Use last known position — RELEASED may not have valid coords
+                    int32_t dx = last_x - s.touch_start_x;
+                    int32_t dy = last_y - s.touch_start_y;
+                    // If barely moved, treat as tap → select aircraft
+                    if (dx * dx + dy * dy < 400) {  // ~20px movement threshold
+                        int32_t canvas_x_off = lv_obj_get_x(s.canvas);
+                        int32_t canvas_y_off = lv_obj_get_y(s.canvas);
+                        int32_t tap_cx = last_x - canvas_x_off;
+                        int32_t tap_cy = last_y - canvas_y_off;
+
+                        // Check if this tap is near the last tap (cycle mode)
+                        int32_t ldx = tap_cx - s.last_tap_x;
+                        int32_t ldy = tap_cy - s.last_tap_y;
+                        bool same_area = (s.last_tap_x >= 0 && ldx * ldx + ldy * ldy < 2500);
+
+                        if (same_area && s.tap_candidate_count > 1) {
+                            // Cycle to next candidate
+                            s.tap_cycle_idx = (s.tap_cycle_idx + 1) % s.tap_candidate_count;
+                            s.selected_icao = s.tap_candidates[s.tap_cycle_idx];
+                        } else {
+                            // Build new candidate list — static to avoid stack overflow in LVGL task
+                            static scope_aircraft_t ac_buf[64];
+                            int ac_cnt = adsb_get_aircraft_for_scope(ac_buf, 64);
+                            receiver_pos_t rx = adsb_get_receiver_pos();
+                            bool has_fix = rx.fix_valid;
+                            double center_lat = rx.lat, center_lon = rx.lon;
+
+                            if (!has_fix) {
+                                double sl = 0, sn = 0; int np = 0;
+                                for (int i = 0; i < ac_cnt; i++) {
+                                    if (ac_buf[i].has_position) { sl += ac_buf[i].lat; sn += ac_buf[i].lon; np++; }
+                                }
+                                if (np > 0) { center_lat = sl / np; center_lon = sn / np; }
+                            }
+
+                            int32_t cx = s.canvas_w / 2;
+                            int32_t cy = s.canvas_h / 2;
+                            double cos_lat = cos(center_lat * M_PI / 180.0);
+                            double scale = (double)(cx - 20) / (double)s.range_nm;
+
+                            // Collect candidates within 60px, sorted by distance
+                            struct { uint32_t icao; int32_t dsq; } cands[8];
+                            int ncands = 0;
+                            for (int i = 0; i < ac_cnt && ncands < 8; i++) {
+                                if (!ac_buf[i].has_position) continue;
+                                int32_t ax, ay;
+                                if (has_fix) {
+                                    double brd = ac_buf[i].bearing_deg * M_PI / 180.0;
+                                    ax = cx + (int32_t)(ac_buf[i].dist_nm * sin(brd) * scale + s.pan_x);
+                                    ay = cy + (int32_t)(-ac_buf[i].dist_nm * cos(brd) * scale + s.pan_y);
+                                } else {
+                                    double ddx = (ac_buf[i].lon - center_lon) * 60.0 * cos_lat;
+                                    double ddy = -(ac_buf[i].lat - center_lat) * 60.0;
+                                    ax = cx + (int32_t)(ddx * scale + s.pan_x);
+                                    ay = cy + (int32_t)(ddy * scale + s.pan_y);
+                                }
+                                int32_t tdx = tap_cx - ax, tdy = tap_cy - ay;
+                                int32_t dsq = tdx * tdx + tdy * tdy;
+                                if (dsq < 3600) { // 60px radius
+                                    cands[ncands++] = { ac_buf[i].icao, dsq };
+                                }
+                            }
+                            // Sort by distance
+                            for (int i = 0; i < ncands - 1; i++)
+                                for (int j = i + 1; j < ncands; j++)
+                                    if (cands[j].dsq < cands[i].dsq) {
+                                        auto tmp = cands[i]; cands[i] = cands[j]; cands[j] = tmp;
+                                    }
+
+                            s.tap_candidate_count = ncands;
+                            s.tap_cycle_idx = 0;
+                            for (int i = 0; i < ncands; i++) s.tap_candidates[i] = cands[i].icao;
+                            s.last_tap_x = tap_cx;
+                            s.last_tap_y = tap_cy;
+
+                            if (ncands > 0) {
+                                s.selected_icao = (s.tap_candidates[0] == s.selected_icao && ncands == 1) ? 0 : s.tap_candidates[0];
+                            } else {
+                                s.selected_icao = 0;
+                            }
+                        }
+                    } else {
+                        // Was a drag, clear tap cycle state
+                        s.last_tap_x = -1;
+                        s.tap_candidate_count = 0;
+                    }
+                    s.touch_active = false;
+                }
+            }
+        }, LV_EVENT_ALL, this);
+
+        // Swipe to return home
+        lv_obj_add_event_cb(_registry.win.scope.root, [](lv_event_t *e) {
+            System *self = static_cast<System *>(lv_event_get_user_data(e));
+            if (lv_event_get_code(e) != LV_EVENT_GESTURE) return;
+            lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_active());
+            if ((dir == LV_DIR_LEFT || dir == LV_DIR_RIGHT) && self->_edge_touch_flag) {
+                // Stop redraw timer
+                if (self->_registry.win.scope.redraw_timer) {
+                    lv_timer_delete(self->_registry.win.scope.redraw_timer);
+                    self->_registry.win.scope.redraw_timer = nullptr;
+                }
+                if (self->_win_scope_status_callback)
+                    self->_win_scope_status_callback(false);
+                lv_display_set_rotation(lv_display_get_default(), self->_home_rotation);
+                self->set_vibration();
+                self->init_win_home();
+                lv_screen_load_anim(self->_registry.win.home.root, LV_SCR_LOAD_ANIM_FADE_OUT, 100, 0, true);
+                self->_edge_touch_flag = false;
+            }
+        }, LV_EVENT_ALL, this);
+
+        // Create LVGL timer for periodic redraw (runs inside lv_timer_handler context)
+        // This is critical — canvas pixel buffer changes are only visible to LVGL
+        // when invalidated from within the LVGL timer/render cycle.
+        if (_registry.win.scope.redraw_timer) {
+            lv_timer_delete(_registry.win.scope.redraw_timer);
+        }
+        _registry.win.scope.redraw_timer = lv_timer_create([](lv_timer_t *t) {
+            System *self = static_cast<System *>(lv_timer_get_user_data(t));
+            if (self->get_current_win() == Current_Win::SCOPE) {
+                self->win_scope_redraw();
+            }
+        }, 100, this);  // initial 100ms, adaptive code adjusts per frame
+
+        // Initial draw
+        win_scope_redraw();
+
+        lv_obj_update_layout(_registry.win.scope.root);
+        _current_win = Current_Win::SCOPE;
+    }
+
+    // --- Scope color helpers (matching ADS-B Scope web app) ---
+    static lv_color_t hsl_to_lv_color(float h, float s, float l) {
+        // h: 0-360, s: 0-1, l: 0-1
+        float c = (1.0f - fabsf(2.0f * l - 1.0f)) * s;
+        float x = c * (1.0f - fabsf(fmodf(h / 60.0f, 2.0f) - 1.0f));
+        float m = l - c / 2.0f;
+        float r = 0, g = 0, b = 0;
+        if (h < 60)       { r = c; g = x; }
+        else if (h < 120) { r = x; g = c; }
+        else if (h < 180) { g = c; b = x; }
+        else if (h < 240) { g = x; b = c; }
+        else if (h < 300) { r = x; b = c; }
+        else              { r = c; b = x; }
+        return lv_color_make((uint8_t)((r + m) * 255), (uint8_t)((g + m) * 255), (uint8_t)((b + m) * 255));
+    }
+
+    static lv_color_t scope_aircraft_color(int color_mode, uint32_t icao, int altitude, int speed) {
+        switch (color_mode) {
+            case 0: // MONO — green
+                return lv_color_hex(0x00e5a0);
+            case 1: { // RAINBOW — hash of ICAO
+                uint32_t h = 0;
+                // Same DJB2-like hash as ADS-B Scope: h = (h*31 + byte) & 0xFFFF
+                h = ((icao >> 20) & 0xF); // hash the hex digits
+                for (int i = 0; i < 6; i++) {
+                    uint8_t nibble = (icao >> (20 - i * 4)) & 0xF;
+                    uint8_t ch = nibble < 10 ? '0' + nibble : 'A' + nibble - 10;
+                    h = (h * 31 + ch) & 0xFFFF;
+                }
+                return hsl_to_lv_color((float)(h % 360), 0.85f, 0.60f);
+            }
+            case 2: { // ALT — blue(low) → green → yellow → red(high)
+                float a = (float)(altitude < 0 ? 0 : (altitude > 45000 ? 45000 : altitude));
+                float hue = 240.0f - (a / 45000.0f) * 240.0f;
+                return hsl_to_lv_color(hue, 0.85f, 0.55f);
+            }
+            case 3: { // SPD — green(slow) → yellow → red(fast)
+                float s = (float)(speed < 0 ? 0 : (speed > 500 ? 500 : speed));
+                float hue = 120.0f - (s / 500.0f) * 120.0f;
+                return hsl_to_lv_color(hue, 0.85f, 0.55f);
+            }
+            default:
+                return lv_color_hex(0x00e5a0);
+        }
+    }
+
+    void System::win_scope_redraw(void)
+    {
+        lv_obj_t *canvas = _registry.win.scope.canvas;
+        if (!canvas || !_registry.win.scope.canvas_buf) return;
+
+        int64_t render_start = esp_timer_get_time();
+
+        int32_t cw = _registry.win.scope.canvas_w;
+        int32_t ch = _registry.win.scope.canvas_h;
+        int32_t cx = cw / 2;
+        int32_t cy = ch / 2;
+
+        // Static text buffers — LVGL 9 canvas draw is deferred; dsc.text must
+        // persist until lv_canvas_finish_layer() renders everything.
+        static char ring_labels[8][16];
+        static char ac_labels[64][28];
+
+        // Colors
+        lv_color_t col_bg    = lv_color_hex(0x0a0e14);
+        lv_color_t col_ring  = lv_color_hex(0x1a5c3a);  // green rings (outer)
+        lv_color_t col_ring2 = lv_color_hex(0x0e3320);  // green rings (inner, dimmer)
+        lv_color_t col_rx    = lv_color_hex(0x00e5a0);
+        lv_color_t col_label = lv_color_hex(0x1a5c3a);  // green label text
+
+        // Clear canvas
+        lv_canvas_fill_bg(canvas, col_bg, LV_OPA_COVER);
+
+        // Get aircraft data — apply max aircraft limit from settings
+        static scope_aircraft_t ac[64];
+        int max_ac = 64;
+        if (g_settings.scope_max_aircraft > 0 && g_settings.scope_max_aircraft < 64)
+            max_ac = g_settings.scope_max_aircraft;
+        int ac_count = adsb_get_aircraft_for_scope(ac, max_ac);
+        receiver_pos_t rx = adsb_get_receiver_pos();
+
+        // Count positioned aircraft
+        int positioned = 0;
+        for (int i = 0; i < ac_count; i++) {
+            if (ac[i].has_position) positioned++;
+        }
+
+        // Determine center and scale
+        bool has_fix = rx.fix_valid;
+        double center_lat = rx.lat, center_lon = rx.lon;
+
+        // If no GPS fix, center on average of aircraft positions
+        if (!has_fix && positioned > 0) {
+            double sum_lat = 0, sum_lon = 0;
+            for (int i = 0; i < ac_count; i++) {
+                if (ac[i].has_position) {
+                    sum_lat += ac[i].lat;
+                    sum_lon += ac[i].lon;
+                }
+            }
+            center_lat = sum_lat / positioned;
+            center_lon = sum_lon / positioned;
+        }
+
+        // Compute pixel positions for each aircraft
+        // We need this before range calc. Use haversine-like approximation.
+        // For display purposes, simple equirectangular projection is fine.
+        double cos_lat = cos(center_lat * M_PI / 180.0);
+        double nm_per_deg_lat = 60.0;       // 1 deg lat ≈ 60 nm
+        double nm_per_deg_lon = 60.0 * cos_lat;
+
+        // Calculate distance from center for all positioned aircraft
+        static double ac_dx[64], ac_dy[64], ac_dist[64];
+        memset(ac_dx, 0, sizeof(ac_dx));
+        memset(ac_dy, 0, sizeof(ac_dy));
+        memset(ac_dist, 0, sizeof(ac_dist));
+        double max_range_nm = 0;
+        for (int i = 0; i < ac_count; i++) {
+            if (!ac[i].has_position) continue;
+            if (has_fix) {
+                // Use precomputed haversine distance/bearing
+                ac_dx[i] = ac[i].dist_nm * sin(ac[i].bearing_deg * M_PI / 180.0);
+                ac_dy[i] = -ac[i].dist_nm * cos(ac[i].bearing_deg * M_PI / 180.0);  // -Y = north
+                ac_dist[i] = ac[i].dist_nm;
+            } else {
+                // Equirectangular from centroid
+                ac_dx[i] = (ac[i].lon - center_lon) * nm_per_deg_lon;
+                ac_dy[i] = -(ac[i].lat - center_lat) * nm_per_deg_lat;  // -Y = north
+                ac_dist[i] = sqrt(ac_dx[i] * ac_dx[i] + ac_dy[i] * ac_dy[i]);
+            }
+            if (ac_dist[i] > max_range_nm) max_range_nm = ac_dist[i];
+        }
+
+        // Snap to nice range values (default 50nm when no positioned aircraft)
+        double range_nm;
+        if (positioned == 0) range_nm = 50.0;  // no positioned aircraft — nice default
+        else if (max_range_nm <= 10.0) range_nm = 10.0;
+        else if (max_range_nm <= 25.0) range_nm = 25.0;
+        else if (max_range_nm <= 50.0) range_nm = 50.0;
+        else if (max_range_nm <= 100.0) range_nm = 100.0;
+        else range_nm = 200.0;
+
+        // Apply zoom
+        range_nm /= _registry.win.scope.zoom;
+        _registry.win.scope.range_nm = (float)range_nm;
+        double scale = (double)(cx - 20) / range_nm; // pixels per nm
+
+        // Pan offset
+        float pan_x = _registry.win.scope.pan_x;
+        float pan_y = _registry.win.scope.pan_y;
+
+        lv_layer_t layer;
+        lv_canvas_init_layer(canvas, &layer);
+
+        if (has_fix) {
+            // Dynamic range rings — pick from standard distances, draw all that
+            // are visible on screen with enough spacing to be readable
+            static const double ring_nms[] = {1, 2, 5, 10, 25, 50, 100, 150, 200};
+            static const int ring_nm_count = sizeof(ring_nms) / sizeof(ring_nms[0]);
+            int ring_drawn = 0;
+
+            for (int r = 0; r < ring_nm_count && ring_drawn < 8; r++) {
+                int32_t radius = (int32_t)(ring_nms[r] * scale);
+
+                // Skip if too small to be useful
+                if (radius < 35) continue;
+                // Cap radius to prevent LVGL renderer overflow
+                if (radius > cw) break;
+
+                // Skip if arc doesn't intersect canvas at all
+                int32_t arc_cx = cx + (int32_t)pan_x;
+                int32_t arc_cy = cy + (int32_t)pan_y;
+                if (arc_cx + radius < 0 || arc_cx - radius > cw ||
+                    arc_cy + radius < 0 || arc_cy - radius > ch) continue;
+
+                // Outer rings brighter, inner rings dimmer
+                bool is_outermost = (r == ring_nm_count - 1) ||
+                    ((int32_t)(ring_nms[r + 1] * scale) > cw);
+                lv_color_t ring_col = is_outermost ? col_ring : col_ring2;
+
+                lv_draw_arc_dsc_t arc_dsc;
+                lv_draw_arc_dsc_init(&arc_dsc);
+                arc_dsc.color = ring_col;
+                arc_dsc.width = 2;
+                arc_dsc.center.x = cx + (int32_t)pan_x;
+                arc_dsc.center.y = cy + (int32_t)pan_y;
+                arc_dsc.radius = radius;
+                arc_dsc.start_angle = 0;
+                arc_dsc.end_angle = 360;
+                arc_dsc.opa = LV_OPA_COVER;
+                lv_draw_arc(&layer, &arc_dsc);
+
+                // Label just inside the ring, north side (skip if off-canvas)
+                int32_t lbl_y = cy + (int32_t)pan_y - radius + 4;
+                if (lbl_y > -16 && lbl_y < ch) {
+                    int nm_int = (int)ring_nms[r];
+                    snprintf(ring_labels[ring_drawn], sizeof(ring_labels[ring_drawn]),
+                             "%d nm", nm_int);
+                    lv_draw_label_dsc_t lbl_dsc;
+                    lv_draw_label_dsc_init(&lbl_dsc);
+                    lbl_dsc.color = col_label;
+                    lbl_dsc.font = &lv_font_montserrat_14;
+                    lbl_dsc.opa = LV_OPA_COVER;
+                    lbl_dsc.text = ring_labels[ring_drawn];
+                    lv_area_t lbl_area;
+                    lbl_area.x1 = cx + (int32_t)pan_x + 4;
+                    lbl_area.y1 = lbl_y;
+                    lbl_area.x2 = lbl_area.x1 + 60;
+                    lbl_area.y2 = lbl_area.y1 + 16;
+                    lv_draw_label(&layer, &lbl_dsc, &lbl_area);
+                }
+
+                ring_drawn++;
+            }
+
+            // Receiver dot (skip if center is way off canvas)
+            int32_t rx_cx = cx + (int32_t)pan_x;
+            int32_t rx_cy = cy + (int32_t)pan_y;
+            if (rx_cx > -50 && rx_cx < cw + 50 && rx_cy > -50 && rx_cy < ch + 50) {
+                lv_draw_arc_dsc_t rx_dsc;
+                lv_draw_arc_dsc_init(&rx_dsc);
+                rx_dsc.color = col_rx;
+                rx_dsc.width = 4;
+                rx_dsc.center.x = rx_cx;
+                rx_dsc.center.y = rx_cy;
+                rx_dsc.radius = 4;
+                rx_dsc.start_angle = 0;
+                rx_dsc.end_angle = 360;
+                rx_dsc.opa = LV_OPA_COVER;
+                lv_draw_arc(&layer, &rx_dsc);
+            }
+        } else {
+            // No GPS fix — draw a scale bar in bottom-left corner
+            // Pick a nice scale: find largest round distance that fits in ~1/4 canvas width
+            double bar_target_px = (double)cw * 0.25;
+            double bar_nm_options[] = {1, 2, 5, 10, 25, 50, 100};
+            double bar_nm = 10;
+            for (int i = 6; i >= 0; i--) {
+                if (bar_nm_options[i] * scale <= bar_target_px) { bar_nm = bar_nm_options[i]; break; }
+            }
+            int32_t bar_px = (int32_t)(bar_nm * scale);
+            if (bar_px < 20) bar_px = 20;
+            int32_t bar_x = 16;
+            int32_t bar_y = ch - 84;  // above zoom-out button (60px + 8px inset + margin)
+
+            // Scale bar line
+            lv_draw_line_dsc_t bar_dsc;
+            lv_draw_line_dsc_init(&bar_dsc);
+            bar_dsc.color = col_ring;
+            bar_dsc.width = 2;
+            bar_dsc.opa = LV_OPA_COVER;
+            bar_dsc.p1.x = bar_x; bar_dsc.p1.y = bar_y;
+            bar_dsc.p2.x = bar_x + bar_px; bar_dsc.p2.y = bar_y;
+            lv_draw_line(&layer, &bar_dsc);
+            // End caps
+            bar_dsc.p1.y = bar_y - 4; bar_dsc.p2.x = bar_x; bar_dsc.p2.y = bar_y + 4;
+            lv_draw_line(&layer, &bar_dsc);
+            bar_dsc.p1.x = bar_x + bar_px; bar_dsc.p1.y = bar_y - 4;
+            bar_dsc.p2.x = bar_x + bar_px; bar_dsc.p2.y = bar_y + 4;
+            lv_draw_line(&layer, &bar_dsc);
+
+            // Scale label
+            static char scale_label[16];
+            snprintf(scale_label, sizeof(scale_label), "%dnm", (int)bar_nm);
+            lv_draw_label_dsc_t slbl;
+            lv_draw_label_dsc_init(&slbl);
+            slbl.color = col_label;
+            slbl.font = &lv_font_montserrat_14;
+            slbl.opa = LV_OPA_COVER;
+            slbl.text = scale_label;
+            lv_area_t sa;
+            sa.x1 = bar_x + bar_px + 6;
+            sa.y1 = bar_y - 8;
+            sa.x2 = sa.x1 + 60;
+            sa.y2 = sa.y1 + 16;
+            lv_draw_label(&layer, &slbl, &sa);
+        }
+
+        // Draw crosshair lines (always)
+        lv_draw_line_dsc_t line_dsc;
+        lv_draw_line_dsc_init(&line_dsc);
+        line_dsc.color = col_ring2;
+        line_dsc.width = 1;
+        line_dsc.opa = 60;
+        line_dsc.p1.x = cx; line_dsc.p1.y = 0;
+        line_dsc.p2.x = cx; line_dsc.p2.y = ch;
+        lv_draw_line(&layer, &line_dsc);
+        line_dsc.p1.x = 0; line_dsc.p1.y = cy;
+        line_dsc.p2.x = cw; line_dsc.p2.y = cy;
+        lv_draw_line(&layer, &line_dsc);
+
+        // Cardinal labels (string literals — safe for deferred draw)
+        static const char *cardinals[] = {"N", "E", "S", "W"};
+        int32_t card_x[] = {cx - 4, cw - 18, cx - 4, 4};
+        int32_t card_y[] = {4, cy - 8, ch - 20, cy - 8};
+        for (int i = 0; i < 4; i++) {
+            lv_draw_label_dsc_t cdsc;
+            lv_draw_label_dsc_init(&cdsc);
+            cdsc.color = col_label;
+            cdsc.font = &lv_font_montserrat_14;
+            cdsc.opa = LV_OPA_COVER;
+            cdsc.text = cardinals[i];
+            lv_area_t ca;
+            ca.x1 = card_x[i]; ca.y1 = card_y[i];
+            ca.x2 = ca.x1 + 20; ca.y2 = ca.y1 + 16;
+            lv_draw_label(&layer, &cdsc, &ca);
+        }
+
+        // --- Trail data (recorded by scope_trail_timer_cb at 1Hz from boot) ---
+        // Just reference the file-scope g_trails / g_trail_count for drawing.
+
+        // Draw trails — budget-based to prevent watchdog on busy airspace
+        // Total trail line draws capped at ~800 to stay under render budget
+        #define SCOPE_TRAIL_BUDGET 800
+        #define SCOPE_TRAIL_MAX_DRAW 60
+        if (g_trails) {
+          // Count visible trails to compute per-trail segment budget
+          int visible_trails = 0;
+          for (int t = 0; t < g_trail_count; t++) {
+              if (g_trails[t].count < 2) continue;
+              visible_trails++;
+          }
+          int segs_per_trail = (visible_trails > 0) ?
+              (SCOPE_TRAIL_BUDGET / visible_trails) : SCOPE_TRAIL_MAX_DRAW;
+          if (segs_per_trail > SCOPE_TRAIL_MAX_DRAW) segs_per_trail = SCOPE_TRAIL_MAX_DRAW;
+          if (segs_per_trail < 4) segs_per_trail = 4;  // minimum for recognizable trail
+
+          for (int t = 0; t < g_trail_count; t++) {
+            if (g_trails[t].count < 2) continue;
+            int trail_alt = 0, trail_spd = 0;
+            int32_t trail_age_ms = 999000;  // assume stale if not found
+            for (int a = 0; a < ac_count; a++) {
+                if (ac[a].icao == g_trails[t].icao) {
+                    trail_alt = ac[a].altitude; trail_spd = ac[a].speed;
+                    trail_age_ms = ac[a].age_ms; break;
+                }
+            }
+            bool trail_gray = (trail_age_ms > 60000);
+            lv_color_t trail_ac_color = trail_gray ? lv_color_hex(0x556677) :
+                scope_aircraft_color(_registry.win.scope.color_mode,
+                                     g_trails[t].icao, trail_alt, trail_spd);
+            bool trail_sel = (g_trails[t].icao == _registry.win.scope.selected_icao);
+            if (trail_sel && _registry.win.scope.color_mode == 0 && !trail_gray)
+                trail_ac_color = lv_color_hex(0x4dabf7);
+            int trail_width = (visible_trails > 20) ? 1 : 2;
+            if (trail_sel) trail_width = 3;  // selected trail always prominent
+            int total = g_trails[t].count;
+            int step = (total > segs_per_trail) ? total / segs_per_trail : 1;
+            int start = (g_trails[t].head - total + SCOPE_TRAIL_DEPTH) % SCOPE_TRAIL_DEPTH;
+            int32_t prev_x = -1, prev_y = -1;
+            int draw_idx = 0;
+            int actual_segs = total / step;
+            for (int j = 0; j < total; j += step) {
+                int idx = (start + j) % SCOPE_TRAIL_DEPTH;
+                double pt_dx = (g_trails[t].pts[idx].lon - center_lon) * nm_per_deg_lon;
+                double pt_dy = -(g_trails[t].pts[idx].lat - center_lat) * nm_per_deg_lat;
+                int32_t tx = cx + (int32_t)(pt_dx * scale + pan_x);
+                int32_t ty = cy + (int32_t)(pt_dy * scale + pan_y);
+                if (tx < 0 || tx > cw || ty < 0 || ty > ch) { prev_x = -1; draw_idx++; continue; }
+                if (prev_x >= 0) {
+                    lv_draw_line_dsc_t tdsc;
+                    lv_draw_line_dsc_init(&tdsc);
+                    tdsc.color = trail_ac_color;
+                    tdsc.width = trail_width;
+                    tdsc.opa = trail_sel ? 220 : (uint8_t)(80 + (draw_idx * 140) / (actual_segs > 0 ? actual_segs : 1));
+                    tdsc.p1.x = prev_x; tdsc.p1.y = prev_y;
+                    tdsc.p2.x = tx; tdsc.p2.y = ty;
+                    lv_draw_line(&layer, &tdsc);
+                }
+                prev_x = tx; prev_y = ty;
+                draw_idx++;
+            }
+            // Connect to most recent point
+            if (total > 1 && step > 1) {
+                int last_idx = (g_trails[t].head - 1 + SCOPE_TRAIL_DEPTH) % SCOPE_TRAIL_DEPTH;
+                double pt_dx = (g_trails[t].pts[last_idx].lon - center_lon) * nm_per_deg_lon;
+                double pt_dy = -(g_trails[t].pts[last_idx].lat - center_lat) * nm_per_deg_lat;
+                int32_t tx = cx + (int32_t)(pt_dx * scale + pan_x);
+                int32_t ty = cy + (int32_t)(pt_dy * scale + pan_y);
+                if (prev_x >= 0 && tx >= 0 && tx <= cw && ty >= 0 && ty <= ch) {
+                    lv_draw_line_dsc_t tdsc;
+                    lv_draw_line_dsc_init(&tdsc);
+                    tdsc.color = trail_ac_color;
+                    tdsc.width = trail_width;
+                    tdsc.opa = 220;
+                    tdsc.p1.x = prev_x; tdsc.p1.y = prev_y;
+                    tdsc.p2.x = tx; tdsc.p2.y = ty;
+                    lv_draw_line(&layer, &tdsc);
+                }
+            }
+          }
+        } // end if(g_trails)
+
+        // Draw aircraft
+        int drawn = 0;
+        int visible = 0;
+        lv_color_t col_gray = lv_color_hex(0x667788);
+        for (int i = 0; i < ac_count && drawn < 64; i++) {
+            if (!ac[i].has_position) continue;
+
+            bool selected = (ac[i].icao == _registry.win.scope.selected_icao);
+
+            // Age-based visibility (matching ADS-B Scope webapp rules):
+            // <30s  → full opacity, normal color
+            // 30-60s → 50% opacity, normal color
+            // >60s  → 35% opacity, gray color
+            // >180s → skip unless selected (accessor already filters at 180s)
+            int32_t age_s = ac[i].age_ms / 1000;
+            uint8_t age_opa;
+            bool age_gray;
+            if (age_s < 30)       { age_opa = 255; age_gray = false; }
+            else if (age_s < 60)  { age_opa = 128; age_gray = false; }
+            else                  { age_opa = 90;  age_gray = true;  }
+            // Selected aircraft stay visible
+            if (selected && age_opa < 200) age_opa = 200;
+
+            // Convert to pixel coordinates
+            int32_t ax = cx + (int32_t)(ac_dx[i] * scale + pan_x);
+            int32_t ay = cy + (int32_t)(ac_dy[i] * scale + pan_y);
+
+            // Clamp to canvas (with margin for labels)
+            if (ax < 2 || ax > cw - 2 || ay < 2 || ay > ch - 2) { continue; }
+
+            lv_color_t ac_color = age_gray ? col_gray :
+                scope_aircraft_color(_registry.win.scope.color_mode,
+                                     ac[i].icao, ac[i].altitude, ac[i].speed);
+            lv_color_t dot_color = ac_color;
+            // In MONO mode, selected aircraft uses blue
+            if (selected && _registry.win.scope.color_mode == 0 && !age_gray) {
+                dot_color = lv_color_hex(0x4dabf7);
+            }
+
+            // Aircraft dot — selected gets bigger + outer ring for emphasis
+            lv_draw_arc_dsc_t ac_dsc;
+            lv_draw_arc_dsc_init(&ac_dsc);
+            ac_dsc.color = dot_color;
+            ac_dsc.width = selected ? 5 : 3;
+            ac_dsc.center.x = ax;
+            ac_dsc.center.y = ay;
+            ac_dsc.radius = selected ? 5 : 3;
+            ac_dsc.start_angle = 0;
+            ac_dsc.end_angle = 360;
+            ac_dsc.opa = age_opa;
+            lv_draw_arc(&layer, &ac_dsc);
+
+            // Selection ring — white outline to make selected aircraft pop
+            if (selected) {
+                lv_draw_arc_dsc_t sel_ring;
+                lv_draw_arc_dsc_init(&sel_ring);
+                sel_ring.color = lv_color_white();
+                sel_ring.width = 2;
+                sel_ring.center.x = ax;
+                sel_ring.center.y = ay;
+                sel_ring.radius = 14;
+                sel_ring.start_angle = 0;
+                sel_ring.end_angle = 360;
+                sel_ring.opa = 220;
+                lv_draw_arc(&layer, &sel_ring);
+            }
+
+            // Heading line
+            if (ac[i].heading > 0) {
+                double hdg_rad = ac[i].heading * M_PI / 180.0;
+                int32_t hlen = selected ? 22 : 12;
+                int32_t hx = ax + (int32_t)(hlen * sin(hdg_rad));
+                int32_t hy = ay - (int32_t)(hlen * cos(hdg_rad));
+
+                lv_draw_line_dsc_t hdg_dsc;
+                lv_draw_line_dsc_init(&hdg_dsc);
+                hdg_dsc.color = dot_color;
+                hdg_dsc.width = selected ? 3 : 2;
+                hdg_dsc.opa = age_opa;
+                hdg_dsc.p1.x = ax; hdg_dsc.p1.y = ay;
+                hdg_dsc.p2.x = hx; hdg_dsc.p2.y = hy;
+                lv_draw_line(&layer, &hdg_dsc);
+            }
+
+            // Callsign + FL label (static buffer!)
+            if (ac[i].callsign[0]) {
+                snprintf(ac_labels[drawn], sizeof(ac_labels[drawn]), "%s FL%d",
+                         ac[i].callsign, ac[i].altitude / 100);
+            } else {
+                snprintf(ac_labels[drawn], sizeof(ac_labels[drawn]), "%06lX FL%d",
+                         (unsigned long)ac[i].icao, ac[i].altitude / 100);
+            }
+
+            lv_draw_label_dsc_t acdsc;
+            lv_draw_label_dsc_init(&acdsc);
+            acdsc.color = age_gray ? col_gray : ((selected && _registry.win.scope.color_mode == 0) ? lv_color_hex(0x4dabf7) : ac_color);
+            acdsc.font = &lv_font_montserrat_14;
+            acdsc.opa = (age_opa < 200) ? age_opa : 200;
+            acdsc.text = ac_labels[drawn];
+            lv_area_t ac_area;
+            ac_area.x1 = ax + 18;
+            ac_area.y1 = ay - 8;
+            ac_area.x2 = ac_area.x1 + 160;
+            ac_area.y2 = ac_area.y1 + 16;
+            lv_draw_label(&layer, &acdsc, &ac_area);
+
+            drawn++;
+            visible++;
+        }
+
+        lv_canvas_finish_layer(canvas, &layer);
+        // Force LVGL to see the new pixel data:
+        // 1. Re-set buffer flushes the image cache (LVGL 9 canvas = image widget)
+        // 2. Invalidate marks the area dirty for the current render cycle
+        // Both are needed. This runs inside lv_timer_handler() context via LVGL timer.
+        lv_canvas_set_buffer(canvas, _registry.win.scope.canvas_buf,
+                             _registry.win.scope.canvas_w, _registry.win.scope.canvas_h,
+                             LV_COLOR_FORMAT_RGB565);
+        lv_obj_invalidate(canvas);
+
+        // Store visible count
+        _registry.win.scope.visible_count = visible;
+
+        // --- Adaptive FPS based on actual render time ---
+        int64_t render_end = esp_timer_get_time();
+        uint32_t render_us = (uint32_t)(render_end - render_start);
+        _registry.win.scope.last_render_us = render_us;
+
+        // Determine target period
+        uint32_t target_period_ms;
+        if (g_settings.scope_fps_cap > 0) {
+            // User-set FPS cap
+            target_period_ms = 1000 / g_settings.scope_fps_cap;
+        } else {
+            // Auto: aim for render time < 60% of frame period (leave headroom for LVGL + touch)
+            // Minimum: render_ms * 1.7 (so render is ~60% of frame time)
+            uint32_t render_ms = render_us / 1000;
+            uint32_t min_period = (render_ms < 10) ? 33 :     // <10ms render → 30fps
+                                  (render_ms < 30) ? 50 :     // <30ms → 20fps
+                                  (render_ms < 60) ? 100 :    // <60ms → 10fps
+                                  (render_ms < 100) ? 200 :   // <100ms → 5fps
+                                  (render_ms < 200) ? 500 :   // <200ms → 2fps
+                                  1000;                        // >200ms → 1fps
+            target_period_ms = min_period;
+        }
+
+        // Clamp to 1-30 FPS range
+        if (target_period_ms < 33) target_period_ms = 33;    // max 30fps
+        if (target_period_ms > 1000) target_period_ms = 1000; // min 1fps
+
+        if (_registry.win.scope.redraw_timer) {
+            lv_timer_set_period(_registry.win.scope.redraw_timer, target_period_ms);
+        }
+
+        // Update info label with visible count
+        char info[128];
+        if (has_fix) {
+            snprintf(info, sizeof(info), "%.0fnm  %d ac  %d pos  %d vis  ~%lu FPS",
+                     range_nm, ac_count, positioned, visible, (unsigned long)(1000 / target_period_ms));
+        } else {
+            snprintf(info, sizeof(info), "%d ac  %d pos  %d vis  ~%lu FPS  no GPS",
+                     ac_count, positioned, visible, (unsigned long)(1000 / target_period_ms));
+        }
+        if (_registry.win.scope.info_label)
+            lv_label_set_text(_registry.win.scope.info_label, info);
+
+        // Update detail label for selected aircraft
+        if (_registry.win.scope.detail_label) {
+            if (_registry.win.scope.selected_icao != 0) {
+                for (int i = 0; i < ac_count; i++) {
+                    if (ac[i].icao == _registry.win.scope.selected_icao) {
+                        bool det_gray = (ac[i].age_ms > 60000);
+                        lv_color_t det_color = det_gray ? lv_color_hex(0x667788) :
+                            ((_registry.win.scope.color_mode == 0)
+                            ? lv_color_hex(0x4dabf7)
+                            : scope_aircraft_color(_registry.win.scope.color_mode,
+                                                   ac[i].icao, ac[i].altitude, ac[i].speed));
+                        lv_obj_set_style_text_color(_registry.win.scope.detail_label, det_color, (lv_style_selector_t)LV_PART_MAIN);
+                        char det[300];
+                        int p = 0;
+                        // Line 1: callsign + ICAO + msgs
+                        p += snprintf(det + p, sizeof(det) - p, "%s  %06lX  %lu msgs",
+                                     ac[i].callsign[0] ? ac[i].callsign : "----",
+                                     (unsigned long)ac[i].icao,
+                                     (unsigned long)ac[i].msg_count);
+                        // Line 2: ALT SPD HDG V/S
+                        p += snprintf(det + p, sizeof(det) - p, "\nALT %d  SPD %d  HDG %d\xC2\xB0  V/S %+d",
+                                     ac[i].altitude, ac[i].speed, ac[i].heading, ac[i].vert_rate);
+                        // Line 3: distance + bearing + age
+                        if (has_fix && ac[i].has_position) {
+                            p += snprintf(det + p, sizeof(det) - p, "\n%.1fnm  %d\xC2\xB0  %ds ago",
+                                         ac[i].dist_nm, (int)ac[i].bearing_deg, (int)(ac[i].age_ms / 1000));
+                        } else {
+                            p += snprintf(det + p, sizeof(det) - p, "\n%ds ago%s",
+                                         (int)(ac[i].age_ms / 1000), has_fix ? "" : "  (no GPS)");
+                        }
+                        lv_label_set_text(_registry.win.scope.detail_label, det);
+                        break;
+                    }
+                }
+            } else {
+                lv_label_set_text(_registry.win.scope.detail_label, "");
+            }
+        }
+    }
+
+    // ================================================================
+    // Settings — Device configuration
+    // ================================================================
+    void System::init_win_settings(void)
+    {
+        lv_display_t *disp = lv_display_get_default();
+        int32_t w = lv_display_get_horizontal_resolution(disp);
+        int32_t h = lv_display_get_vertical_resolution(disp);
+
+        // Root screen
+        _registry.win.settings.root = lv_obj_create(NULL);
+        lv_obj_set_style_bg_color(_registry.win.settings.root, lv_color_hex(0x0A0E14), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_size(_registry.win.settings.root, w, h);
+        lv_obj_set_scrollbar_mode(_registry.win.settings.root, LV_SCROLLBAR_MODE_OFF);
+
+        // Status bar
+        int32_t status_h = 50;
+        init_status_bar(_registry.win.settings.root);
+
+        // Title bar
+        int32_t title_h = 60;
+        lv_obj_t *title_bar = lv_obj_create(_registry.win.settings.root);
+        lv_obj_set_size(title_bar, w, title_h);
+        lv_obj_set_pos(title_bar, 0, status_h);
+        lv_obj_set_style_bg_color(title_bar, lv_color_hex(0x1a2a36), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(title_bar, LV_OPA_COVER, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_border_width(title_bar, 0, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_radius(title_bar, 0, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_pad_all(title_bar, 8, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_remove_flag(title_bar, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *title_icon = lv_label_create(title_bar);
+        lv_label_set_text(title_icon, LV_SYMBOL_SETTINGS);
+        lv_obj_set_style_text_font(title_icon, &lv_font_montserrat_24, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_text_color(title_icon, lv_color_white(), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_align(title_icon, LV_ALIGN_LEFT_MID, 0, 0);
+
+        lv_obj_t *title_label = lv_label_create(title_bar);
+        lv_label_set_text(title_label, " Settings");
+        lv_obj_set_style_text_font(title_label, &lv_font_montserrat_24, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_text_color(title_label, lv_color_white(), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_align_to(title_label, title_icon, LV_ALIGN_OUT_RIGHT_MID, 4, 0);
+
+        // Close button
+        lv_obj_t *close_btn = lv_button_create(title_bar);
+        lv_obj_set_size(close_btn, 50, 42);
+        lv_obj_align(close_btn, LV_ALIGN_RIGHT_MID, -5, 0);
+        lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x2a3a46), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_shadow_width(close_btn, 0, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_border_width(close_btn, 0, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_radius(close_btn, 6, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_t *close_lbl = lv_label_create(close_btn);
+        lv_label_set_text(close_lbl, LV_SYMBOL_CLOSE);
+        lv_obj_set_style_text_color(close_lbl, lv_color_white(), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_center(close_lbl);
+        lv_obj_add_event_cb(close_btn, [](lv_event_t *e) {
+            System *self = static_cast<System *>(lv_event_get_user_data(e));
+            if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+            settings_save();
+            lv_display_set_rotation(lv_display_get_default(), self->_home_rotation);
+            self->set_vibration();
+            self->init_win_home();
+            lv_screen_load_anim(self->_registry.win.home.root, LV_SCR_LOAD_ANIM_FADE_OUT, 100, 0, true);
+        }, LV_EVENT_ALL, this);
+
+        // Scrollable content area
+        int32_t content_top = status_h + title_h;
+        lv_obj_t *scroll = lv_obj_create(_registry.win.settings.root);
+        lv_obj_set_size(scroll, w, h - content_top);
+        lv_obj_set_pos(scroll, 0, content_top);
+        lv_obj_set_style_bg_color(scroll, lv_color_hex(0x0A0E14), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(scroll, LV_OPA_COVER, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_border_width(scroll, 0, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_radius(scroll, 0, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_pad_all(scroll, 12, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_flex_flow(scroll, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(scroll, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+        lv_obj_set_style_pad_row(scroll, 4, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_scrollbar_mode(scroll, LV_SCROLLBAR_MODE_ACTIVE);
+        _registry.win.settings.scroll_container = scroll;
+
+        // Style constants
+        lv_color_t col_section = lv_color_hex(0x4dabf7);
+        lv_color_t col_label = lv_color_hex(0xc8d6e5);
+        lv_color_t col_value = lv_color_hex(0x00e5a0);
+        lv_color_t col_row_bg = lv_color_hex(0x141e28);
+        int32_t row_w = w - 28;
+
+        // --- Helper lambdas ---
+
+        // Section header
+        auto add_section = [&](const char *text) {
+            lv_obj_t *lbl = lv_label_create(scroll);
+            lv_label_set_text(lbl, text);
+            lv_obj_set_style_text_color(lbl, col_section, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_22, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_width(lbl, row_w);
+            lv_obj_set_style_pad_top(lbl, 12, (lv_style_selector_t)LV_PART_MAIN);
+        };
+
+        // Setting row container
+        auto add_row = [&]() -> lv_obj_t * {
+            lv_obj_t *row = lv_obj_create(scroll);
+            lv_obj_set_size(row, row_w, 52);
+            lv_obj_set_style_bg_color(row, col_row_bg, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(row, LV_OPA_COVER, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_border_width(row, 0, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_radius(row, 8, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_pad_all(row, 8, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+            return row;
+        };
+
+        // Label on left side of a row
+        auto add_row_label = [&](lv_obj_t *row, const char *text) {
+            lv_obj_t *lbl = lv_label_create(row);
+            lv_label_set_text(lbl, text);
+            lv_obj_set_style_text_color(lbl, col_label, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 0, 0);
+        };
+
+        // Toggle switch on right side of a row
+        auto add_toggle = [&](lv_obj_t *row, bool *setting) -> lv_obj_t * {
+            lv_obj_t *sw = lv_switch_create(row);
+            lv_obj_set_size(sw, 56, 30);
+            lv_obj_align(sw, LV_ALIGN_RIGHT_MID, 0, 0);
+            lv_obj_set_style_bg_color(sw, lv_color_hex(0x2a3a46), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_bg_color(sw, lv_color_hex(0x00e5a0), (lv_style_selector_t)(LV_PART_INDICATOR | LV_STATE_CHECKED));
+            if (*setting) lv_obj_add_state(sw, LV_STATE_CHECKED);
+            // Store pointer to setting in user_data for the callback
+            lv_obj_set_user_data(sw, (void *)setting);
+            lv_obj_add_event_cb(sw, [](lv_event_t *e) {
+                if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+                lv_obj_t *sw = lv_event_get_target_obj(e);
+                bool *s = (bool *)lv_obj_get_user_data(sw);
+                if (s) *s = lv_obj_has_state(sw, LV_STATE_CHECKED);
+                settings_save();
+            }, LV_EVENT_ALL, nullptr);
+            return sw;
+        };
+
+        // Value display button on right side (tap to cycle)
+        auto add_value_btn = [&](lv_obj_t *row, const char *text) -> lv_obj_t * {
+            lv_obj_t *btn = lv_button_create(row);
+            lv_obj_set_size(btn, LV_SIZE_CONTENT, 36);
+            lv_obj_set_style_min_width(btn, 80, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_align(btn, LV_ALIGN_RIGHT_MID, 0, 0);
+            lv_obj_set_style_bg_color(btn, lv_color_hex(0x1a2a36), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_shadow_width(btn, 0, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_border_color(btn, lv_color_hex(0x2a4a56), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_border_width(btn, 1, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_radius(btn, 6, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_pad_hor(btn, 12, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_t *lbl = lv_label_create(btn);
+            lv_label_set_text(lbl, text);
+            lv_obj_set_style_text_color(lbl, col_value, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_center(lbl);
+            return btn;
+        };
+
+        // Slider on right side of a row
+        auto add_slider = [&](lv_obj_t *row, int32_t min, int32_t max, int32_t value) -> lv_obj_t * {
+            lv_obj_t *slider = lv_slider_create(row);
+            lv_obj_set_size(slider, 180, 20);
+            lv_obj_align(slider, LV_ALIGN_RIGHT_MID, 0, 0);
+            lv_slider_set_range(slider, min, max);
+            lv_slider_set_value(slider, value, LV_ANIM_OFF);
+            lv_obj_set_style_bg_color(slider, lv_color_hex(0x2a3a46), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_bg_color(slider, lv_color_hex(0x00e5a0), (lv_style_selector_t)LV_PART_INDICATOR);
+            lv_obj_set_style_bg_color(slider, lv_color_hex(0xc8d6e5), (lv_style_selector_t)LV_PART_KNOB);
+            return slider;
+        };
+
+        // Info row (read-only value on right)
+        auto add_info_row = [&](const char *label, const char *value) {
+            lv_obj_t *row = add_row();
+            add_row_label(row, label);
+            lv_obj_t *val = lv_label_create(row);
+            lv_label_set_text(val, value);
+            lv_obj_set_style_text_color(val, col_value, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_text_font(val, &lv_font_montserrat_16, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_align(val, LV_ALIGN_RIGHT_MID, 0, 0);
+        };
+
+        // ═══════════════════════════════════════════════════════════════
+        // DISPLAY
+        // ═══════════════════════════════════════════════════════════════
+        add_section(LV_SYMBOL_IMAGE "  Display");
+
+        // Display type (read-only)
+        add_info_row("Display", screen_type_name());
+
+        // Brightness slider
+        {
+            lv_obj_t *row = add_row();
+            add_row_label(row, "Brightness");
+            lv_obj_t *slider = add_slider(row, 5, 100, (int32_t)g_settings.brightness);
+            lv_obj_add_event_cb(slider, [](lv_event_t *e) {
+                if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+                g_settings.brightness = (uint8_t)lv_slider_get_value(lv_event_get_target_obj(e));
+                // Brightness will be applied by the main task
+            }, LV_EVENT_ALL, nullptr);
+            // Save on release
+            lv_obj_add_event_cb(slider, [](lv_event_t *e) {
+                if (lv_event_get_code(e) != LV_EVENT_RELEASED) return;
+                settings_save();
+            }, LV_EVENT_ALL, nullptr);
+        }
+
+        // Screen timeout
+        {
+            lv_obj_t *row = add_row();
+            add_row_label(row, "Screen Timeout");
+            static const uint16_t timeout_vals[] = {0, 30, 60, 120, 300, 600};
+            static const char *timeout_labels[] = {"Never", "30s", "1m", "2m", "5m", "10m"};
+            int cur = 0;
+            for (int i = 0; i < 6; i++) {
+                if (g_settings.screen_timeout_s == timeout_vals[i]) { cur = i; break; }
+            }
+            lv_obj_t *btn = add_value_btn(row, timeout_labels[cur]);
+            lv_obj_add_event_cb(btn, [](lv_event_t *e) {
+                if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+                static const uint16_t vals[] = {0, 30, 60, 120, 300, 600};
+                static const char *labels[] = {"Never", "30s", "1m", "2m", "5m", "10m"};
+                int cur = 0;
+                for (int i = 0; i < 6; i++) if (g_settings.screen_timeout_s == vals[i]) { cur = i; break; }
+                cur = (cur + 1) % 6;
+                g_settings.screen_timeout_s = vals[cur];
+                // Reset touch timer so the new timeout starts from now
+                g_last_touch_ms = esp_log_timestamp();
+                lv_obj_t *lbl = lv_obj_get_child(lv_event_get_target_obj(e), 0);
+                if (lbl) lv_label_set_text(lbl, labels[cur]);
+                settings_save();
+            }, LV_EVENT_ALL, nullptr);
+        }
+
+        // Double-tap wake/sleep
+        {
+            lv_obj_t *row = add_row();
+            add_row_label(row, "Double-Tap Wake");
+            add_toggle(row, &g_settings.double_tap_wake);
+        }
+
+        // Auto-rotation
+        {
+            lv_obj_t *row = add_row();
+            add_row_label(row, "Auto Rotation");
+            add_toggle(row, &g_settings.auto_rotation);
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // TIME & DATE
+        // ═══════════════════════════════════════════════════════════════
+        add_section(LV_SYMBOL_BELL "  Time & Date");
+
+        // Timezone
+        {
+            lv_obj_t *row = add_row();
+            add_row_label(row, "Timezone");
+            lv_obj_t *btn = add_value_btn(row, settings_tz_string());
+            lv_obj_add_event_cb(btn, [](lv_event_t *e) {
+                if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+                // Cycle common timezones: -12 through +14
+                g_settings.tz_offset_h++;
+                if (g_settings.tz_offset_h > 14) g_settings.tz_offset_h = -12;
+                lv_obj_t *lbl = lv_obj_get_child(lv_event_get_target_obj(e), 0);
+                if (lbl) lv_label_set_text(lbl, settings_tz_string());
+                settings_save();
+            }, LV_EVENT_ALL, nullptr);
+        }
+
+        // DST
+        {
+            lv_obj_t *row = add_row();
+            add_row_label(row, "Daylight Saving");
+            add_toggle(row, &g_settings.dst_enabled);
+        }
+
+        // 24h format
+        {
+            lv_obj_t *row = add_row();
+            add_row_label(row, "24-Hour Format");
+            add_toggle(row, &g_settings.time_24h);
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // ADS-B
+        // ═══════════════════════════════════════════════════════════════
+        add_section(LV_SYMBOL_GPS "  ADS-B");
+
+        // ADS-B enable
+        {
+            lv_obj_t *row = add_row();
+            add_row_label(row, "RTL-SDR Receiver");
+            add_toggle(row, &g_settings.adsb_enabled);
+        }
+
+        // SD logging
+        {
+            lv_obj_t *row = add_row();
+            add_row_label(row, "SD Card Logging");
+            add_toggle(row, &g_settings.adsb_sd_logging);
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // MESHTASTIC
+        // ═══════════════════════════════════════════════════════════════
+        add_section(LV_SYMBOL_WIFI "  Meshy");
+
+        // Enable
+        {
+            lv_obj_t *row = add_row();
+            add_row_label(row, "LoRa Radio");
+            add_toggle(row, &g_settings.meshy_enabled);
+        }
+
+        // SD logging
+        {
+            lv_obj_t *row = add_row();
+            add_row_label(row, "SD Card Logging");
+            add_toggle(row, &g_settings.meshy_sd_logging);
+        }
+
+        // Region
+        {
+            lv_obj_t *row = add_row();
+            add_row_label(row, "Region");
+            lv_obj_t *btn = add_value_btn(row, settings_region_name(g_settings.meshy_region));
+            lv_obj_add_event_cb(btn, [](lv_event_t *e) {
+                if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+                g_settings.meshy_region = (g_settings.meshy_region + 1) % 15;
+                lv_obj_t *lbl = lv_obj_get_child(lv_event_get_target_obj(e), 0);
+                if (lbl) lv_label_set_text(lbl, settings_region_name(g_settings.meshy_region));
+                settings_save();
+            }, LV_EVENT_ALL, nullptr);
+        }
+
+        // Channel preset
+        {
+            lv_obj_t *row = add_row();
+            add_row_label(row, "Preset");
+            lv_obj_t *btn = add_value_btn(row, settings_preset_name(g_settings.meshy_preset));
+            lv_obj_add_event_cb(btn, [](lv_event_t *e) {
+                if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+                g_settings.meshy_preset = (g_settings.meshy_preset + 1) % 6;
+                lv_obj_t *lbl = lv_obj_get_child(lv_event_get_target_obj(e), 0);
+                if (lbl) lv_label_set_text(lbl, settings_preset_name(g_settings.meshy_preset));
+                settings_save();
+            }, LV_EVENT_ALL, nullptr);
+        }
+
+        // Channel index
+        {
+            lv_obj_t *row = add_row();
+            add_row_label(row, "Channel");
+            static char ch_buf[4];
+            snprintf(ch_buf, sizeof(ch_buf), "%d", g_settings.meshy_channel);
+            lv_obj_t *btn = add_value_btn(row, ch_buf);
+            lv_obj_add_event_cb(btn, [](lv_event_t *e) {
+                if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+                g_settings.meshy_channel = (g_settings.meshy_channel + 1) % 8;
+                static char buf[4];
+                snprintf(buf, sizeof(buf), "%d", g_settings.meshy_channel);
+                lv_obj_t *lbl = lv_obj_get_child(lv_event_get_target_obj(e), 0);
+                if (lbl) lv_label_set_text(lbl, buf);
+                settings_save();
+            }, LV_EVENT_ALL, nullptr);
+        }
+
+        // TX power
+        {
+            lv_obj_t *row = add_row();
+            add_row_label(row, "TX Power");
+            static char pwr_buf[8];
+            snprintf(pwr_buf, sizeof(pwr_buf), "%ddBm", g_settings.meshy_tx_power);
+            lv_obj_t *btn = add_value_btn(row, pwr_buf);
+            lv_obj_add_event_cb(btn, [](lv_event_t *e) {
+                if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+                static const uint8_t powers[] = {10, 17, 20, 22, 27, 30};
+                int cur = 0;
+                for (int i = 0; i < 6; i++) if (g_settings.meshy_tx_power == powers[i]) { cur = i; break; }
+                cur = (cur + 1) % 6;
+                g_settings.meshy_tx_power = powers[cur];
+                static char buf[8];
+                snprintf(buf, sizeof(buf), "%ddBm", g_settings.meshy_tx_power);
+                lv_obj_t *lbl = lv_obj_get_child(lv_event_get_target_obj(e), 0);
+                if (lbl) lv_label_set_text(lbl, buf);
+                settings_save();
+            }, LV_EVENT_ALL, nullptr);
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // GPS
+        // ═══════════════════════════════════════════════════════════════
+        add_section(LV_SYMBOL_GPS "  GPS");
+
+        {
+            lv_obj_t *row = add_row();
+            add_row_label(row, "GPS Module");
+            add_toggle(row, &g_settings.gps_enabled);
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // SCOPE DISPLAY
+        // ═══════════════════════════════════════════════════════════════
+        add_section(LV_SYMBOL_EYE_OPEN "  Scope Display");
+
+        // FPS cap
+        {
+            lv_obj_t *row = add_row();
+            add_row_label(row, "FPS Cap");
+            static const uint8_t fps_vals[] = {0, 5, 10, 15, 30};
+            static const char *fps_labels[] = {"Auto", "5", "10", "15", "30"};
+            int cur = 0;
+            for (int i = 0; i < 5; i++) if (g_settings.scope_fps_cap == fps_vals[i]) { cur = i; break; }
+            lv_obj_t *btn = add_value_btn(row, fps_labels[cur]);
+            lv_obj_add_event_cb(btn, [](lv_event_t *e) {
+                if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+                static const uint8_t vals[] = {0, 5, 10, 15, 30};
+                static const char *labels[] = {"Auto", "5", "10", "15", "30"};
+                int cur = 0;
+                for (int i = 0; i < 5; i++) if (g_settings.scope_fps_cap == vals[i]) { cur = i; break; }
+                cur = (cur + 1) % 5;
+                g_settings.scope_fps_cap = vals[cur];
+                lv_obj_t *lbl = lv_obj_get_child(lv_event_get_target_obj(e), 0);
+                if (lbl) lv_label_set_text(lbl, labels[cur]);
+                settings_save();
+            }, LV_EVENT_ALL, nullptr);
+        }
+
+        // Max aircraft
+        {
+            lv_obj_t *row = add_row();
+            add_row_label(row, "Max Aircraft");
+            static const uint8_t ac_vals[] = {0, 16, 32, 48, 64};
+            static const char *ac_labels[] = {"All", "16", "32", "48", "64"};
+            int cur = 0;
+            for (int i = 0; i < 5; i++) if (g_settings.scope_max_aircraft == ac_vals[i]) { cur = i; break; }
+            lv_obj_t *btn = add_value_btn(row, ac_labels[cur]);
+            lv_obj_add_event_cb(btn, [](lv_event_t *e) {
+                if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+                static const uint8_t vals[] = {0, 16, 32, 48, 64};
+                static const char *labels[] = {"All", "16", "32", "48", "64"};
+                int cur = 0;
+                for (int i = 0; i < 5; i++) if (g_settings.scope_max_aircraft == vals[i]) { cur = i; break; }
+                cur = (cur + 1) % 5;
+                g_settings.scope_max_aircraft = vals[cur];
+                lv_obj_t *lbl = lv_obj_get_child(lv_event_get_target_obj(e), 0);
+                if (lbl) lv_label_set_text(lbl, labels[cur]);
+                settings_save();
+            }, LV_EVENT_ALL, nullptr);
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // AUDIO & HAPTICS
+        // ═══════════════════════════════════════════════════════════════
+        add_section(LV_SYMBOL_VOLUME_MAX "  Audio & Haptics");
+
+        // Volume slider
+        {
+            lv_obj_t *row = add_row();
+            add_row_label(row, "Volume");
+            lv_obj_t *slider = add_slider(row, 0, 100, (int32_t)g_settings.volume);
+            lv_obj_add_event_cb(slider, [](lv_event_t *e) {
+                if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+                g_settings.volume = (uint8_t)lv_slider_get_value(lv_event_get_target_obj(e));
+            }, LV_EVENT_ALL, nullptr);
+            lv_obj_add_event_cb(slider, [](lv_event_t *e) {
+                if (lv_event_get_code(e) != LV_EVENT_RELEASED) return;
+                settings_save();
+            }, LV_EVENT_ALL, nullptr);
+        }
+
+        // Haptic
+        {
+            lv_obj_t *row = add_row();
+            add_row_label(row, "Haptic Feedback");
+            add_toggle(row, &g_settings.haptic_enabled);
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // SYSTEM
+        // ═══════════════════════════════════════════════════════════════
+        add_section(LV_SYMBOL_CHARGE "  System");
+
+        // Memory info
+        {
+            static char mem_buf[64];
+            snprintf(mem_buf, sizeof(mem_buf), "%luKB / %.1fMB",
+                     (unsigned long)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+                     (double)heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / (1024.0 * 1024.0));
+            add_info_row("Free RAM / PSRAM", mem_buf);
+        }
+
+        // Console heartbeat
+        {
+            lv_obj_t *row = add_row();
+            add_row_label(row, "Console Heartbeat");
+            add_toggle(row, &g_settings.heartbeat_enabled);
+        }
+        {
+            static const uint8_t hb_vals[] = {5, 10, 15, 30, 60, 120};
+            static const char *hb_labels[] = {"5s", "10s", "15s", "30s", "60s", "120s"};
+            lv_obj_t *row = add_row();
+            add_row_label(row, "Heartbeat Period");
+            static char hb_buf[8];
+            snprintf(hb_buf, sizeof(hb_buf), "%ds", g_settings.heartbeat_period_s);
+            lv_obj_t *btn = add_value_btn(row, hb_buf);
+            lv_obj_add_event_cb(btn, [](lv_event_t *e) {
+                if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+                static const uint8_t vals[] = {5, 10, 15, 30, 60, 120};
+                static const char *labels[] = {"5s", "10s", "15s", "30s", "60s", "120s"};
+                int cur = 3; // default 30s
+                for (int i = 0; i < 6; i++) {
+                    if (g_settings.heartbeat_period_s == vals[i]) { cur = i; break; }
+                }
+                cur = (cur + 1) % 6;
+                g_settings.heartbeat_period_s = vals[cur];
+                lv_obj_t *lbl = lv_obj_get_child(lv_event_get_target_obj(e), 0);
+                if (lbl) lv_label_set_text(lbl, labels[cur]);
+                settings_save();
+            }, LV_EVENT_ALL, nullptr);
+        }
+
+        // Firmware version
+        {
+            const esp_app_desc_t *app = esp_app_get_description();
+            add_info_row("Firmware", app->version);
+        }
+
+        // Factory reset
+        {
+            lv_obj_t *row = add_row();
+            add_row_label(row, "Factory Reset");
+            lv_obj_t *btn = add_value_btn(row, "RESET");
+            lv_obj_set_style_bg_color(btn, lv_color_hex(0x3a1a1a), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_border_color(btn, lv_color_hex(0x6a2a2a), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_t *rlbl = lv_obj_get_child(btn, 0);
+            if (rlbl) lv_obj_set_style_text_color(rlbl, lv_color_hex(0xff4444), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_add_event_cb(btn, [](lv_event_t *e) {
+                System *self = static_cast<System *>(lv_event_get_user_data(e));
+                if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+                // Clear NVS blob and apply defaults
+                settings_reset();
+                g_last_touch_ms = esp_log_timestamp();
+                // Navigate home
+                lv_display_set_rotation(lv_display_get_default(), self->_home_rotation);
+                self->set_vibration();
+                self->init_win_home();
+                lv_screen_load_anim(self->_registry.win.home.root, LV_SCR_LOAD_ANIM_FADE_OUT, 100, 0, true);
+            }, LV_EVENT_ALL, this);
+        }
+
+        // Bottom padding
+        {
+            lv_obj_t *pad = lv_obj_create(scroll);
+            lv_obj_set_size(pad, row_w, 40);
+            lv_obj_set_style_bg_opa(pad, 0, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_border_width(pad, 0, (lv_style_selector_t)LV_PART_MAIN);
+        }
+
+        // Swipe to return home
+        lv_obj_add_event_cb(_registry.win.settings.root, [](lv_event_t *e) {
+            System *self = static_cast<System *>(lv_event_get_user_data(e));
+            if (lv_event_get_code(e) != LV_EVENT_GESTURE) return;
+            lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_active());
+            if ((dir == LV_DIR_LEFT || dir == LV_DIR_RIGHT) && self->_edge_touch_flag) {
+                settings_save();
+                lv_display_set_rotation(lv_display_get_default(), self->_home_rotation);
+                self->set_vibration();
+                self->init_win_home();
+                lv_screen_load_anim(self->_registry.win.home.root, LV_SCR_LOAD_ANIM_FADE_OUT, 100, 0, true);
+                self->_edge_touch_flag = false;
+            }
+        }, LV_EVENT_ALL, this);
+
+        lv_obj_update_layout(_registry.win.settings.root);
+        _current_win = Current_Win::SETTINGS;
     }
 
     void System::init_win_rf(void)

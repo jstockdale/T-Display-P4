@@ -7,6 +7,7 @@
  */
 #include <stdio.h>
 #include <unistd.h>
+#include <math.h>
 #include <sys/lock.h>
 #include <sys/time.h>
 #include "sdkconfig.h"
@@ -45,6 +46,7 @@
 #include "driver/sdmmc_host.h"
 #include "New Notification 010_c2_b16_s44100.h"
 #include "ICM20948_WE.h"
+#include "meshtastic_task.h"
 #include "esp_netif.h"
 #include "esp_eth.h"
 #include "esp_event.h"
@@ -62,6 +64,11 @@
 
 #include "class_driver.h"
 #include "serial_console.h"
+#include "nvs_flash.h"
+#include "device_settings.h"
+
+// Global settings instance — declared extern in device_settings.h
+device_settings_t g_settings;
 // WiFi disabled — Espressif Issue #17889 (SDMMC controller DMA conflict)
 // WiFi disabled — esp_hosted and esp_wifi_remote removed from build
 // to prevent SDIO auto-init that fragments internal heap (Issue #17889)
@@ -109,6 +116,7 @@ enum class Es8311_Mode
 enum class Imu_Mode
 {
     TEST = 0,
+    DOUBLE_TAP_WAKE = 1,
 };
 
 enum class Battery_Health_Mode
@@ -226,8 +234,9 @@ TaskHandle_t Gps_Task_Handle = NULL;
 TaskHandle_t Ethernet_Task_Handle = NULL;
 TaskHandle_t At_Task_Handle = NULL;
 TaskHandle_t Sleep_Task_Handle = NULL;
-TaskHandle_t Rf_Task_Handle = NULL;
 TaskHandle_t Adsb_App_Task_Handle = NULL;
+TaskHandle_t Meshy_App_Task_Handle = NULL;
+TaskHandle_t Scope_App_Task_Handle = NULL;
 TaskHandle_t Iis_Transmission_Data_Stream_Task = NULL;
 
 // USB host task handles — kept so app_main can clean up if needed
@@ -265,11 +274,6 @@ void *lcd_buffer[CONFIG_EXAMPLE_CAM_BUF_COUNT];
 int32_t fps_count;
 int64_t start_time;
 int32_t video_cam_fd0;
-
-bool Rf_Send_Flag = false;
-uint8_t Rf_Send_Package[255] = {0};
-
-bool Device_Rf_Task_Stop_Flag = false;
 
 QueueHandle_t app_queue;
 
@@ -331,6 +335,10 @@ auto SX1262 = std::make_unique<Cpp_Bus_Driver::Sx126x>(SX1262_SPI_Bus, Cpp_Bus_D
 screen_type_t g_screen_type = SCREEN_TYPE_UNKNOWN;
 uint32_t g_screen_width = HI8561_SCREEN_WIDTH;   // default until detected
 uint32_t g_screen_height = HI8561_SCREEN_HEIGHT;
+
+// Screen timeout / wake state (accessed from lvgl_ui.cpp settings)
+volatile uint32_t g_last_touch_ms = 0;
+volatile bool g_screen_blanked = false;
 
 #if defined SCREEN_ROTATION_DIRECTION_0
 auto System_Ui = std::make_unique<Lvgl_Ui::System>(SCREEN_WIDTH_MAX, SCREEN_HEIGHT_MAX);
@@ -628,6 +636,19 @@ void lvgl_ui_task(void *arg)
         time_till_next_ms = lv_timer_handler();
         _lock_release(&lvgl_api_lock);
 
+        // Screen timeout — blank display after inactivity
+        if (g_settings.screen_timeout_s > 0 && !g_screen_blanked && g_last_touch_ms > 0) {
+            uint32_t elapsed = esp_log_timestamp() - g_last_touch_ms;
+            if (elapsed > (uint32_t)g_settings.screen_timeout_s * 1000) {
+                g_screen_blanked = true;
+                if (screen_is_rm69a10()) {
+                    set_rm69a10_brightness(Screen_Mipi_Dpi_Panel, 0);
+                } else {
+                    HI8561_T->start_pwm_gradient_time(0, 500);
+                }
+            }
+        }
+
         if (time_till_next_ms < 10)
             time_till_next_ms = 10;
 
@@ -854,6 +875,71 @@ void device_imu_task(void *arg)
         }
         break;
 
+        case Imu_Mode::DOUBLE_TAP_WAKE:
+        {
+            // Double-tap detection by polling accelerometer magnitude.
+            // State machine: IDLE → TAP1 → WAIT → TAP2 → ACTION → COOLDOWN → IDLE
+            // Runs every 10ms (vTaskDelay at bottom of loop), ~1 I2C read per cycle.
+            static enum { DT_IDLE, DT_TAP1, DT_WAIT, DT_TAP2, DT_COOLDOWN } dt_state = DT_IDLE;
+            static uint32_t dt_time = 0;
+            static const float TAP_G = 1.6f;  // g-force spike threshold
+
+            ICM20948->readSensor();
+            xyzFloat gVal;
+            ICM20948->getGValues(&gVal);
+            float mag = sqrtf(gVal.x * gVal.x + gVal.y * gVal.y + gVal.z * gVal.z);
+            // At rest mag ≈ 1.0g. A tap spike reaches 1.6-3.0g briefly.
+            bool spike = (mag > TAP_G);
+            uint32_t now = esp_log_timestamp();
+
+            switch (dt_state) {
+                case DT_IDLE:
+                    if (spike) { dt_time = now; dt_state = DT_TAP1; }
+                    break;
+                case DT_TAP1:
+                    // Wait for motion to settle (~80ms debounce)
+                    if (!spike && (now - dt_time > 80)) {
+                        dt_state = DT_WAIT;
+                    } else if (now - dt_time > 300) {
+                        dt_state = DT_IDLE; // too long — tilt, not tap
+                    }
+                    break;
+                case DT_WAIT:
+                    if (spike) {
+                        dt_state = DT_TAP2; dt_time = now;
+                    } else if (now - dt_time > 400) {
+                        dt_state = DT_IDLE; // window expired
+                    }
+                    break;
+                case DT_TAP2:
+                    if (now - dt_time > 50) {
+                        // Double tap confirmed — toggle screen
+                        if (g_screen_blanked) {
+                            g_screen_blanked = false;
+                            g_last_touch_ms = now;
+                            if (screen_is_rm69a10()) {
+                                set_rm69a10_brightness(Screen_Mipi_Dpi_Panel, g_settings.brightness * 255 / 100);
+                            } else {
+                                HI8561_T->start_pwm_gradient_time(g_settings.brightness, 200);
+                            }
+                        } else {
+                            g_screen_blanked = true;
+                            if (screen_is_rm69a10()) {
+                                set_rm69a10_brightness(Screen_Mipi_Dpi_Panel, 0);
+                            } else {
+                                HI8561_T->start_pwm_gradient_time(0, 200);
+                            }
+                        }
+                        dt_state = DT_COOLDOWN; dt_time = now;
+                    }
+                    break;
+                case DT_COOLDOWN:
+                    if (now - dt_time > 800) dt_state = DT_IDLE;
+                    break;
+            }
+        }
+        break;
+
         default:
             break;
         }
@@ -996,6 +1082,9 @@ void device_battery_health_task(void *arg)
                 break;
             }
 
+            // Flush any pending settings to NVS (must run on internal RAM stack)
+            settings_save_if_pending();
+
             cycle_time = esp_log_timestamp() + 1000;
         }
 
@@ -1014,6 +1103,11 @@ void device_gps_task(void *arg)
 
     while (1)
     {
+        // Skip GPS processing if disabled in settings
+        if (!g_settings.gps_enabled) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
         if (esp_log_timestamp() > cycle_time)
         {
             std::unique_ptr<uint8_t[]> buffer;
@@ -1104,7 +1198,7 @@ void device_gps_task(void *arg)
                                     .tv_usec = GPS_SERIAL_DELAY_US
                                 };
                                 settimeofday(&tv_now, NULL);
-                                serial_console_print("[GNSS] Clock corrected by %+llds → %04d-%02d-%02d %02d:%02d:%02d.%03ld UTC\n",
+                                serial_console_print("\033[0;36m[GNSS] Clock corrected by %+llds → %04d-%02d-%02d %02d:%02d:%02d.%03ld UTC\033[0m\n",
                                     drift_s, utc_year, utc_mon, utc_day,
                                     utc_hour, utc_min, utc_sec,
                                     GPS_SERIAL_DELAY_US / 1000);
@@ -1147,7 +1241,7 @@ void device_gps_task(void *arg)
                                 };
                                 PCF8563->set_time(t);
 
-                                serial_console_print("[GNSS] RTC set: %04d-%02d-%02d %02d:%02d:%02d UTC%+d:%02d\n",
+                                serial_console_print("\033[0;36m[GNSS] RTC set: %04d-%02d-%02d %02d:%02d:%02d UTC%+d:%02d\033[0m\n",
                                     tm_local.tm_year + 1900, tm_local.tm_mon + 1, tm_local.tm_mday,
                                     tm_local.tm_hour, tm_local.tm_min, tm_local.tm_sec,
                                     tz_off_min / 60, abs(tz_off_min) % 60);
@@ -1174,7 +1268,7 @@ void device_gps_task(void *arg)
                         double hdop = gga_ok ? (double)gga.hdop : 99.9;
                         int fix_q  = gga_ok ? gga.gps_mode_status : -1;
 
-                        serial_console_print("[GNSS] fix=%s lat=%.6f lon=%.6f sats=%d hdop=%.1f q=%d\n",
+                        serial_console_print("\033[0;36m[GNSS] fix=%s lat=%.6f lon=%.6f sats=%d hdop=%.1f q=%d\033[0m\n",
                             rmc.location_status.c_str(), lat, lon, sats, hdop, fix_q);
 
                         last_summary_time = now_ms + 5000;
@@ -1473,7 +1567,7 @@ void device_at_task(void *arg)
 void device_adsb_app_task(void *arg)
 {
     printf("device_adsb_app_task start\n");
-    vTaskSuspend(Adsb_App_Task_Handle);
+    vTaskSuspend(NULL);  // suspend self until ADS-B app opens
 
     // Buffers for formatting — allocated once on task stack
     static char stats_buf[512];
@@ -1554,386 +1648,65 @@ void device_adsb_app_task(void *arg)
     }
 }
 
-void device_rf_task(void *arg)
+void device_meshy_app_task(void *arg)
 {
-    printf("device_rf_task start\n");
+    printf("device_meshy_app_task start\n");
+    vTaskSuspend(NULL);  // suspend self until Meshy app opens
+
+    static char stats_buf[256];
+    static const size_t MSG_BUF_SIZE = 65536;  // 64KB — enough for 1000 messages
+    static char *msg_buf = nullptr;
+    if (!msg_buf) {
+        msg_buf = (char *)heap_caps_malloc(MSG_BUF_SIZE, MALLOC_CAP_SPIRAM);
+        if (!msg_buf) {
+            printf("meshy_app_task: failed to alloc msg_buf in PSRAM\n");
+            vTaskDelete(NULL);
+            return;
+        }
+    }
 
     size_t cycle_time = 0;
-    size_t auto_send_cycle_time = 0;
 
     while (1)
     {
-        switch (System_Ui->_rf_chip_type)
+        if (esp_log_timestamp() > cycle_time)
         {
-        case Lvgl_Ui::System::Rf_Chip_Type::SX1262:
-        {
-            if (System_Ui->_device_sx1262.auto_send.flag == true)
+            if (System_Ui->get_current_win() == Lvgl_Ui::System::Current_Win::MESHY)
             {
-                if (Rf_Send_Flag == false)
-                {
-                    if (esp_log_timestamp() > auto_send_cycle_time)
-                    {
-                        memset(Rf_Send_Package, '\0', sizeof(Rf_Send_Package));
+                meshy_stats_t stats = meshy_get_stats();
 
-                        if (System_Ui->_device_sx1262.auto_send.text.size() <= 255)
-                            memcpy(Rf_Send_Package, System_Ui->_device_sx1262.auto_send.text.data(), System_Ui->_device_sx1262.auto_send.text.size());
-                        else
-                        {
-                            memcpy(Rf_Send_Package, System_Ui->_device_sx1262.auto_send.text.data(), 254);
-                            Rf_Send_Package[254] = '\0';
-                            printf("sx1262 send out of bounds(data > Rf_Send_Package)\n");
-                        }
+                int pos = 0;
+                pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
+                    "Freq: %.3f MHz  %s",
+                    stats.freq_mhz,
+                    stats.running ? "ACTIVE" : "STOPPED");
+                pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
+                    "\nRX: %lu decoded  Nodes: %lu  TX: %lu",
+                    (unsigned long)stats.rx_decoded,
+                    (unsigned long)stats.known_nodes,
+                    (unsigned long)stats.tx_packets);
 
-                        char buffer_time[15];
-                        snprintf(buffer_time, sizeof(buffer_time), "%02d:%02d:%02d", System_Ui->_time.hour, System_Ui->_time.minute, System_Ui->_time.second);
+                meshy_format_messages(msg_buf, MSG_BUF_SIZE);
 
-                        Lvgl_Ui::System::Win_Rf_Chat_Message wlcm =
-                            {
-                                .direction = Lvgl_Ui::System::Chat_Message_Direction::SEND,
-                                .time = buffer_time,
-                                .data = System_Ui->_device_sx1262.auto_send.text,
-                            };
-                        System_Ui->_registry.win.rf.chat_message_data.push_back(wlcm);
-
-                        if (System_Ui->_current_win == Lvgl_Ui::System::Current_Win::RF)
-                        {
-                            _lock_acquire(&lvgl_api_lock);
-                            System_Ui->win_rf_chat_message_data_update(System_Ui->_registry.win.rf.chat_message_data);
-                            _lock_release(&lvgl_api_lock);
-                        }
-
-                        Rf_Send_Flag = true;
-                        auto_send_cycle_time = esp_log_timestamp() + System_Ui->_device_sx1262.auto_send.interval;
-                    }
-                }
+                _lock_acquire(&lvgl_api_lock);
+                System_Ui->win_meshy_update(stats_buf, msg_buf);
+                _lock_release(&lvgl_api_lock);
             }
 
-            if (Rf_Send_Flag == true)
-            {
-                SX1262->start_lora_transmit(Cpp_Bus_Driver::Sx126x::Chip_Mode::TX, 0, Cpp_Bus_Driver::Sx126x::Fallback_Mode::FS);
-                SX1262->set_irq_pin_mode(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::TX_DONE);
-                SX1262->clear_irq_flag(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::TX_DONE);
-
-                printf("sx1262 send start\n");
-                uint16_t timeout_count = 0;
-                if (SX1262->send_data(Rf_Send_Package, strlen(reinterpret_cast<const char *>(Rf_Send_Package))) == true)
-                {
-                    while (1)
-                    {
-                        if (XL9535->pin_read(XL9535_SX1262_DIO1) == 1)
-                        {
-                            Cpp_Bus_Driver::Sx126x::Irq_Status is;
-                            if (SX1262->parse_irq_status(SX1262->get_irq_flag(), is) == false)
-                                printf("parse_Iqr_status fail\n");
-                            else if (is.all_flag.tx_done == true)
-                            {
-                                printf("sx1262 send success\n");
-                                break;
-                            }
-                        }
-                        timeout_count++;
-                        if (timeout_count > 1000)
-                        {
-                            printf("sx1262 send timeout\n");
-                            break;
-                        }
-                        vTaskDelay(pdMS_TO_TICKS(10));
-                    }
-                }
-                else
-                    printf("sx1262 send fail\n");
-
-                SX1262->start_lora_transmit(Cpp_Bus_Driver::Sx126x::Chip_Mode::RX);
-                SX1262->set_irq_pin_mode(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::RX_DONE);
-                SX1262->clear_irq_flag(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::RX_DONE);
-
-                Rf_Send_Flag = false;
-            }
-
-            if (XL9535->pin_read(XL9535_SX1262_DIO1) == 1)
-            {
-                Cpp_Bus_Driver::Sx126x::Irq_Status is;
-                if (SX1262->parse_irq_status(SX1262->get_irq_flag(), is) == false)
-                    printf("parse_irq_status fail\n");
-                else
-                {
-                    if (is.all_flag.tx_rx_timeout == true)
-                    {
-                        printf("receive timeout\n");
-                        SX1262->clear_irq_flag(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::TIMEOUT);
-                    }
-                    else if (is.all_flag.crc_error == true)
-                    {
-                        printf("receive crc error\n");
-                        SX1262->clear_irq_flag(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::CRC_ERROR);
-                    }
-                    else if (is.lora_reg_flag.header_error == true)
-                    {
-                        printf("receive header error\n");
-                        SX1262->clear_irq_flag(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::HEADER_ERROR);
-                    }
-                    else
-                    {
-                        uint8_t receive_package[255] = {0};
-                        uint8_t length_buffer = SX1262->receive_data(receive_package);
-                        if (length_buffer == 0)
-                            printf("sx1262 receive fail (error assert: %d)\n", SX1262->_assert);
-                        else
-                        {
-                            Cpp_Bus_Driver::Sx126x::Packet_Metrics pm;
-                            if (SX1262->get_lora_packet_metrics(pm) == true)
-                                printf("sx1262 receive rssi_average: %.01f rssi_instantaneous: %.01f snr: %.01f\n", pm.lora.rssi_average, pm.lora.rssi_instantaneous, pm.lora.snr);
-
-                            char buffer_time[15];
-                            snprintf(buffer_time, sizeof(buffer_time), "%02d:%02d:%02d", System_Ui->_time.hour, System_Ui->_time.minute, System_Ui->_time.second);
-
-                            std::vector<uint8_t> buffer_vector(receive_package, receive_package + length_buffer);
-                            buffer_vector.erase(std::remove(buffer_vector.begin(), buffer_vector.end(), 0), buffer_vector.end());
-                            std::string message_str(buffer_vector.begin(), buffer_vector.end());
-                            message_str += '\0';
-
-                            char buffer_data_info[30];
-                            snprintf(buffer_data_info, sizeof(buffer_data_info), "rssi[%.01f] snr[%.01f]", pm.lora.rssi_instantaneous, pm.lora.snr);
-
-                            Lvgl_Ui::System::Win_Rf_Chat_Message wlcm =
-                                {
-                                    .direction = Lvgl_Ui::System::Chat_Message_Direction::RECEIVE,
-                                    .time = buffer_time,
-                                    .data = message_str,
-                                    .data_info = buffer_data_info,
-                                };
-                            System_Ui->_registry.win.rf.chat_message_data.push_back(wlcm);
-
-                            if (System_Ui->_current_win == Lvgl_Ui::System::Current_Win::RF)
-                            {
-                                _lock_acquire(&lvgl_api_lock);
-                                System_Ui->win_rf_chat_message_data_update(System_Ui->_registry.win.rf.chat_message_data);
-                                _lock_release(&lvgl_api_lock);
-                            }
-                        }
-                    }
-                }
-
-                SX1262->clear_irq_flag(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::RX_DONE);
-            }
+            cycle_time = esp_log_timestamp() + 500;
         }
-        break;
-
-#if defined CONFIG_BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
-        case Lvgl_Ui::System::Rf_Chip_Type::CC1101:
-        {
-            if (System_Ui->_device_cc1101.auto_send.flag == true)
-            {
-                if (Rf_Send_Flag == false)
-                {
-                    if (esp_log_timestamp() > auto_send_cycle_time)
-                    {
-                        memset(Rf_Send_Package, '\0', sizeof(Rf_Send_Package));
-                        if (System_Ui->_device_cc1101.auto_send.text.size() <= 255)
-                            memcpy(Rf_Send_Package, System_Ui->_device_cc1101.auto_send.text.data(), System_Ui->_device_cc1101.auto_send.text.size());
-                        else
-                        {
-                            memcpy(Rf_Send_Package, System_Ui->_device_cc1101.auto_send.text.data(), 254);
-                            Rf_Send_Package[254] = '\0';
-                        }
-
-                        char buffer_time[15];
-                        snprintf(buffer_time, sizeof(buffer_time), "%02d:%02d:%02d", System_Ui->_time.hour, System_Ui->_time.minute, System_Ui->_time.second);
-
-                        Lvgl_Ui::System::Win_Rf_Chat_Message wlcm =
-                            {
-                                .direction = Lvgl_Ui::System::Chat_Message_Direction::SEND,
-                                .time = buffer_time,
-                                .data = System_Ui->_device_cc1101.auto_send.text,
-                            };
-                        System_Ui->_registry.win.rf.chat_message_data.push_back(wlcm);
-
-                        if (System_Ui->_current_win == Lvgl_Ui::System::Current_Win::RF)
-                        {
-                            _lock_acquire(&lvgl_api_lock);
-                            System_Ui->win_rf_chat_message_data_update(System_Ui->_registry.win.rf.chat_message_data);
-                            _lock_release(&lvgl_api_lock);
-                        }
-
-                        Rf_Send_Flag = true;
-                        auto_send_cycle_time = esp_log_timestamp() + System_Ui->_device_cc1101.auto_send.interval;
-                    }
-                }
-            }
-
-            if (Rf_Send_Flag == true)
-            {
-                printf("cc1101 send start\n");
-                Cc1101.finishTransmit();
-                int16_t assert = Cc1101.transmit(Rf_Send_Package, strlen(reinterpret_cast<const char *>(Rf_Send_Package)));
-                if (assert != RADIOLIB_ERR_NONE)
-                    printf("cc1101 transmit fail (error code: %d)\n", assert);
-
-                assert = Cc1101.startReceive();
-                if (assert != RADIOLIB_ERR_NONE)
-                    printf("cc1101 startReceive fail (error code: %d)\n", assert);
-
-                Cc1101_Interrupt_Flag = false;
-                Rf_Send_Flag = false;
-            }
-
-            if (Cc1101_Interrupt_Flag == true)
-            {
-                uint8_t receive_package[255] = {0};
-                uint8_t length_buffer = Cc1101.getPacketLength();
-                int16_t assert = Cc1101.readData(receive_package, length_buffer);
-                if (assert != RADIOLIB_ERR_NONE)
-                    printf("cc1101 receive fail (error assert: %d)\n", assert);
-                else
-                {
-                    float buffer_rssi = Cc1101.getRSSI();
-                    uint8_t buffer_lqi = Cc1101.getLQI();
-
-                    char buffer_time[15];
-                    snprintf(buffer_time, sizeof(buffer_time), "%02d:%02d:%02d", System_Ui->_time.hour, System_Ui->_time.minute, System_Ui->_time.second);
-
-                    std::vector<uint8_t> buffer_vector(receive_package, receive_package + length_buffer);
-                    buffer_vector.erase(std::remove(buffer_vector.begin(), buffer_vector.end(), 0), buffer_vector.end());
-                    std::string message_str(buffer_vector.begin(), buffer_vector.end());
-                    message_str += '\0';
-
-                    char buffer_data_info[30];
-                    snprintf(buffer_data_info, sizeof(buffer_data_info), "rssi[%.01f] lqi[%d]", buffer_rssi, buffer_lqi);
-
-                    Lvgl_Ui::System::Win_Rf_Chat_Message wlcm =
-                        {
-                            .direction = Lvgl_Ui::System::Chat_Message_Direction::RECEIVE,
-                            .time = buffer_time,
-                            .data = message_str,
-                            .data_info = buffer_data_info,
-                        };
-                    System_Ui->_registry.win.rf.chat_message_data.push_back(wlcm);
-
-                    if (System_Ui->_current_win == Lvgl_Ui::System::Current_Win::RF)
-                    {
-                        _lock_acquire(&lvgl_api_lock);
-                        System_Ui->win_rf_chat_message_data_update(System_Ui->_registry.win.rf.chat_message_data);
-                        _lock_release(&lvgl_api_lock);
-                    }
-                }
-
-                Cc1101_Interrupt_Flag = false;
-            }
-        }
-        break;
-
-        case Lvgl_Ui::System::Rf_Chip_Type::NRF24L01:
-        {
-            if (System_Ui->_device_nrf24l01.auto_send.flag == true)
-            {
-                if (Rf_Send_Flag == false)
-                {
-                    if (esp_log_timestamp() > auto_send_cycle_time)
-                    {
-                        memset(Rf_Send_Package, '\0', sizeof(Rf_Send_Package));
-                        if (System_Ui->_device_nrf24l01.auto_send.text.size() <= 255)
-                            memcpy(Rf_Send_Package, System_Ui->_device_nrf24l01.auto_send.text.data(), System_Ui->_device_nrf24l01.auto_send.text.size());
-                        else
-                        {
-                            memcpy(Rf_Send_Package, System_Ui->_device_nrf24l01.auto_send.text.data(), 254);
-                            Rf_Send_Package[254] = '\0';
-                        }
-
-                        char buffer_time[15];
-                        snprintf(buffer_time, sizeof(buffer_time), "%02d:%02d:%02d", System_Ui->_time.hour, System_Ui->_time.minute, System_Ui->_time.second);
-
-                        Lvgl_Ui::System::Win_Rf_Chat_Message wlcm =
-                            {
-                                .direction = Lvgl_Ui::System::Chat_Message_Direction::SEND,
-                                .time = buffer_time,
-                                .data = System_Ui->_device_nrf24l01.auto_send.text,
-                            };
-                        System_Ui->_registry.win.rf.chat_message_data.push_back(wlcm);
-
-                        if (System_Ui->_current_win == Lvgl_Ui::System::Current_Win::RF)
-                        {
-                            _lock_acquire(&lvgl_api_lock);
-                            System_Ui->win_rf_chat_message_data_update(System_Ui->_registry.win.rf.chat_message_data);
-                            _lock_release(&lvgl_api_lock);
-                        }
-
-                        Rf_Send_Flag = true;
-                        auto_send_cycle_time = esp_log_timestamp() + System_Ui->_device_nrf24l01.auto_send.interval;
-                    }
-                }
-            }
-
-            if (Rf_Send_Flag == true)
-            {
-                printf("nrf24l01 send start\n");
-                Nrf24l01.finishTransmit();
-                int16_t assert = Nrf24l01.transmit(Rf_Send_Package, strlen(reinterpret_cast<const char *>(Rf_Send_Package)), 0);
-                if (assert != RADIOLIB_ERR_NONE)
-                    printf("nrf24l01 transmit fail (error code: %d)\n", assert);
-
-                assert = Nrf24l01.startReceive();
-                if (assert != RADIOLIB_ERR_NONE)
-                    printf("nrf24l01 startReceive fail (error code: %d)\n", assert);
-
-                Nrf24l01_Interrupt_Flag = false;
-                Rf_Send_Flag = false;
-            }
-
-            if (Nrf24l01_Interrupt_Flag == true)
-            {
-                uint8_t receive_package[255] = {0};
-                uint8_t length_buffer = Nrf24l01.getPacketLength();
-                int16_t assert = Nrf24l01.readData(receive_package, length_buffer);
-                if (assert != RADIOLIB_ERR_NONE)
-                    printf("nrf24l01 receive fail (error assert: %d)\n", assert);
-                else
-                {
-                    float buffer_rssi = Nrf24l01.getRSSI();
-                    float buffer_lqi = Nrf24l01.getSNR();
-
-                    char buffer_time[15];
-                    snprintf(buffer_time, sizeof(buffer_time), "%02d:%02d:%02d", System_Ui->_time.hour, System_Ui->_time.minute, System_Ui->_time.second);
-
-                    std::vector<uint8_t> buffer_vector(receive_package, receive_package + length_buffer);
-                    buffer_vector.erase(std::remove(buffer_vector.begin(), buffer_vector.end(), 0), buffer_vector.end());
-                    std::string message_str(buffer_vector.begin(), buffer_vector.end());
-                    message_str += '\0';
-
-                    char buffer_data_info[30];
-                    snprintf(buffer_data_info, sizeof(buffer_data_info), "rssi[%.01f] snr[%.01f]", buffer_rssi, buffer_lqi);
-
-                    Lvgl_Ui::System::Win_Rf_Chat_Message wlcm =
-                        {
-                            .direction = Lvgl_Ui::System::Chat_Message_Direction::RECEIVE,
-                            .time = buffer_time,
-                            .data = message_str,
-                            .data_info = buffer_data_info,
-                        };
-                    System_Ui->_registry.win.rf.chat_message_data.push_back(wlcm);
-
-                    if (System_Ui->_current_win == Lvgl_Ui::System::Current_Win::RF)
-                    {
-                        _lock_acquire(&lvgl_api_lock);
-                        System_Ui->win_rf_chat_message_data_update(System_Ui->_registry.win.rf.chat_message_data);
-                        _lock_release(&lvgl_api_lock);
-                    }
-                }
-
-                Nrf24l01_Interrupt_Flag = false;
-            }
-        }
-        break;
-#endif
-
-        default:
-            break;
-        }
-
-        if (Device_Rf_Task_Stop_Flag == true)
-            vTaskSuspend(Rf_Task_Handle);
 
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+}
+
+void device_scope_app_task(void *arg)
+{
+    // This task is no longer used — scope redraws via LVGL timer instead.
+    // Kept as a stub so the task handle/creation doesn't need to change.
+    printf("device_scope_app_task start (stub — using LVGL timer)\n");
+    vTaskSuspend(NULL);
+    while (1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
 }
 
 void iis_transmission_data_stream_task(void *arg)
@@ -2019,6 +1792,19 @@ void my_touchpad_read(lv_indev_t *indev, lv_indev_data_t *data)
 
     if (got_touch)
     {
+        // Track last touch for screen timeout
+        g_last_touch_ms = esp_log_timestamp();
+        // Wake screen on touch if blanked
+        if (g_screen_blanked) {
+            g_screen_blanked = false;
+            if (screen_is_rm69a10()) {
+                set_rm69a10_brightness(Screen_Mipi_Dpi_Panel, g_settings.brightness * 255 / 100);
+            } else {
+                HI8561_T->start_pwm_gradient_time(g_settings.brightness, 200);
+            }
+            data->state = LV_INDEV_STATE_REL;  // swallow the wake touch
+            return;
+        }
         if (System_Ui->get_current_win() == Lvgl_Ui::System::Current_Win::CIT_TOUCH_TEST)
         {
             data->point.x = tp.info[0].x;
@@ -2442,10 +2228,29 @@ void System_Ui_Callback_Init(void)
 
     System_Ui->_win_adsb_status_callback = [](bool status)
     {
+        if (Adsb_App_Task_Handle == NULL) return;
         if (status == true)
             vTaskResume(Adsb_App_Task_Handle);
         else
             vTaskSuspend(Adsb_App_Task_Handle);
+    };
+
+    System_Ui->_win_meshy_status_callback = [](bool status)
+    {
+        if (Meshy_App_Task_Handle == NULL) return;
+        if (status == true)
+            vTaskResume(Meshy_App_Task_Handle);
+        else
+            vTaskSuspend(Meshy_App_Task_Handle);
+    };
+
+    System_Ui->_win_scope_status_callback = [](bool status)
+    {
+        if (Scope_App_Task_Handle == NULL) return;
+        if (status == true)
+            vTaskResume(Scope_App_Task_Handle);
+        else
+            vTaskSuspend(Scope_App_Task_Handle);
     };
 
     System_Ui->_win_rf_config_sx1262_params_callback = [](Lvgl_Ui::System::Device_Sx1262 device_sx1262) -> bool
@@ -2468,30 +2273,7 @@ void System_Ui_Callback_Init(void)
         return true;
     };
 
-    System_Ui->_win_rf_send_data_callback = [](std::string data)
-    {
-        memset(Rf_Send_Package, '\0', sizeof(Rf_Send_Package));
-        if (data.size() <= 255)
-            memcpy(Rf_Send_Package, data.data(), data.size());
-        else
-        {
-            memcpy(Rf_Send_Package, data.data(), 254);
-            Rf_Send_Package[254] = '\0';
-            printf("lora send out of bounds(data > Rf_Send_Package)\n");
-        }
-        Rf_Send_Flag = true;
-    };
-
-    System_Ui->_win_rf_status_callback = [](bool status)
-    {
-        if (status == true)
-        {
-            Device_Rf_Task_Stop_Flag = false;
-            vTaskResume(Rf_Task_Handle);
-        }
-        else
-            Device_Rf_Task_Stop_Flag = true;
-    };
+    // RF send/status callbacks removed — SX1262 is now managed by Meshy (Meshtastic)
 
     System_Ui->_win_music_start_end_callback = [](bool status)
     {
@@ -3386,6 +3168,24 @@ extern "C" void *g_usb_dma_reservation;
 extern "C" void app_main(void)
 {
     printf("Hello world!\n");
+
+    // Initialize NVS flash and load settings
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err != ESP_OK) {
+        printf("[NVS] Init failed (0x%x), erasing and reinitializing...\n", nvs_err);
+        nvs_flash_erase();
+        nvs_err = nvs_flash_init();
+        if (nvs_err != ESP_OK) {
+            printf("[NVS] Still failed after erase (0x%x) — settings won't persist\n", nvs_err);
+        }
+    }
+    settings_load();
+    printf("[SETTINGS] Loaded: tz=%+d:%02d%s brightness=%d meshy=%s adsb=%s\n",
+           g_settings.tz_offset_h, g_settings.tz_offset_m,
+           g_settings.dst_enabled ? " DST" : "",
+           g_settings.brightness,
+           g_settings.meshy_enabled ? "on" : "off",
+           g_settings.adsb_enabled ? "on" : "off");
     printf("[MEM] boot start: internal=%u PSRAM=%u\n",
            heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
            heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
@@ -3589,7 +3389,11 @@ extern "C" void app_main(void)
     printf("[MEM] before USB host: internal=%u PSRAM=%u\n",
            heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
            heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-    rtlsdr_adsb_start();
+    if (g_settings.adsb_enabled) {
+        rtlsdr_adsb_start();
+    } else {
+        printf("[SETTINGS] ADS-B disabled — USB host not started\n");
+    }
 
     // ---------------------------------------------------------------
     // Now init LVGL and the startup screen.
@@ -3862,6 +3666,16 @@ extern "C" void app_main(void)
 
     System_Ui->set_config_rf_params(System_Ui->_device_sx1262);
 
+    // Initialize Meshy (Meshtastic) — pass hardware pointers, then start
+    // after SX1262 is configured. This reconfigures the radio for Meshtastic
+    // parameters (MediumFast, slot 45, 913.375 MHz).
+    meshy_set_hw(SX1262.get(), XL9535.get());
+    if (g_settings.meshy_enabled) {
+        meshy_start();
+    } else {
+        printf("[SETTINGS] Meshtastic disabled — radio not started\n");
+    }
+
     _lock_acquire(&lvgl_api_lock);
     Set_Lvgl_Startup_Progress_Bar(100);
     _lock_release(&lvgl_api_lock);
@@ -3873,30 +3687,53 @@ extern "C" void app_main(void)
     // ADS-B aircraft display is now handled by the on-device ADS-B app
     // (init_win_adsb in lvgl_ui.cpp). The old home-screen table is removed.
 
-    // Task stacks in internal RAM — some tasks pass stack-local variables
-    // to I2C/SPI/UART drivers that require DMA-accessible memory.
-    // LVGL task is the exception (no DMA from stack, uses PSRAM via xTaskCreateWithCaps).
-    xTaskCreate(device_vibration_task,   "device_vibration_task",   4 * 1024, NULL, 2, &Vibration_Task_Handle);
-    xTaskCreate(device_speaker_task,     "device_speaker_task",     4 * 1024, NULL, 3, &Speaker_Task_Handle);
-    xTaskCreate(device_microphone_task,  "device_microphone_task",  4 * 1024, NULL, 3, &Microphone_Task_Handle);
-    xTaskCreate(device_imu_task,         "device_imu_task",         4 * 1024, NULL, 3, &Imu_Task_Handle);
-    xTaskCreate(device_battery_health_task, "device_battery_health_task", 8 * 1024, NULL, 3, NULL);
-    xTaskCreate(device_gps_task,         "device_gps_task",         8 * 1024, NULL, 3, &Gps_Task_Handle);
-    xTaskCreate(device_ethernet_task,    "device_ethernet_task",    4 * 1024, NULL, 3, &Ethernet_Task_Handle);
-    xTaskCreate(device_rtc_task,         "device_rtc_task",         4 * 1024, NULL, 3, NULL);
-    xTaskCreate(device_at_task,          "device_at_task",          4 * 1024, NULL, 3, &At_Task_Handle);
-    xTaskCreate(device_rf_task,          "device_rf_task",          4 * 1024, NULL, 3, &Rf_Task_Handle);
-    xTaskCreate(device_adsb_app_task,    "adsb_app_task",           8 * 1024, NULL, 3, &Adsb_App_Task_Handle);
-    xTaskCreate(iis_transmission_data_stream_task, "iis_transmission_data_stream_task", 4 * 1024, NULL, 4, &Iis_Transmission_Data_Stream_Task);
+    // ── Task stack allocation strategy ──
+    // INTERNAL RAM stacks: Only for tasks that interact with SPI DMA or USB host,
+    // where ESP-IDF checks buffer pointer capability.
+    //   - usb_host, class_driver, usb_quit (USB subsystem)
+    //   - meshy_rx, meshy_tx (SX1262 SPI via cpp_bus_driver — DMA pre-alloc buffers)
+    //
+    // PSRAM stacks: Everything else. These tasks use I2C (FIFO, no DMA from stack),
+    // UART (GPS), I2S (driver-managed DMA), or just read data and update LVGL.
+    // Moving them frees ~56KB of internal RAM for DMA, AES, and heap headroom.
+
+    xTaskCreateWithCaps(device_vibration_task,   "vibration",   4 * 1024, NULL, 2, &Vibration_Task_Handle, MALLOC_CAP_SPIRAM);
+    xTaskCreateWithCaps(device_speaker_task,     "speaker",     4 * 1024, NULL, 3, &Speaker_Task_Handle, MALLOC_CAP_SPIRAM);
+    xTaskCreateWithCaps(device_microphone_task,  "microphone",  4 * 1024, NULL, 3, &Microphone_Task_Handle, MALLOC_CAP_SPIRAM);
+    xTaskCreateWithCaps(device_imu_task,         "imu",         4 * 1024, NULL, 3, &Imu_Task_Handle, MALLOC_CAP_SPIRAM);
+    xTaskCreateWithCaps(device_battery_health_task, "battery",  8 * 1024, NULL, 3, NULL, MALLOC_CAP_SPIRAM);
+    xTaskCreateWithCaps(device_gps_task,         "gps",         8 * 1024, NULL, 3, &Gps_Task_Handle, MALLOC_CAP_SPIRAM);
+    xTaskCreateWithCaps(device_ethernet_task,    "ethernet",    4 * 1024, NULL, 3, &Ethernet_Task_Handle, MALLOC_CAP_SPIRAM);
+    xTaskCreateWithCaps(device_rtc_task,         "rtc",         4 * 1024, NULL, 3, NULL, MALLOC_CAP_SPIRAM);
+    xTaskCreateWithCaps(device_at_task,          "at_status",   4 * 1024, NULL, 3, &At_Task_Handle, MALLOC_CAP_SPIRAM);
+    // device_rf_task removed — SX1262 is now managed by Meshy (Meshtastic)
+    // App tasks: read data + update LVGL labels/canvas. No SPI/DMA — safe for PSRAM stacks.
+    xTaskCreateWithCaps(device_adsb_app_task,    "adsb_app",    8 * 1024, NULL, 3, &Adsb_App_Task_Handle, MALLOC_CAP_SPIRAM);
+    xTaskCreateWithCaps(device_meshy_app_task,   "meshy_app",   8 * 1024, NULL, 3, &Meshy_App_Task_Handle, MALLOC_CAP_SPIRAM);
+    xTaskCreateWithCaps(device_scope_app_task,   "scope_app",  16 * 1024, NULL, 3, &Scope_App_Task_Handle, MALLOC_CAP_SPIRAM);
+    xTaskCreateWithCaps(iis_transmission_data_stream_task, "iis_stream", 4 * 1024, NULL, 4, &Iis_Transmission_Data_Stream_Task, MALLOC_CAP_SPIRAM);
 
 #if defined CONFIG_BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
-    xTaskCreate(device_nfc_task, "device_nfc_task", 8 * 1024, NULL, 3, &Nfc_Task_Handle);
+    xTaskCreateWithCaps(device_nfc_task, "nfc", 8 * 1024, NULL, 3, &Nfc_Task_Handle, MALLOC_CAP_SPIRAM);
 #endif
 
     while (lv_display_flush_is_last(lv_display_get_default()) == false)
         vTaskDelay(pdMS_TO_TICKS(10));
 
     printf("system ui init finish\n");
+
+    // Start persistent trail recording — 1Hz esp_timer, runs in background from boot
+    // so trails are available when user opens Scope later
+    scope_trail_init();
+
+    // Apply saved brightness and init screen timeout
+    g_last_touch_ms = esp_log_timestamp();
+
+    // Enable double-tap wake/sleep if configured
+    if (g_settings.double_tap_wake) {
+        ICM20948_Imu_Mode = Imu_Mode::DOUBLE_TAP_WAKE;
+        if (Imu_Task_Handle) vTaskResume(Imu_Task_Handle);
+    }
     printf("[MEM] after UI + tasks: internal=%u\n", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     System_Ui->set_vibration();
 

@@ -1,0 +1,297 @@
+// device_settings.h — Persistent device settings backed by NVS flash
+// Versioned blob with forward-compatible migration.
+//
+// RULES FOR FUTURE CHANGES:
+//   1. Bump SETTINGS_VERSION
+//   2. Add new fields ONLY at the end (before _pad)
+//   3. Reduce _pad size by the bytes you added
+//   4. The memcpy migration in settings_load() handles it automatically:
+//      old blob is smaller, new fields stay at their defaults.
+//   5. If you must reorder fields (DON'T), add an explicit migration case.
+#pragma once
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include "nvs_flash.h"
+#include "nvs.h"
+#include "esp_log.h"
+#include "esp_system.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define SETTINGS_NVS_NAMESPACE "dev_settings"
+#define SETTINGS_VERSION       3    // bump when struct changes
+
+// ─── Settings structure ──────────────────────────────────────────────────────
+
+typedef struct {
+    // ── Display ──
+    uint8_t  brightness;          // 0-100%, default 80
+    uint16_t screen_timeout_s;    // 0 = never, default 120 (2 min)
+    bool     double_tap_wake;     // IMU double-tap toggles display, default true
+    bool     auto_rotation;       // auto-rotate based on orientation, default false
+
+    // ── Time & Date ──
+    int8_t   tz_offset_h;        // timezone hours offset from UTC, -12 to +14
+    int8_t   tz_offset_m;        // timezone minutes offset (0 or 30)
+    bool     dst_enabled;         // daylight saving time active, default false
+    bool     time_24h;            // 24h format, default true
+
+    // ── ADS-B ──
+    bool     adsb_enabled;        // enable RTL-SDR receiver, default true
+    bool     adsb_sd_logging;     // log to SD card, default true
+    bool     adsb_manual_pos;     // use manual position instead of GPS
+    double   adsb_manual_lat;     // manual receiver latitude
+    double   adsb_manual_lon;     // manual receiver longitude
+
+    // ── Meshtastic ──
+    bool     meshy_enabled;       // enable LoRa radio, default true
+    bool     meshy_sd_logging;    // log to SD card, default true
+    uint8_t  meshy_region;        // 0=US..14=SG
+    uint8_t  meshy_preset;        // 0=LongFast..5=ShortSlow
+    uint8_t  meshy_tx_power;      // dBm, default 30
+    char     meshy_node_name[16]; // short name, default "" (auto from MAC)
+    uint8_t  meshy_channel;       // channel index 0-7, default 0
+
+    // ── GPS ──
+    bool     gps_enabled;         // enable L76K GPS, default true
+
+    // ── Audio & Haptics ──
+    uint8_t  volume;              // 0-100%, default 50
+    bool     haptic_enabled;      // vibration feedback, default true
+
+    // ── Scope Display ──
+    uint8_t  scope_fps_cap;       // 0=auto, 5/10/15/30, default 0 (auto)
+    uint8_t  scope_max_aircraft;  // 0=unlimited, 16/32/48/64, default 0
+
+    // ── Console ──
+    bool     heartbeat_enabled;    // serial console heartbeat, default true
+    uint8_t  heartbeat_period_s;   // heartbeat period in seconds (5-255), default 30
+
+    // ── ADD NEW FIELDS HERE — consume _pad bytes, bump SETTINGS_VERSION ──
+
+    // ── Reserved for future fields ──
+    uint8_t  _pad[963];
+} device_settings_t;
+
+// Struct must be exactly 1024 bytes — adjust _pad if this fires
+// (alignment may differ on RISC-V vs x86; the assert catches it)
+_Static_assert(sizeof(device_settings_t) == 1024, "device_settings_t must be 1024 bytes — adjust _pad");
+
+// ─── Default values ──────────────────────────────────────────────────────────
+
+static inline void settings_apply_defaults(device_settings_t *s) {
+    memset(s, 0, sizeof(*s));
+    s->brightness       = 80;
+    s->screen_timeout_s = 120;
+    s->double_tap_wake  = true;
+    s->auto_rotation    = false;
+    s->tz_offset_h      = -8;    // PST
+    s->tz_offset_m      = 0;
+    s->dst_enabled      = true;  // PDT
+    s->time_24h         = true;
+    s->adsb_enabled     = true;
+    s->adsb_sd_logging  = true;
+    s->adsb_manual_pos  = false;
+    s->adsb_manual_lat  = 0.0;
+    s->adsb_manual_lon  = 0.0;
+    s->meshy_enabled    = true;
+    s->meshy_sd_logging = true;
+    s->meshy_region     = 0;     // US
+    s->meshy_preset     = 2;     // MediumFast
+    s->meshy_tx_power   = 30;
+    s->meshy_node_name[0] = '\0';
+    s->meshy_channel    = 0;
+    s->gps_enabled      = true;
+    s->volume           = 50;
+    s->haptic_enabled   = true;
+    s->scope_fps_cap    = 0;     // auto
+    s->scope_max_aircraft = 0;   // unlimited
+    s->heartbeat_enabled = true;
+    s->heartbeat_period_s = 30;
+}
+
+// Legacy wrapper for any code that calls settings_defaults()
+static inline device_settings_t settings_defaults(void) {
+    device_settings_t s;
+    settings_apply_defaults(&s);
+    return s;
+}
+
+// ─── Validation — clamp all values to safe ranges ────────────────────────────
+
+static inline void settings_validate(device_settings_t *s) {
+    if (s->brightness < 5 || s->brightness > 100) s->brightness = 80;
+    if (s->screen_timeout_s > 600) s->screen_timeout_s = 120;
+    if (s->tz_offset_h < -12 || s->tz_offset_h > 14) s->tz_offset_h = -8;
+    if (s->meshy_region > 14) s->meshy_region = 0;
+    if (s->meshy_preset > 5) s->meshy_preset = 2;
+    if (s->meshy_channel > 7) s->meshy_channel = 0;
+    if (s->meshy_tx_power > 30) s->meshy_tx_power = 30;
+    if (s->volume > 100) s->volume = 50;
+    if (s->scope_fps_cap > 30) s->scope_fps_cap = 0;
+    if (s->scope_max_aircraft > 64) s->scope_max_aircraft = 0;
+    if (s->heartbeat_period_s < 5) s->heartbeat_period_s = 30;
+}
+
+// ─── Global settings instance (defined in main.cpp) ──────────────────────────
+
+extern device_settings_t g_settings;
+
+// Screen timeout state (defined in main.cpp)
+extern volatile uint32_t g_last_touch_ms;
+extern volatile bool g_screen_blanked;
+
+// ─── Deferred NVS persistence ─────────────────────────────────────────────────
+
+static volatile bool _settings_save_pending = false;
+static volatile bool _settings_reset_pending = false;
+
+// ─── Load with version migration ─────────────────────────────────────────────
+
+static inline void settings_load(void) {
+    settings_apply_defaults(&g_settings);
+
+    nvs_handle_t nvs;
+    if (nvs_open(SETTINGS_NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+        ESP_LOGW("SETTINGS", "No saved settings found, using defaults");
+        return;
+    }
+
+    // Read stored version (separate key, not in blob)
+    uint8_t stored_version = 0;
+    nvs_get_u8(nvs, "ver", &stored_version);
+
+    if (stored_version == 0) {
+        // Pre-versioned blob — cannot migrate safely, use defaults
+        ESP_LOGW("SETTINGS", "Unversioned settings (v0) — using defaults");
+        nvs_close(nvs);
+        return;
+    }
+
+    // Read blob into temp buffer (static — main task stack is only ~3.5KB)
+    static uint8_t raw[1024];
+    size_t len = sizeof(raw);
+    if (nvs_get_blob(nvs, "cfg", raw, &len) != ESP_OK) {
+        ESP_LOGW("SETTINGS", "Failed to read settings blob, using defaults");
+        nvs_close(nvs);
+        return;
+    }
+    nvs_close(nvs);
+
+    if (stored_version > SETTINGS_VERSION) {
+        // Downgrade — blob is from newer firmware, don't trust it
+        ESP_LOGW("SETTINGS", "Settings v%d > firmware v%d — using defaults",
+                 stored_version, SETTINGS_VERSION);
+        return;
+    }
+
+    // Migration: g_settings starts as defaults. Copy the old blob over it.
+    // Since new fields are always appended at the end (before _pad):
+    //   - Old fields at the same offsets get overwritten with saved values
+    //   - New fields beyond the old blob size keep their defaults
+    //   - _pad is always zero
+    size_t copy = (len < sizeof(g_settings)) ? len : sizeof(g_settings);
+    memcpy(&g_settings, raw, copy);
+
+    if (stored_version < SETTINGS_VERSION) {
+        ESP_LOGI("SETTINGS", "Migrated v%d -> v%d (%zu bytes)", stored_version, SETTINGS_VERSION, len);
+        // Future: add explicit field fixups here if a migration is non-trivial
+        // switch (stored_version) {
+        //     case 2: /* v2->v3: new_field was added, default is fine */ break;
+        // }
+    } else {
+        ESP_LOGI("SETTINGS", "Loaded v%d settings (%zu bytes)", stored_version, len);
+    }
+
+    settings_validate(&g_settings);
+}
+
+// Called from LVGL callbacks (PSRAM stack) — just sets a flag
+static inline void settings_save(void) {
+    _settings_save_pending = true;
+}
+
+// Called from a task with INTERNAL RAM stack (e.g. battery task)
+static inline void settings_save_if_pending(void) {
+    if (_settings_reset_pending) {
+        _settings_reset_pending = false;
+        _settings_save_pending = false;
+        nvs_handle_t nvs;
+        if (nvs_open(SETTINGS_NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+            nvs_erase_all(nvs);
+            nvs_set_u8(nvs, "ver", SETTINGS_VERSION);
+            nvs_set_blob(nvs, "cfg", &g_settings, sizeof(g_settings));
+            nvs_commit(nvs);
+            nvs_close(nvs);
+        }
+        ESP_LOGI("SETTINGS", "Factory reset complete — defaults saved (v%d)", SETTINGS_VERSION);
+        return;
+    }
+
+    if (!_settings_save_pending) return;
+    _settings_save_pending = false;
+
+    nvs_handle_t nvs;
+    if (nvs_open(SETTINGS_NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) {
+        ESP_LOGE("SETTINGS", "Failed to open NVS for writing");
+        return;
+    }
+
+    nvs_set_u8(nvs, "ver", SETTINGS_VERSION);
+    if (nvs_set_blob(nvs, "cfg", &g_settings, sizeof(g_settings)) != ESP_OK) {
+        ESP_LOGE("SETTINGS", "Failed to write settings blob");
+    } else {
+        nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+}
+
+// Called from LVGL callbacks (PSRAM stack) — deferred
+static inline void settings_reset(void) {
+    settings_apply_defaults(&g_settings);
+    _settings_reset_pending = true;
+}
+
+// ─── Helper: total UTC offset in minutes (including DST) ─────────────────────
+
+static inline int settings_utc_offset_minutes(void) {
+    int offset = g_settings.tz_offset_h * 60 + g_settings.tz_offset_m;
+    if (g_settings.dst_enabled) offset += 60;
+    return offset;
+}
+
+// ─── String helpers for UI ──────────────────────────────────────────────────
+
+static inline const char *settings_region_name(uint8_t region) {
+    static const char *names[] = {
+        "US", "EU_868", "EU_433", "CN", "JP", "ANZ", "KR", "TW",
+        "RU", "IN", "NZ", "TH", "UA", "MY", "SG"
+    };
+    return (region < sizeof(names)/sizeof(names[0])) ? names[region] : "?";
+}
+
+static inline const char *settings_preset_name(uint8_t preset) {
+    static const char *names[] = {
+        "LongFast", "LongSlow", "MediumFast", "MediumSlow", "ShortFast", "ShortSlow"
+    };
+    return (preset < sizeof(names)/sizeof(names[0])) ? names[preset] : "?";
+}
+
+static inline const char *settings_tz_string(void) {
+    static char buf[16];
+    int h = g_settings.tz_offset_h;
+    int m = g_settings.tz_offset_m;
+    snprintf(buf, sizeof(buf), "UTC%+d:%02d%s", h, m < 0 ? -m : m,
+             g_settings.dst_enabled ? " DST" : "");
+    return buf;
+}
+
+#ifdef __cplusplus
+}
+#endif
