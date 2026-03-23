@@ -15,6 +15,8 @@
 
 This project turns a LILYGO T-Display-P4 development board into a standalone ADS-B receiver. An RTL-SDR dongle connected via USB Host receives 1090 MHz transponder signals, which are decoded in real-time on the ESP32-P4. Decoded aircraft are displayed on the built-in touchscreen, logged to SD card with full positional data, and can be viewed live on a map via the companion web app, ADS-B Scope.
 
+![Screenshot of ADS-B Scope](adsb_scope.png)
+
 ### What works today
 
 - **On-device ADS-B display** – touchscreen UI with aircraft table (ICAO, callsign, altitude, speed, heading, distance), stats panel (message rate, GPS, nearest aircraft, UTC time), draggable divider between panels, 4-way screen rotation toggle (persists across app visits)
