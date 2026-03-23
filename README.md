@@ -13,7 +13,7 @@
 
 ## Overview
 
-This project turns a LILYGO T-Display-P4 development board into a portable ADS-B receiver, Meshtastic-compatible mesh radio, and (yes, really) an MP3 player 🎵. An RTL-SDR dongle connected via USB Host receives 1090 MHz transponder signals, which are decoded in real-time on the ESP32-P4. The onboard SX1262 LoRa radio runs a Meshtastic-compatible mesh network for off-grid messaging. Decoded aircraft and mesh messages are displayed on the built-in touchscreen, logged to SD card, and can be viewed live via the companion web app, ADS-B Scope.
+This project turns a LILYGO T-Display-P4 development board into a portable ADS-B receiver, Meshtastic-compatible mesh radio, and (yes, really) an mp3 player 🎵. An RTL-SDR dongle connected via USB Host receives 1090 MHz transponder signals, which are decoded in real-time on the ESP32-P4. The onboard SX1262 LoRa radio runs a Meshtastic-compatible mesh network for off-grid messaging. Decoded aircraft and mesh messages are displayed on the built-in touchscreen, logged to SD card, and can be viewed live via the companion web app, ADS-B Scope.
 
 ![Screenshot of ADS-B Scope](adsb_scope.png)
 
@@ -26,8 +26,8 @@ This project turns a LILYGO T-Display-P4 development board into a portable ADS-B
 - **USB hot-plug** – RTL-SDR can be connected/disconnected at any time; firmware detects disconnect (10 consecutive read errors), frees stuck USB transfer, and re-initializes cleanly on reconnect
 - **Three-state RTL-SDR status** – status bar and CIT page distinguish between disconnected (grey), connected (green), and error (red) states
 - **SD card CSV logging** – UTC timestamps, raw Mode-S hex, decoded fields (ICAO, callsign, altitude, speed, heading, vertical rate, position, squawk), receiver GPS metadata (sats, HDOP). PSRAM-buffered writes with periodic flush for clean filesystem state.
-- **Meshy mesh networking** – compatible TX/RX on the SX1262 LoRa radio with channel encryption, PKI direct message decryption, node discovery, position/telemetry display, MQTT gateway forwarding, and configurable hop limit (1–7, default 5). See [Meshy](#meshy--meshtastic-mesh-radio) section below.
-- **Music player** – SD card MP3 playback via the ES8311 DAC with ID3 tag parsing, cover art display, 512 KB PSRAM readahead buffer, and gapless track scanning. Because every SIGINT platform needs a jukebox 🎶🐱
+- **Meshy mesh networking** – compatible TX/RX on the SX1262 LoRa radio with channel encryption, PKI direct message decryption, node discovery, position/telemetry display, MQTT gateway forwarding, and configurable hop limit (1–7, default 5).
+- **Music player** – SD card mp3 playback via the ES8311 DAC with ID3 tag parsing, cover art display, 512 KB PSRAM readahead buffer, and gapless track scanning. Because every SIGINT platform needs a jukebox 🎶🐱
 - **GPS timezone with DST** – L76K GNSS (5 Hz) sets the system clock with 650ms serial delay compensation; timezone determined from GPS coordinates using a compiled 0.1° grid covering 61 regions with 12 DST rules; syncs the PCF8563 RTC with local time
 - **Persistent settings** – all device and radio settings stored in NVS with version-migrated blob, validated on load, deferred writes from LVGL via internal-RAM helper task (PSRAM stack safe)
 - **Serial console** – interactive command mode (Ctrl+C) with file management, status, version query; ADS-B output buffered and replayed on return to log mode
@@ -127,11 +127,13 @@ The firmware implements a Meshtastic-compatible LoRa mesh radio using the onboar
 
 Because every open-source SIGINT platform deserves a soundtrack 🎧🛩️
 
-The firmware includes an SD card MP3 player using the onboard ES8311 DAC and NS4150B amplifier. Drop `.mp3` files in `/sdcard/music/` and they show up in the on-device player.
+The firmware includes an SD card mp3 player using the onboard ES8311 DAC and NS4150B amplifier. Drop `.mp3` files in `/sdcard/music/` and they show up in the on-device player.
+
+Prepare your mp3 files with prepare_music.py which resizes embedded album art, replaces UTF-16 characters, and accueately populates the TLEN field in the ID3 tag.
 
 ### Features
 
-- MP3 decoding via minimp3 (header-only, no external dependencies)
+- mp3 decoding via minimp3 (header-only, no external dependencies)
 - ID3v2 tag parsing for track title, artist, and album
 - Cover art extraction and display on the AMOLED/LCD screen
 - 512 KB PSRAM readahead buffer with 64 KB chunk fills for gapless playback
