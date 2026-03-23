@@ -19,13 +19,14 @@
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "tz_lookup.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define SETTINGS_NVS_NAMESPACE "dev_settings"
-#define SETTINGS_VERSION       3    // bump when struct changes
+#define SETTINGS_NVS_NAMESPACE "device_settings"
+#define SETTINGS_VERSION       8    // bump when struct changes
 
 // ─── Settings structure ──────────────────────────────────────────────────────
 
@@ -41,6 +42,8 @@ typedef struct {
     int8_t   tz_offset_m;        // timezone minutes offset (0 or 30)
     bool     dst_enabled;         // daylight saving time active, default false
     bool     time_24h;            // 24h format, default true
+    bool     show_seconds;        // show seconds on clock, default false
+    bool     tz_auto;             // true=GPS auto timezone, false=manual, default true
 
     // ── ADS-B ──
     bool     adsb_enabled;        // enable RTL-SDR receiver, default true
@@ -48,6 +51,7 @@ typedef struct {
     bool     adsb_manual_pos;     // use manual position instead of GPS
     double   adsb_manual_lat;     // manual receiver latitude
     double   adsb_manual_lon;     // manual receiver longitude
+    bool     adsb_bias_tee;       // bias-T power on antenna port (4.5V DC), default false
 
     // ── Meshtastic ──
     bool     meshy_enabled;       // enable LoRa radio, default true
@@ -56,7 +60,11 @@ typedef struct {
     uint8_t  meshy_preset;        // 0=LongFast..5=ShortSlow
     uint8_t  meshy_tx_power;      // dBm, default 30
     char     meshy_node_name[16]; // short name, default "" (auto from MAC)
-    uint8_t  meshy_channel;       // channel index 0-7, default 0
+    uint8_t  meshy_freq_slot;     // 0=auto (hash), 1+=explicit slot, default 0
+    uint8_t  meshy_role;          // 0=Client, 1=ClientMute, 2=RouterLate
+    bool     meshy_ok_to_mqtt;    // set ok_to_mqtt bit on outgoing packets, default true
+    uint16_t meshy_nodeinfo_period_m; // NODEINFO broadcast period in minutes (15-1440), default 30
+    uint8_t  meshy_hop_limit;    // TX hop limit (1-7), default 5
 
     // ── GPS ──
     bool     gps_enabled;         // enable L76K GPS, default true
@@ -76,7 +84,7 @@ typedef struct {
     // ── ADD NEW FIELDS HERE — consume _pad bytes, bump SETTINGS_VERSION ──
 
     // ── Reserved for future fields ──
-    uint8_t  _pad[963];
+    uint8_t  _pad[955];
 } device_settings_t;
 
 // Struct must be exactly 1024 bytes — adjust _pad if this fires
@@ -95,18 +103,25 @@ static inline void settings_apply_defaults(device_settings_t *s) {
     s->tz_offset_m      = 0;
     s->dst_enabled      = true;  // PDT
     s->time_24h         = true;
+    s->show_seconds     = false;
+    s->tz_auto          = true;
     s->adsb_enabled     = true;
     s->adsb_sd_logging  = true;
     s->adsb_manual_pos  = false;
     s->adsb_manual_lat  = 0.0;
     s->adsb_manual_lon  = 0.0;
+    s->adsb_bias_tee    = false;
     s->meshy_enabled    = true;
     s->meshy_sd_logging = true;
     s->meshy_region     = 0;     // US
     s->meshy_preset     = 2;     // MediumFast
     s->meshy_tx_power   = 30;
     s->meshy_node_name[0] = '\0';
-    s->meshy_channel    = 0;
+    s->meshy_freq_slot  = 0;     // auto (hash-based)
+    s->meshy_role       = 0;     // Client
+    s->meshy_ok_to_mqtt = true;
+    s->meshy_nodeinfo_period_m = 30;
+    s->meshy_hop_limit  = 5;
     s->gps_enabled      = true;
     s->volume           = 50;
     s->haptic_enabled   = true;
@@ -131,8 +146,12 @@ static inline void settings_validate(device_settings_t *s) {
     if (s->tz_offset_h < -12 || s->tz_offset_h > 14) s->tz_offset_h = -8;
     if (s->meshy_region > 14) s->meshy_region = 0;
     if (s->meshy_preset > 5) s->meshy_preset = 2;
-    if (s->meshy_channel > 7) s->meshy_channel = 0;
+    if (s->meshy_freq_slot > 200) s->meshy_freq_slot = 0;  // 0=auto, 1+=slot
+    if (s->meshy_role > 2) s->meshy_role = 0;
+    if (s->meshy_nodeinfo_period_m < 15 || s->meshy_nodeinfo_period_m > 1440)
+        s->meshy_nodeinfo_period_m = 30;
     if (s->meshy_tx_power > 30) s->meshy_tx_power = 30;
+    if (s->meshy_hop_limit < 1 || s->meshy_hop_limit > 7) s->meshy_hop_limit = 5;
     if (s->volume > 100) s->volume = 50;
     if (s->scope_fps_cap > 30) s->scope_fps_cap = 0;
     if (s->scope_max_aircraft > 64) s->scope_max_aircraft = 0;
@@ -149,8 +168,9 @@ extern volatile bool g_screen_blanked;
 
 // ─── Deferred NVS persistence ─────────────────────────────────────────────────
 
-static volatile bool _settings_save_pending = false;
-static volatile bool _settings_reset_pending = false;
+// Defined in main.cpp alongside g_settings
+extern volatile bool g_settings_save_pending;
+extern volatile bool g_settings_reset_pending;
 
 // ─── Load with version migration ─────────────────────────────────────────────
 
@@ -214,14 +234,15 @@ static inline void settings_load(void) {
 
 // Called from LVGL callbacks (PSRAM stack) — just sets a flag
 static inline void settings_save(void) {
-    _settings_save_pending = true;
+    g_settings_save_pending = true;
 }
 
-// Called from a task with INTERNAL RAM stack (e.g. battery task)
-static inline void settings_save_if_pending(void) {
-    if (_settings_reset_pending) {
-        _settings_reset_pending = false;
-        _settings_save_pending = false;
+// ── Internal: NVS write task (runs on internal RAM stack, self-deletes) ──────
+
+static void _settings_nvs_write_task(void *arg) {
+    bool is_reset = (bool)(uintptr_t)arg;
+
+    if (is_reset) {
         nvs_handle_t nvs;
         if (nvs_open(SETTINGS_NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
             nvs_erase_all(nvs);
@@ -231,31 +252,49 @@ static inline void settings_save_if_pending(void) {
             nvs_close(nvs);
         }
         ESP_LOGI("SETTINGS", "Factory reset complete — defaults saved (v%d)", SETTINGS_VERSION);
-        return;
-    }
-
-    if (!_settings_save_pending) return;
-    _settings_save_pending = false;
-
-    nvs_handle_t nvs;
-    if (nvs_open(SETTINGS_NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) {
-        ESP_LOGE("SETTINGS", "Failed to open NVS for writing");
-        return;
-    }
-
-    nvs_set_u8(nvs, "ver", SETTINGS_VERSION);
-    if (nvs_set_blob(nvs, "cfg", &g_settings, sizeof(g_settings)) != ESP_OK) {
-        ESP_LOGE("SETTINGS", "Failed to write settings blob");
     } else {
-        nvs_commit(nvs);
+        nvs_handle_t nvs;
+        if (nvs_open(SETTINGS_NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) {
+            ESP_LOGE("SETTINGS", "Failed to open NVS for writing");
+        } else {
+            nvs_set_u8(nvs, "ver", SETTINGS_VERSION);
+            if (nvs_set_blob(nvs, "cfg", &g_settings, sizeof(g_settings)) != ESP_OK) {
+                ESP_LOGE("SETTINGS", "Failed to write settings blob");
+            } else {
+                nvs_commit(nvs);
+                ESP_LOGI("SETTINGS", "Settings saved (v%d)", SETTINGS_VERSION);
+            }
+            nvs_close(nvs);
+        }
     }
-    nvs_close(nvs);
+
+    vTaskDelete(NULL);
+}
+
+// Polled from any task (safe from PSRAM stacks).
+// Spawns a short-lived internal-RAM task for the actual NVS write,
+// because SPI flash operations disable the cache (PSRAM inaccessible).
+static inline void settings_save_if_pending(void) {
+    if (g_settings_reset_pending) {
+        g_settings_reset_pending = false;
+        g_settings_save_pending = false;
+        // xTaskCreate allocates stack from internal RAM by default
+        xTaskCreate(_settings_nvs_write_task, "nvs_wr", 3072,
+                    (void *)(uintptr_t)true, 5, NULL);
+        return;
+    }
+
+    if (!g_settings_save_pending) return;
+    g_settings_save_pending = false;
+
+    xTaskCreate(_settings_nvs_write_task, "nvs_wr", 3072,
+                (void *)(uintptr_t)false, 5, NULL);
 }
 
 // Called from LVGL callbacks (PSRAM stack) — deferred
 static inline void settings_reset(void) {
     settings_apply_defaults(&g_settings);
-    _settings_reset_pending = true;
+    g_settings_reset_pending = true;
 }
 
 // ─── Helper: total UTC offset in minutes (including DST) ─────────────────────
@@ -283,13 +322,45 @@ static inline const char *settings_preset_name(uint8_t preset) {
     return (preset < sizeof(names)/sizeof(names[0])) ? names[preset] : "?";
 }
 
+static inline const char *settings_role_name(uint8_t role) {
+    static const char *names[] = { "Client", "Client Mute", "Router Late" };
+    return (role < sizeof(names)/sizeof(names[0])) ? names[role] : "?";
+}
+
 static inline const char *settings_tz_string(void) {
-    static char buf[16];
-    int h = g_settings.tz_offset_h;
-    int m = g_settings.tz_offset_m;
-    snprintf(buf, sizeof(buf), "UTC%+d:%02d%s", h, m < 0 ? -m : m,
-             g_settings.dst_enabled ? " DST" : "");
+    static char buf[24];
+    if (g_settings.tz_auto) {
+        snprintf(buf, sizeof(buf), "Auto (GPS)");
+    } else {
+        int h = g_settings.tz_offset_h;
+        int m = g_settings.tz_offset_m;
+        snprintf(buf, sizeof(buf), "UTC%+d:%02d%s", h, m < 0 ? -m : m,
+                 g_settings.dst_enabled ? " DST" : "");
+    }
     return buf;
+}
+
+// Format an offset in minutes as "UTC±H:MM" or "UTC±H:MM DST"
+static inline const char *settings_format_offset(int16_t offset_min, bool dst_active) {
+    static char buf[24];
+    int h = offset_min / 60;
+    int m = abs(offset_min) % 60;
+    snprintf(buf, sizeof(buf), "UTC%+d:%02d%s", h, m, dst_active ? " DST" : "");
+    return buf;
+}
+
+/**
+ * Apply timezone settings to the tz_lookup runtime module.
+ * Call after any change to tz_auto / tz_offset_h / tz_offset_m / dst_enabled.
+ */
+static inline void settings_apply_timezone(void) {
+    if (g_settings.tz_auto) {
+        tz_set_auto();
+    } else {
+        int16_t total = (int16_t)(g_settings.tz_offset_h * 60 + g_settings.tz_offset_m);
+        if (g_settings.dst_enabled) total += 60;
+        tz_set_manual_offset(total);
+    }
 }
 
 #ifdef __cplusplus

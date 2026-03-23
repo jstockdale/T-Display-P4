@@ -160,6 +160,10 @@ extern void init_adsb_dev(void);
 // Check if USB bulk transfer buffer is allocated and ready
 extern bool adsb_transfer_ready(void);
 
+// Enable/disable bias-T power on RTL-SDR antenna port (4.5V DC).
+// Safe to call anytime — no-op if RTL-SDR not connected.
+extern void adsb_set_bias_tee(bool on);
+
 // Free bulk transfer on disconnect — allows re-alloc on reconnect
 extern void free_adsb_transfer(void);
 

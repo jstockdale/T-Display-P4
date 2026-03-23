@@ -23,6 +23,9 @@
  *   version           – show firmware version and build info
  *   mount             – mount SD card
  *   unmount           – safely unmount SD card (aliases: eject)
+ *   webapp            – dump built-in adsb_scope.htm to serial
+ *   meshy_tx <text>   – send Meshtastic text broadcast (aliases: tx)
+ *   nvs               – NVS management (list, dump, clear)
  *   reboot            – software reset
  */
 
@@ -54,8 +57,16 @@
 #include "class_driver.h"  // for adsb_get_receiver_pos, aircraft count
 #include "tz_lookup.h"     // for timezone lookup and manual override
 #include "device_settings.h"
+#include "meshtastic_task.h"
+#include "meshy_channels.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 
 static const char *CONSOLE_TAG = "CONSOLE";
+
+// Embedded adsb_scope.htm — built into firmware via EMBED_TXTFILES in CMakeLists.txt
+extern const uint8_t adsb_scope_htm_start[] asm("_binary_adsb_scope_htm_start");
+extern const uint8_t adsb_scope_htm_end[]   asm("_binary_adsb_scope_htm_end");
 
 // ---------------------------------------------------------------------------
 // State
@@ -149,6 +160,26 @@ static void replay_flush(void) {
 }
 
 // ---------------------------------------------------------------------------
+// ESP_LOG gating — intercept all ESP_LOGI/W/E output in CMD mode
+// ---------------------------------------------------------------------------
+static vprintf_like_t s_original_log_vprintf = NULL;
+
+static int gated_log_vprintf(const char *fmt, va_list ap) {
+    if (s_mode == MODE_LOG) {
+        return s_original_log_vprintf(fmt, ap);
+    }
+    // CMD mode — buffer to replay ring
+    static char log_tmp[REPLAY_LINE_MAX];
+    static SemaphoreHandle_t log_mutex = NULL;
+    if (!log_mutex) log_mutex = xSemaphoreCreateMutex();
+    if (log_mutex) xSemaphoreTake(log_mutex, portMAX_DELAY);
+    vsnprintf(log_tmp, sizeof(log_tmp), fmt, ap);
+    replay_push(log_tmp);
+    if (log_mutex) xSemaphoreGive(log_mutex);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Mode query (called from other tasks)
 // ---------------------------------------------------------------------------
 bool serial_console_log_enabled(void) {
@@ -218,6 +249,11 @@ static void cmd_help(void) {
         "  \033[32mheartbeat\033[0m [on|off|5-255] show/set console heartbeat\n"
         "  \033[32mmount\033[0m             mount SD card\n"
         "  \033[32munmount\033[0m           safely unmount SD card\n"
+        "  \033[32mwebapp\033[0m            dump built-in adsb_scope.htm to serial\n"
+        "  \033[32mmeshy_tx\033[0m <text>   send Meshtastic text message (broadcast)\n"
+        "  \033[32mchannels\033[0m [list|reset|add|remove]  manage Meshtastic channels\n"
+        "  \033[32midentity\033[0m [<long> [<short>]]  show/set Meshy node identity\n"
+        "  \033[32mnvs\033[0m [list|dump|clear] [device|meshy|pki|all]  NVS management\n"
         "  \033[32mreboot\033[0m            software reset\n"
         "\n"
         "  Ctrl+C to escape from log mode to command mode\n"
@@ -468,6 +504,232 @@ static void cmd_version(void) {
 }
 
 // ---------------------------------------------------------------------------
+// NVS management
+// ---------------------------------------------------------------------------
+
+static const char *nvs_ns_device = SETTINGS_NVS_NAMESPACE;
+static const char *nvs_ns_meshy  = MESHY_CH_NVS_NAMESPACE;
+
+static const char *nvs_resolve_namespace(const char *name) {
+    if (!name) return NULL;
+    if (strcmp(name, "device") == 0) return nvs_ns_device;
+    if (strcmp(name, "meshy") == 0)  return nvs_ns_meshy;
+    return NULL;
+}
+
+static void nvs_list_keys(const char *ns_name, const char *ns_label) {
+    printf("  \033[1m%s\033[0m (namespace: \"%s\")\n", ns_label, ns_name);
+
+    nvs_iterator_t it = NULL;
+    esp_err_t err = nvs_entry_find("nvs", ns_name, NVS_TYPE_ANY, &it);
+    if (err == ESP_ERR_NVS_NOT_FOUND || !it) {
+        printf("    (empty)\n");
+        return;
+    }
+    if (err != ESP_OK) {
+        printf("    error: 0x%x\n", err);
+        return;
+    }
+
+    int count = 0;
+    while (it) {
+        nvs_entry_info_t info;
+        nvs_entry_info(it, &info);
+
+        const char *type_str = "?";
+        switch (info.type) {
+            case NVS_TYPE_U8:   type_str = "u8";   break;
+            case NVS_TYPE_I8:   type_str = "i8";   break;
+            case NVS_TYPE_U16:  type_str = "u16";  break;
+            case NVS_TYPE_I16:  type_str = "i16";  break;
+            case NVS_TYPE_U32:  type_str = "u32";  break;
+            case NVS_TYPE_I32:  type_str = "i32";  break;
+            case NVS_TYPE_U64:  type_str = "u64";  break;
+            case NVS_TYPE_I64:  type_str = "i64";  break;
+            case NVS_TYPE_STR:  type_str = "str";  break;
+            case NVS_TYPE_BLOB: type_str = "blob"; break;
+            default: break;
+        }
+        printf("    %-16s  %s\n", info.key, type_str);
+        count++;
+
+        err = nvs_entry_next(&it);
+        if (err != ESP_OK) break;
+    }
+    nvs_release_iterator(it);
+    printf("    (%d key%s)\n", count, count == 1 ? "" : "s");
+}
+
+static void nvs_dump_blob(const char *ns_name, const char *ns_label, const char *key) {
+    nvs_handle_t nvs;
+    if (nvs_open(ns_name, NVS_READONLY, &nvs) != ESP_OK) {
+        printf("  Failed to open namespace \"%s\"\n", ns_name);
+        return;
+    }
+
+    size_t len = 0;
+    if (nvs_get_blob(nvs, key, NULL, &len) != ESP_OK || len == 0) {
+        printf("  No blob \"%s\" in %s\n", key, ns_label);
+        nvs_close(nvs);
+        return;
+    }
+
+    // Read onto stack (blobs are < 1KB)
+    uint8_t buf[512];
+    size_t read_len = len < sizeof(buf) ? len : sizeof(buf);
+    if (nvs_get_blob(nvs, key, buf, &read_len) != ESP_OK) {
+        printf("  Failed to read blob\n");
+        nvs_close(nvs);
+        return;
+    }
+    nvs_close(nvs);
+
+    printf("  \033[1m%s\033[0m: \"%s\" (%zu bytes)\n", ns_label, key, read_len);
+    for (size_t i = 0; i < read_len; i += 16) {
+        printf("  %04x: ", (unsigned)i);
+        for (size_t j = 0; j < 16; j++) {
+            if (i + j < read_len)
+                printf("%02x ", buf[i + j]);
+            else
+                printf("   ");
+        }
+        printf(" ");
+        for (size_t j = 0; j < 16 && (i + j) < read_len; j++) {
+            uint8_t c = buf[i + j];
+            printf("%c", (c >= 0x20 && c < 0x7f) ? c : '.');
+        }
+        printf("\n");
+    }
+    if (len > sizeof(buf)) {
+        printf("  ... (truncated, %zu total)\n", len);
+    }
+}
+
+static void cmd_nvs(const char *subcmd, const char *target) {
+    if (!subcmd) {
+        printf(
+            "\n"
+            "  \033[1mNVS Management\033[0m\n"
+            "\n"
+            "  \033[32mnvs list\033[0m [device|meshy]   list keys in namespace(s)\n"
+            "  \033[32mnvs dump\033[0m [device|meshy]   hex dump settings blob\n"
+            "  \033[32mnvs clear device\033[0m          reset device settings to defaults\n"
+            "  \033[32mnvs clear meshy\033[0m           clear Meshy identity + channels (keeps PKI)\n"
+            "  \033[32mnvs clear pki\033[0m             clear PKI keypair (new key on reboot)\n"
+            "  \033[32mnvs clear all\033[0m             factory reset everything\n"
+            "\n"
+            "  Namespaces:\n"
+            "    device  = \"%s\"  (display, radio, timezone, etc.)\n"
+            "    meshy   = \"%s\"  (identity, channels, PKI keypair)\n"
+            "\n",
+            nvs_ns_device, nvs_ns_meshy
+        );
+        return;
+    }
+
+    // ── nvs list ──
+    if (strcmp(subcmd, "list") == 0) {
+        if (!target || strcmp(target, "device") == 0) {
+            nvs_list_keys(nvs_ns_device, "Device Settings");
+        }
+        if (!target || strcmp(target, "meshy") == 0) {
+            nvs_list_keys(nvs_ns_meshy, "Meshy Settings");
+        }
+        if (target && !nvs_resolve_namespace(target)) {
+            printf("  Unknown namespace: \"%s\" (use device or meshy)\n", target);
+        }
+        return;
+    }
+
+    // ── nvs dump ──
+    if (strcmp(subcmd, "dump") == 0) {
+        if (!target || strcmp(target, "device") == 0) {
+            nvs_dump_blob(nvs_ns_device, "Device Settings", "cfg");
+        }
+        if (!target || strcmp(target, "meshy") == 0) {
+            nvs_dump_blob(nvs_ns_meshy, "Meshy Settings", MESHY_CH_NVS_KEY);
+        }
+        if (target && !nvs_resolve_namespace(target)) {
+            printf("  Unknown namespace: \"%s\" (use device or meshy)\n", target);
+        }
+        return;
+    }
+
+    // ── nvs clear ──
+    if (strcmp(subcmd, "clear") == 0) {
+        if (!target) {
+            printf("  Usage: nvs clear [device|meshy|pki|all]\n");
+            return;
+        }
+
+        if (strcmp(target, "device") == 0) {
+            settings_reset();
+            printf("  Device settings reset to defaults.\n");
+            printf("  (takes effect immediately, saved on next settings_save_if_pending cycle)\n");
+
+        } else if (strcmp(target, "meshy") == 0) {
+            // Preserve PKI across the clear
+            uint8_t saved_priv[32] = {0}, saved_pub[32] = {0};
+            uint8_t saved_valid = 0;
+            if (g_meshy_channels.pki_valid) {
+                memcpy(saved_priv, g_meshy_channels.pki_private_key, 32);
+                memcpy(saved_pub, g_meshy_channels.pki_public_key, 32);
+                saved_valid = g_meshy_channels.pki_valid;
+            }
+
+            // Erase NVS
+            nvs_handle_t nvs;
+            if (nvs_open(nvs_ns_meshy, NVS_READWRITE, &nvs) == ESP_OK) {
+                nvs_erase_all(nvs);
+                nvs_commit(nvs);
+                nvs_close(nvs);
+            }
+
+            // Rebuild with PKI preserved
+            memset(&g_meshy_channels, 0, sizeof(g_meshy_channels));
+            if (saved_valid) {
+                memcpy(g_meshy_channels.pki_private_key, saved_priv, 32);
+                memcpy(g_meshy_channels.pki_public_key, saved_pub, 32);
+                g_meshy_channels.pki_valid = saved_valid;
+            }
+            memset(saved_priv, 0, sizeof(saved_priv));
+            meshy_channels_save();
+            printf("  Meshy identity + channels cleared (PKI keypair preserved).\n");
+            printf("  New identity will be generated on reboot.\n");
+
+        } else if (strcmp(target, "pki") == 0) {
+            memset(g_meshy_channels.pki_private_key, 0, sizeof(g_meshy_channels.pki_private_key));
+            memset(g_meshy_channels.pki_public_key, 0, sizeof(g_meshy_channels.pki_public_key));
+            g_meshy_channels.pki_valid = 0;
+            meshy_channels_save();
+            printf("  PKI keypair cleared. New key generated on reboot.\n");
+            printf("  Other Meshtastic nodes will need to re-learn your public key.\n");
+
+        } else if (strcmp(target, "all") == 0) {
+            // Device settings
+            settings_reset();
+
+            // Meshy: full erase
+            nvs_handle_t nvs;
+            if (nvs_open(nvs_ns_meshy, NVS_READWRITE, &nvs) == ESP_OK) {
+                nvs_erase_all(nvs);
+                nvs_commit(nvs);
+                nvs_close(nvs);
+            }
+            memset(&g_meshy_channels, 0, sizeof(g_meshy_channels));
+            printf("  Full factory reset. All settings, identity, and PKI cleared.\n");
+            printf("  Reboot to apply: type 'reboot'\n");
+
+        } else {
+            printf("  Unknown target: \"%s\" (use device, meshy, pki, or all)\n", target);
+        }
+        return;
+    }
+
+    printf("  Unknown subcommand: \"%s\" (type 'nvs' for help)\n", subcmd);
+}
+
+// ---------------------------------------------------------------------------
 // Command dispatcher
 // ---------------------------------------------------------------------------
 static void dispatch_command(char *line) {
@@ -481,15 +743,19 @@ static void dispatch_command(char *line) {
     // Parse command and args
     char *cmd = line;
     char *arg1 = NULL, *arg2 = NULL;
+    char *full_args = NULL;   // everything after cmd, unsplit
+    char *arg_split = NULL;   // position of null byte between arg1/arg2 (restorable)
 
     char *sp = strchr(line, ' ');
     if (sp) {
         *sp = '\0';
         arg1 = sp + 1;
         while (*arg1 == ' ') arg1++;
+        full_args = arg1;     // save before further splitting
 
         sp = strchr(arg1, ' ');
         if (sp) {
+            arg_split = sp;   // save so we can restore for commands needing full text
             *sp = '\0';
             arg2 = sp + 1;
             while (*arg2 == ' ') arg2++;
@@ -547,12 +813,13 @@ static void dispatch_command(char *line) {
     } else if (strcmp(cmd, "timezone") == 0 || strcmp(cmd, "tz") == 0) {
         if (!arg1) {
             // Show current timezone status
-            receiver_pos_t rx = adsb_get_receiver_pos();
-            if (tz_is_manual()) {
-                printf("  Mode: manual\n");
-            } else {
-                printf("  Mode: auto (GPS)\n");
+            printf("  Mode: %s\n", g_settings.tz_auto ? "auto (GPS)" : "manual");
+            if (!g_settings.tz_auto) {
+                int16_t total = g_settings.tz_offset_h * 60 + g_settings.tz_offset_m;
+                if (g_settings.dst_enabled) total += 60;
+                printf("  Manual offset: %s\n", settings_format_offset(total, g_settings.dst_enabled));
             }
+            receiver_pos_t rx = adsb_get_receiver_pos();
             if (rx.fix_valid) {
                 struct timeval tv;
                 gettimeofday(&tv, NULL);
@@ -560,25 +827,22 @@ static void dispatch_command(char *line) {
                 gmtime_r(&tv.tv_sec, &tm_utc);
                 tz_result_t tz = tz_lookup(rx.lat, rx.lon,
                     tm_utc.tm_year + 1900, tm_utc.tm_mon + 1, tm_utc.tm_mday);
-                int off_h = tz.total_offset_min / 60;
-                int off_m = abs(tz.total_offset_min) % 60;
-                printf("  Position: %.4f, %.4f\n", rx.lat, rx.lon);
-                printf("  Offset:   UTC%+d", off_h);
-                if (off_m) printf(":%02d", off_m);
-                printf(" (%d min)\n", tz.total_offset_min);
-                printf("  Std:      UTC%+d (%d min)\n", tz.std_offset_min / 60, tz.std_offset_min);
+                printf("  GPS position: %.4f, %.4f\n", rx.lat, rx.lon);
+                printf("  Auto offset:  %s\n", settings_format_offset(tz.total_offset_min, tz.dst_active));
                 if (tz.has_dst)
-                    printf("  DST:      %s (%+d min)\n", tz.dst_active ? "ACTIVE" : "inactive", tz.dst_offset_min);
+                    printf("  DST:          %s (%+d min)\n", tz.dst_active ? "ACTIVE" : "inactive", tz.dst_offset_min);
                 else
-                    printf("  DST:      not observed\n");
+                    printf("  DST:          not observed\n");
             } else {
-                printf("  No GPS fix — cannot compute timezone\n");
+                printf("  No GPS fix — auto timezone unavailable\n");
             }
         } else if (strcmp(arg1, "auto") == 0) {
-            tz_set_auto();
+            g_settings.tz_auto = true;
+            settings_apply_timezone();
+            settings_save();
             printf("  Timezone set to automatic (GPS-based)\n");
         } else {
-            // Parse UTC±N or UTC±N:MM
+            // Parse UTC±N or UTC±N:MM — sets manual mode
             const char *p = arg1;
             if (strncasecmp(p, "UTC", 3) == 0) p += 3;
             int hours = 0, minutes = 0;
@@ -592,10 +856,17 @@ static void dispatch_command(char *line) {
             if (total < -720 || total > 840) {
                 printf("  Invalid offset (range: UTC-12 to UTC+14)\n");
             } else {
-                tz_set_manual_offset((int16_t)total);
+                g_settings.tz_auto = false;
+                g_settings.tz_offset_h = (int8_t)(total / 60);
+                g_settings.tz_offset_m = (int8_t)(abs(total) % 60);
+                if (total < 0 && g_settings.tz_offset_m > 0)
+                    g_settings.tz_offset_m = -g_settings.tz_offset_m;
+                g_settings.dst_enabled = false;
+                settings_apply_timezone();
+                settings_save();
                 printf("  Timezone set to UTC%c%d", total >= 0 ? '+' : '-', abs(total) / 60);
                 if (abs(total) % 60) printf(":%02d", abs(total) % 60);
-                printf(" (manual)\n");
+                printf(" (manual, persisted)\n");
             }
         }
     } else if (strcmp(cmd, "heartbeat") == 0 || strcmp(cmd, "hb") == 0) {
@@ -622,6 +893,102 @@ static void dispatch_command(char *line) {
                 printf("  Usage: heartbeat [on|off|5-255]\n");
             }
         }
+    } else if (strcmp(cmd, "webapp") == 0) {
+        size_t len = adsb_scope_htm_end - adsb_scope_htm_start;
+        printf("  Sending adsb_scope.htm (%zu bytes)...\n", len);
+        const uint8_t *p = adsb_scope_htm_start;
+        size_t remaining = len;
+        while (remaining > 0) {
+            size_t chunk = remaining > 4096 ? 4096 : remaining;
+            fwrite(p, 1, chunk, stdout);
+            p += chunk;
+            remaining -= chunk;
+            fflush(stdout);
+            taskYIELD();
+        }
+        printf("\n");
+    } else if (strcmp(cmd, "meshy_tx") == 0 || strcmp(cmd, "tx") == 0) {
+        // Restore full text after command (arg split may have inserted NUL)
+        if (arg_split) *arg_split = ' ';
+        if (!full_args || !full_args[0]) {
+            printf("  usage: meshy_tx <message text>\n");
+        } else if (!meshy_send_text(full_args)) {
+            printf("  TX failed (radio not running?)\n");
+        } else {
+            printf("  TX queued: \"%s\"\n", full_args);
+        }
+    } else if (strcmp(cmd, "channels") == 0) {
+        if (!arg1 || strcmp(arg1, "list") == 0) {
+            printf("  Ch 0: (default) PSK index 1, enabled\n");
+            int n = meshy_channels_count();
+            for (int i = 0; i < n; i++) {
+                const meshy_channel_cfg_t *ch = meshy_channels_get(i);
+                printf("  Ch %d: \"%s\" psk_len=%d %s\n", i + 1,
+                       ch->name[0] ? ch->name : "(unnamed)",
+                       ch->psk_len, ch->enabled ? "ON" : "OFF");
+            }
+            if (n == 0) printf("  (no extra channels configured)\n");
+        } else if (strcmp(arg1, "reset") == 0) {
+            meshy_channels_reset();
+            printf("  All extra channels cleared\n");
+            if (g_settings.meshy_enabled) meshy_restart();
+        } else if (strcmp(arg1, "add") == 0) {
+            // channels add <name> -- creates channel with default PSK (index 1)
+            // For custom PSKs, use the webapp channel manager.
+            if (!arg2) {
+                printf("  usage: channels add <name>\n");
+                printf("  Creates a named channel with default PSK. Use webapp for custom PSKs.\n");
+            } else {
+                int count = meshy_channels_count();
+                if (count >= MESHY_CH_MAX_EXTRA) {
+                    printf("  Channel table full (%d extra channels)\n", MESHY_CH_MAX_EXTRA);
+                } else {
+                    uint8_t default_psk = 1;
+                    meshy_channels_set(count, arg2, &default_psk, 1, true);
+                    meshy_channels_save();
+                    printf("  Added channel %d: \"%s\" (default PSK)\n", count + 1, arg2);
+                    if (g_settings.meshy_enabled) meshy_restart();
+                }
+            }
+        } else if (strcmp(arg1, "remove") == 0) {
+            if (!arg2) {
+                printf("  usage: channels remove <index>  (1-based, 0=default cannot be removed)\n");
+            } else {
+                int idx = atoi(arg2) - 1;  // user gives 1-based, API is 0-based
+                if (idx < 0 || idx >= meshy_channels_count()) {
+                    printf("  Invalid index (have %d extra channels)\n", meshy_channels_count());
+                } else {
+                    const meshy_channel_cfg_t *ch = meshy_channels_get(idx);
+                    printf("  Removing channel %d: \"%s\"\n", idx + 1,
+                           ch && ch->name[0] ? ch->name : "(unnamed)");
+                    meshy_channels_remove(idx);
+                    meshy_channels_save();
+                    if (g_settings.meshy_enabled) meshy_restart();
+                }
+            }
+        } else {
+            printf("  usage: channels [list|reset|add <name> <psk>|remove <idx>]\n");
+        }
+    } else if (strcmp(cmd, "identity") == 0) {
+        if (!arg1) {
+            // Show current identity
+            printf("  long_name:  \"%s\"\n", meshy_channels_long_name());
+            printf("  short_name: \"%s\"\n", meshy_channels_short_name());
+        } else if (arg2) {
+            // identity <long_name> <short_name>
+            // Restore the split to get full long_name up to last space-separated token
+            // Actually: arg1=long_name, arg2=short_name
+            meshy_channels_set_identity(arg1, arg2);
+            printf("  Identity set: \"%s\" (%s)\n", arg1, arg2);
+        } else {
+            // identity <long_name> — auto-derive short_name from first 4 chars
+            char short_auto[5] = {0};
+            strncpy(short_auto, arg1, 4);
+            meshy_channels_set_identity(arg1, short_auto);
+            printf("  Identity set: \"%s\" (%s)\n", arg1, short_auto);
+        }
+    } else if (strcmp(cmd, "nvs") == 0) {
+        cmd_nvs(arg1, arg2);
     } else if (strcmp(cmd, "reboot") == 0) {
         printf("  Shutting down SD card...\n");
         extern void sd_safe_shutdown(void);
@@ -659,10 +1026,10 @@ static void serial_console_task(void *arg) {
             if (s_mode == MODE_LOG && g_settings.heartbeat_enabled &&
                 esp_log_timestamp() >= heartbeat_next) {
                 printf("[CONSOLE] Serial console heartbeat\n");
-                printf("[MEM] internal: %u free, %u largest | psram: %u free\n",
-                       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-                       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-                       (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+                printf("[MEM] internal=%u largest=%u PSRAM=%u\n",
+                       heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                       heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                       heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
                 heartbeat_next = esp_log_timestamp() + (g_settings.heartbeat_period_s * 1000);
             }
             vTaskDelay(pdMS_TO_TICKS(50));
@@ -714,6 +1081,10 @@ static void serial_console_task(void *arg) {
 void serial_console_init(void) {
     s_mode_mutex = xSemaphoreCreateMutex();
     replay_init();
+
+    // Hook ESP_LOG output — gates all ESP_LOGI/W/E in CMD mode
+    s_original_log_vprintf = esp_log_set_vprintf(gated_log_vprintf);
+
     // Console task does file I/O and stdin reads — no SPI/DMA, safe for PSRAM stack.
     // Must use PSRAM because internal RAM is exhausted by meshy SPI tasks.
     BaseType_t ret = xTaskCreateWithCaps(serial_console_task, "console", 8192, NULL, 2, NULL, MALLOC_CAP_SPIRAM);

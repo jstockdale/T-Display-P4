@@ -29,6 +29,10 @@
 #include "esp_mac.h"
 #include "esp_heap_caps.h"
 #include "device_settings.h"
+
+// GPS fix epoch — set in GPS task on first quality fix.
+extern volatile time_t g_gps_fix_epoch;
+#include "meshy_channels.h"
 #include "serial_console.h"
 
 // Cpp_Bus_Driver includes
@@ -63,6 +67,9 @@ static TaskHandle_t s_tx_task_hdl = nullptr;
 
 static QueueHandle_t s_rx_queue  = nullptr;  // meshy_msg_t → UI
 static QueueHandle_t s_tx_queue  = nullptr;  // tx_request_t → TX task
+
+// SPI bus mutex — shared between RX and TX tasks for SX1262 access
+static SemaphoreHandle_t s_spi_mutex = nullptr;
 
 typedef struct {
     uint32_t to;
@@ -198,13 +205,16 @@ static void meshy_sd_log_msg(const meshy_msg_t *msg) {
     }
 
     // Check if GPS fix arrived and we should rename the file
-    time_t now;
-    time(&now);
-    if (now >= 1704067200LL && strstr(meshy_sd_filename, "_boot")) {
+    if (g_gps_fix_epoch > 0 && strstr(meshy_sd_filename, "_boot")) {
         meshy_sd_flush();
         char old_name[64];
         strncpy(old_name, meshy_sd_filename, sizeof(old_name));
-        meshy_sd_pick_filename();
+        // Use GPS fix epoch for filename — matches ADS-B log timestamp
+        struct tm timeinfo;
+        time_t fix_time = g_gps_fix_epoch;
+        gmtime_r(&fix_time, &timeinfo);
+        strftime(meshy_sd_filename, sizeof(meshy_sd_filename),
+            "/sdcard/meshy_%Y-%m-%dT%H%M%SZ.csv", &timeinfo);
         rename(old_name, meshy_sd_filename);
         MESHY_LOGI("Meshy SD renamed: %s", meshy_sd_filename);
     }
@@ -212,6 +222,7 @@ static void meshy_sd_log_msg(const meshy_msg_t *msg) {
     // Format timestamp (static to keep off 4KB stack)
     static char ts[32];
     struct tm timeinfo;
+    time_t now;
     time(&now);
     gmtime_r(&now, &timeinfo);
     if (now >= 1704067200LL) {
@@ -324,16 +335,22 @@ static void update_node_from_packet(const MeshRxResult *result) {
 
     // Update from decoded content
     if (result->data.portnum == PORT_NODEINFO) {
-        static MeshUser user;  // ~95 bytes → BSS (single-threaded RX task only)
+        MeshUser user;
         if (meshDecodeUser(result->data.payload, result->data.payload_len, &user)) {
             strncpy(node->long_name, user.long_name, sizeof(node->long_name) - 1);
             strncpy(node->short_name, user.short_name, sizeof(node->short_name) - 1);
             node->hw_model = user.hw_model;
-            MESHY_LOGI("Node !%08lx: %s (%s)", (unsigned long)node->node_num,
-                     node->long_name, node->short_name);
+            // Store public key for PKI DM decryption
+            if (user.public_key_len == 32) {
+                memcpy(node->public_key, user.public_key, 32);
+                node->public_key_len = 32;
+            }
+            MESHY_LOGI("Node !%08lx: %s (%s)%s", (unsigned long)node->node_num,
+                     node->long_name, node->short_name,
+                     node->public_key_len == 32 ? " [PKI]" : "");
         }
     } else if (result->data.portnum == PORT_POSITION) {
-        static MeshPosition pos;  // ~24 bytes → BSS (single-threaded RX task)
+        MeshPosition pos;
         if (meshDecodePosition(result->data.payload, result->data.payload_len, &pos)) {
             if (pos.latitude_i != 0 || pos.longitude_i != 0) {
                 node->has_position = true;
@@ -343,7 +360,7 @@ static void update_node_from_packet(const MeshRxResult *result) {
             }
         }
     } else if (result->data.portnum == PORT_TELEMETRY) {
-        static MeshTelemetry tel;  // ~28 bytes → BSS (single-threaded RX task)
+        MeshTelemetry tel;
         if (meshDecodeTelemetry(result->data.payload, result->data.payload_len, &tel)) {
             if (tel.has_device_metrics) {
                 node->battery_level = tel.device_metrics.battery_level;
@@ -353,6 +370,79 @@ static void update_node_from_packet(const MeshRxResult *result) {
 
     s_stats.known_nodes = s_node_count;
     xSemaphoreGive(s_node_mutex);
+}
+
+// ─── PKI DM Decryption Fallback ─────────────────────────────────────────────
+//
+// Called when channel-based decryption fails. Checks if the packet is
+// addressed to us, looks up the sender's public key, and attempts
+// XChaCha20-Poly1305 decryption with the X25519 shared secret.
+
+static bool try_pki_decrypt(const uint8_t *raw, size_t raw_len,
+                             float rssi, float snr,
+                             MeshRxResult *result)
+{
+    // Need our private key
+    const uint8_t *our_priv = meshy_pki_private_key();
+    if (!our_priv) return false;
+
+    // Parse header (minimum check)
+    if (raw_len < sizeof(MeshPacketHeader)) return false;
+    if (!meshParsePacket(raw, raw_len, &result->packet)) return false;
+
+    result->packet.rssi = rssi;
+    result->packet.snr  = snr;
+
+    // Only attempt PKI for packets addressed specifically to us (not broadcast)
+    if (result->packet.to != s_session.node_num) return false;
+    if (result->packet.to == MESH_ADDR_BROADCAST) return false;
+
+    // Look up sender's public key from node table
+    uint8_t sender_pubkey[32];
+    bool found_key = false;
+
+    xSemaphoreTake(s_node_mutex, portMAX_DELAY);
+    for (int i = 0; i < s_node_count; i++) {
+        if (s_nodes[i].node_num == result->packet.from && s_nodes[i].public_key_len == 32) {
+            memcpy(sender_pubkey, s_nodes[i].public_key, 32);
+            found_key = true;
+            break;
+        }
+    }
+    xSemaphoreGive(s_node_mutex);
+
+    if (!found_key) {
+        ESP_LOGD(TAG, "PKI: no public key for !%08lx", (unsigned long)result->packet.from);
+        return false;
+    }
+
+    // Attempt XChaCha20-Poly1305 decryption
+    uint8_t plaintext[240];
+    size_t  plain_len = 0;
+
+    if (!meshDecryptPki(our_priv, sender_pubkey, result->packet.from, result->packet.id,
+                         result->packet.payload, result->packet.payload_len,
+                         plaintext, &plain_len)) {
+        ESP_LOGD(TAG, "PKI: decrypt failed for !%08lx id=%lu",
+                 (unsigned long)result->packet.from, (unsigned long)result->packet.id);
+        return false;
+    }
+
+    // Decode Data protobuf envelope
+    if (!meshDecodeData(plaintext, plain_len, &result->data)) {
+        ESP_LOGD(TAG, "PKI: Data decode failed after decrypt");
+        return false;
+    }
+
+    result->channel_idx = -1;  // not a channel-based packet
+    result->decrypted = true;
+    result->is_pki = true;
+    result->packet.channel_index = -1;
+
+    ESP_LOGI(TAG, "PKI DM decrypted from !%08lx (port=%d, %zu bytes)",
+             (unsigned long)result->packet.from, result->data.portnum, plain_len);
+
+    return true;
 }
 
 // ─── Build meshy_msg_t from MeshRxResult ────────────────────────────────────
@@ -382,7 +472,7 @@ static void build_msg(const MeshRxResult *result, meshy_msg_t *msg) {
             break;
         }
         case PORT_POSITION: {
-            static MeshPosition pos;  // → BSS (called only from RX task)
+            MeshPosition pos;
             if (meshDecodePosition(result->data.payload, result->data.payload_len, &pos)) {
                 msg->has_position = true;
                 msg->lat = pos.latitude();
@@ -392,7 +482,7 @@ static void build_msg(const MeshRxResult *result, meshy_msg_t *msg) {
             break;
         }
         case PORT_NODEINFO: {
-            static MeshUser user;  // → BSS (called only from RX task)
+            MeshUser user;
             if (meshDecodeUser(result->data.payload, result->data.payload_len, &user)) {
                 msg->has_nodeinfo = true;
                 strncpy(msg->long_name, user.long_name, sizeof(msg->long_name) - 1);
@@ -401,7 +491,7 @@ static void build_msg(const MeshRxResult *result, meshy_msg_t *msg) {
             break;
         }
         case PORT_TELEMETRY: {
-            static MeshTelemetry tel;  // → BSS (called only from RX task)
+            MeshTelemetry tel;
             if (meshDecodeTelemetry(result->data.payload, result->data.payload_len, &tel)) {
                 if (tel.has_device_metrics) {
                     msg->has_telemetry = true;
@@ -462,7 +552,8 @@ static bool configure_radio(void) {
     if (!s_sx1262 || !s_xl9535) return false;
 
     const char *ch_name = s_session.channels.effectiveName(0);
-    MeshRadioConfig rc = s_session.radioConfig();
+    int8_t tx_pwr = (int8_t)g_settings.meshy_tx_power;
+    MeshRadioConfig rc = s_session.radioConfig(tx_pwr);
 
     MESHY_LOGI("Configuring SX1262: %.3f MHz, BW%.0f, SF%d, CR4/%d, SW 0x%02X, %ddBm",
              rc.frequency_mhz, rc.bandwidth_khz, rc.spreading_factor,
@@ -504,17 +595,22 @@ static void meshy_rx_task(void *arg) {
     ESP_LOGI(TAG, "RX task started");
 
     while (s_running) {
-        // Poll DIO1 through XL9535 GPIO expander
+        // Poll DIO1 through XL9535 GPIO expander (I2C — no mutex needed)
         if (s_xl9535->pin_read(XL9535_SX1262_DIO1) == 1) {
-            static Cpp_Bus_Driver::Sx126x::Irq_Status irq;  // → BSS (avoid stack churn)
+            // ── SPI critical section: read IRQ, read data, read metrics ──
+            xSemaphoreTake(s_spi_mutex, portMAX_DELAY);
+
+            Cpp_Bus_Driver::Sx126x::Irq_Status irq;
             if (!s_sx1262->parse_irq_status(s_sx1262->get_irq_flag(), irq)) {
                 s_sx1262->clear_irq_flag(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::RX_DONE);
+                xSemaphoreGive(s_spi_mutex);
                 vTaskDelay(pdMS_TO_TICKS(10));
                 continue;
             }
 
             if (irq.all_flag.crc_error) {
                 s_sx1262->clear_irq_flag(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::CRC_ERROR);
+                xSemaphoreGive(s_spi_mutex);
                 vTaskDelay(pdMS_TO_TICKS(10));
                 continue;
             }
@@ -525,12 +621,14 @@ static void meshy_rx_task(void *arg) {
                 s_sx1262->start_lora_transmit(Cpp_Bus_Driver::Sx126x::Chip_Mode::RX);
                 s_sx1262->set_irq_pin_mode(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::RX_DONE);
                 s_sx1262->clear_irq_flag(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::RX_DONE);
+                xSemaphoreGive(s_spi_mutex);
                 vTaskDelay(pdMS_TO_TICKS(10));
                 continue;
             }
 
             if (irq.lora_reg_flag.header_error) {
                 s_sx1262->clear_irq_flag(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::HEADER_ERROR);
+                xSemaphoreGive(s_spi_mutex);
                 vTaskDelay(pdMS_TO_TICKS(10));
                 continue;
             }
@@ -543,24 +641,36 @@ static void meshy_rx_task(void *arg) {
             // and we re-read the same buffer every poll cycle
             s_sx1262->clear_irq_flag(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::RX_DONE);
 
-            if (len == 0) {
-                vTaskDelay(pdMS_TO_TICKS(10));
-                continue;
-            }
-
             // Get RSSI/SNR
             float rssi = 0, snr = 0;
-            static Cpp_Bus_Driver::Sx126x::Packet_Metrics pm;  // → BSS
+            Cpp_Bus_Driver::Sx126x::Packet_Metrics pm;
             if (s_sx1262->get_lora_packet_metrics(pm)) {
                 rssi = pm.lora.rssi_instantaneous;
                 snr  = pm.lora.snr;
             }
 
+            // ── End SPI critical section ──
+            xSemaphoreGive(s_spi_mutex);
+
+            if (len == 0) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+
             s_stats.rx_packets++;
 
             // Process through Meshtastic protocol
-            static MeshRxResult result;  // ~350 bytes → BSS (was blowing 6KB internal stack)
-            if (s_session.processRx(raw, len, rssi, snr, &result)) {
+            MeshRxResult result;
+            memset(&result, 0, sizeof(result));
+
+            bool decoded = s_session.processRx(raw, len, rssi, snr, &result);
+
+            // If channel decrypt failed, try PKI decryption for DMs addressed to us
+            if (!decoded) {
+                decoded = try_pki_decrypt(raw, len, rssi, snr, &result);
+            }
+
+            if (decoded) {
                 s_stats.rx_decoded++;
 
                 // Update node table
@@ -638,10 +748,124 @@ static void meshy_rx_task(void *arg) {
 
     ESP_LOGI(TAG, "RX task exiting");
     s_rx_task_hdl = nullptr;
-    vTaskDelete(NULL);
+    vTaskDeleteWithCaps(NULL);
 }
 
 // ─── TX Task ────────────────────────────────────────────────────────────────
+
+// NODEINFO state
+static bool     s_nodeinfo_sent = false;
+static uint32_t s_nodeinfo_next_ms = 0;
+
+/**
+ * Transmit a raw frame over SX1262.
+ * Handles the full send_data → set_tx → poll → return-to-RX sequence.
+ * Returns true on success (TX_DONE received within 5s).
+ */
+static bool transmit_frame(const uint8_t *frame, size_t frame_len) {
+    // CSMA/CA random backoff (before taking mutex — don't block RX during backoff)
+    uint32_t delay = meshTxDelayMs(s_session.preset);
+    if (delay > 0) {
+        ESP_LOGI(TAG, "CSMA/CA backoff: %lu ms", (unsigned long)delay);
+        vTaskDelay(pdMS_TO_TICKS(delay));
+    }
+
+    // ── SPI critical section: FIFO write → TX → poll → return to RX ──
+    xSemaphoreTake(s_spi_mutex, portMAX_DELAY);
+
+    // Step 1: Write frame to SX1262 FIFO
+    // send_data takes non-const uint8_t* (bus driver API), but does not modify
+    if (!s_sx1262->send_data(const_cast<uint8_t *>(frame), (uint8_t)frame_len)) {
+        ESP_LOGE(TAG, "send_data (buffer write) failed");
+        xSemaphoreGive(s_spi_mutex);
+        return false;
+    }
+
+    // Step 2: Switch RF antenna to TX path (SKY13453: HIGH = TX)
+    s_xl9535->pin_write(XL9535_SKY13453_VCTL, Cpp_Bus_Driver::Xl95x5::Value::HIGH);
+
+    // Step 3: Configure IRQ for TX_DONE on DIO1
+    s_sx1262->set_irq_pin_mode(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::TX_DONE);
+    s_sx1262->clear_irq_flag(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::TX_DONE);
+
+    // Step 4: Issue SetTx — radio starts transmitting from buffer NOW
+    s_sx1262->set_tx(0);
+
+    // Step 5: Wait for TX_DONE (poll DIO1)
+    uint16_t timeout = 0;
+    bool tx_ok = false;
+    while (timeout < 500) {  // 5 second max
+        if (s_xl9535->pin_read(XL9535_SX1262_DIO1) == 1) {
+            Cpp_Bus_Driver::Sx126x::Irq_Status irq;
+            if (s_sx1262->parse_irq_status(s_sx1262->get_irq_flag(), irq)) {
+                if (irq.all_flag.tx_done) {
+                    tx_ok = true;
+                    break;
+                }
+            }
+        }
+        timeout++;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    s_sx1262->clear_irq_flag(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::TX_DONE);
+
+    if (!tx_ok) {
+        ESP_LOGE(TAG, "TX timeout after %d ms", timeout * 10);
+    }
+
+    // Step 6: Return to RX
+    s_xl9535->pin_write(XL9535_SKY13453_VCTL, Cpp_Bus_Driver::Xl95x5::Value::LOW);
+    s_sx1262->start_lora_transmit(Cpp_Bus_Driver::Sx126x::Chip_Mode::RX);
+    s_sx1262->set_irq_pin_mode(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::RX_DONE);
+    s_sx1262->clear_irq_flag(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::RX_DONE);
+
+    // ── End SPI critical section ──
+    xSemaphoreGive(s_spi_mutex);
+
+    return tx_ok;
+}
+
+/**
+ * Build and transmit a NODEINFO broadcast.
+ * Uses identity from NVS store (meshy_channels).
+ */
+static bool transmit_nodeinfo(void) {
+    const char *long_name  = meshy_channels_long_name();
+    const char *short_name = meshy_channels_short_name();
+    bool ok_to_mqtt = g_settings.meshy_ok_to_mqtt;
+
+    // Build "!XXXXXXXX" id string from our node_num
+    char id_str[16];
+    snprintf(id_str, sizeof(id_str), "!%08lx", (unsigned long)s_session.node_num);
+
+    // Get PKI public key (NULL if not yet generated)
+    const uint8_t *pub_key = meshy_pki_public_key();
+    uint8_t pub_key_len = pub_key ? 32 : 0;
+
+    static uint8_t frame[256];
+    size_t frame_len = s_session.buildNodeInfoTx(
+        0, MESH_ADDR_BROADCAST,
+        id_str, long_name, short_name,
+        255,  // PRIVATE_HW — not an official Meshtastic device
+        false, ok_to_mqtt, frame,
+        pub_key, pub_key_len,
+        g_settings.meshy_hop_limit);
+
+    if (frame_len == 0) {
+        ESP_LOGE(TAG, "Failed to build NODEINFO frame");
+        return false;
+    }
+
+    ESP_LOGI(TAG, "NODEINFO frame built: %zu bytes", frame_len);
+
+    if (transmit_frame(frame, frame_len)) {
+        s_stats.tx_packets++;
+        MESHY_LOGI("[TX:NODE] \"%s\" (%s)", long_name, short_name);
+        return true;
+    }
+    return false;
+}
 
 static void meshy_tx_task(void *arg) {
     ESP_LOGI(TAG, "TX task started");
@@ -649,74 +873,98 @@ static void meshy_tx_task(void *arg) {
     while (s_running) {
         static tx_request_t req;
         if (xQueueReceive(s_tx_queue, &req, pdMS_TO_TICKS(200)) == pdTRUE) {
-            // CSMA/CA random backoff
-            uint32_t delay = meshTxDelayMs(s_session.preset);
-            if (delay > 0) {
-                ESP_LOGI(TAG, "CSMA/CA backoff: %lu ms", (unsigned long)delay);
-                vTaskDelay(pdMS_TO_TICKS(delay));
+            // ── First TX: send NODEINFO before the text message ──
+            if (!s_nodeinfo_sent) {
+                if (transmit_nodeinfo()) {
+                    s_nodeinfo_sent = true;
+                    uint32_t period_ms = (uint32_t)g_settings.meshy_nodeinfo_period_m * 60 * 1000;
+                    s_nodeinfo_next_ms = esp_log_timestamp() + period_ms;
+                }
+                vTaskDelay(pdMS_TO_TICKS(4000));  // let NODEINFO propagate before text
             }
 
-            // Build encrypted TX frame
+            // ── Text message TX ──
+            bool ok_to_mqtt = g_settings.meshy_ok_to_mqtt;
+
             static uint8_t frame[256];
             size_t frame_len = s_session.buildTextTx(
-                req.channel_idx, req.to, req.text, false, frame);
+                req.channel_idx, req.to, req.text, false, ok_to_mqtt, frame,
+                g_settings.meshy_hop_limit);
 
             if (frame_len == 0) {
                 ESP_LOGE(TAG, "Failed to build TX frame");
                 continue;
             }
 
-            // Switch to TX
-            s_xl9535->pin_write(XL9535_SKY13453_VCTL, Cpp_Bus_Driver::Xl95x5::Value::HIGH);
+            ESP_LOGI(TAG, "TX frame built: %zu bytes", frame_len);
 
-            s_sx1262->start_lora_transmit(Cpp_Bus_Driver::Sx126x::Chip_Mode::TX, 0,
-                                           Cpp_Bus_Driver::Sx126x::Fallback_Mode::FS);
-            s_sx1262->set_irq_pin_mode(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::TX_DONE);
-            s_sx1262->clear_irq_flag(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::TX_DONE);
-
-            if (s_sx1262->send_data(frame, frame_len)) {
-                // Wait for TX done (poll DIO1)
-                uint16_t timeout = 0;
-                bool tx_ok = false;
-                while (timeout < 500) {  // 5 second max
-                    if (s_xl9535->pin_read(XL9535_SX1262_DIO1) == 1) {
-                        static Cpp_Bus_Driver::Sx126x::Irq_Status irq;  // → BSS (4KB TX stack)
-                        if (s_sx1262->parse_irq_status(s_sx1262->get_irq_flag(), irq)) {
-                            if (irq.all_flag.tx_done) {
-                                tx_ok = true;
-                                break;
-                            }
-                        }
-                    }
-                    timeout++;
-                    vTaskDelay(pdMS_TO_TICKS(10));
-                }
-
-                if (tx_ok) {
-                    s_stats.tx_packets++;
-                    ESP_LOGI(TAG, "TX success: %zu bytes to %s",
-                             frame_len, req.to == MESH_ADDR_BROADCAST ? "broadcast" : "DM");
-                } else {
-                    ESP_LOGE(TAG, "TX timeout");
-                }
-            } else {
-                ESP_LOGE(TAG, "send_data failed");
+            if (transmit_frame(frame, frame_len)) {
+                s_stats.tx_packets++;
+                MESHY_LOGI("[TX] \"%s\"", req.text);
             }
-
-            // Return to RX
-            s_xl9535->pin_write(XL9535_SKY13453_VCTL, Cpp_Bus_Driver::Xl95x5::Value::LOW);
-            s_sx1262->start_lora_transmit(Cpp_Bus_Driver::Sx126x::Chip_Mode::RX);
-            s_sx1262->set_irq_pin_mode(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::RX_DONE);
-            s_sx1262->clear_irq_flag(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::RX_DONE);
+        } else {
+            // ── Queue timeout (200ms) — check periodic NODEINFO ──
+            if (s_nodeinfo_sent && esp_log_timestamp() >= s_nodeinfo_next_ms) {
+                if (transmit_nodeinfo()) {
+                    uint32_t period_ms = (uint32_t)g_settings.meshy_nodeinfo_period_m * 60 * 1000;
+                    s_nodeinfo_next_ms = esp_log_timestamp() + period_ms;
+                }
+            }
         }
     }
 
     ESP_LOGI(TAG, "TX task exiting");
     s_tx_task_hdl = nullptr;
-    vTaskDelete(NULL);
+    vTaskDeleteWithCaps(NULL);
 }
 
 // ─── Public API ─────────────────────────────────────────────────────────────
+
+// Map device_settings indices to meshtastic-lite enums.
+// The settings UI presents a curated subset in display order;
+// the radio library uses a different numbering.
+
+static MeshModemPreset settings_to_preset(uint8_t idx) {
+    static const MeshModemPreset map[] = {
+        MODEM_LONG_FAST,    // 0: LongFast
+        MODEM_LONG_SLOW,    // 1: LongSlow
+        MODEM_MEDIUM_FAST,  // 2: MediumFast
+        MODEM_MEDIUM_SLOW,  // 3: MediumSlow
+        MODEM_SHORT_FAST,   // 4: ShortFast
+        MODEM_SHORT_SLOW,   // 5: ShortSlow
+    };
+    return (idx < sizeof(map)/sizeof(map[0])) ? map[idx] : MODEM_MEDIUM_FAST;
+}
+
+static MeshRegion settings_to_region(uint8_t idx) {
+    static const MeshRegion map[] = {
+        REGION_US,       // 0:  US
+        REGION_EU_868,   // 1:  EU_868
+        REGION_EU_433,   // 2:  EU_433
+        REGION_CN,       // 3:  CN
+        REGION_JP,       // 4:  JP
+        REGION_ANZ,      // 5:  ANZ
+        REGION_KR,       // 6:  KR
+        REGION_TW,       // 7:  TW
+        REGION_RU,       // 8:  RU
+        REGION_IN,       // 9:  IN
+        REGION_NZ_865,   // 10: NZ
+        REGION_TH,       // 11: TH
+        REGION_UNSET,    // 12: UA (no dedicated band plan)
+        REGION_UNSET,    // 13: MY
+        REGION_UNSET,    // 14: SG
+    };
+    return (idx < sizeof(map)/sizeof(map[0])) ? map[idx] : REGION_US;
+}
+
+static MeshRole settings_to_role(uint8_t idx) {
+    static const MeshRole map[] = {
+        ROLE_CLIENT,       // 0: Client
+        ROLE_CLIENT_MUTE,  // 1: Client Mute
+        ROLE_ROUTER_LATE,  // 2: Router Late
+    };
+    return (idx < sizeof(map)/sizeof(map[0])) ? map[idx] : ROLE_CLIENT;
+}
 
 // These must be set before calling meshy_start().
 // Call from main.cpp: meshy_set_hw(SX1262.get(), XL9535.get());
@@ -732,6 +980,16 @@ extern "C" bool meshy_start(void) {
         return false;
     }
 
+    // Read settings
+    MeshRegion      region = settings_to_region(g_settings.meshy_region);
+    MeshModemPreset preset = settings_to_preset(g_settings.meshy_preset);
+    MeshRole        role   = settings_to_role(g_settings.meshy_role);
+    int8_t          tx_pwr = (int8_t)g_settings.meshy_tx_power;
+
+    const char *region_name = settings_region_name(g_settings.meshy_region);
+    const char *preset_name = settings_preset_name(g_settings.meshy_preset);
+    const char *role_name   = settings_role_name(g_settings.meshy_role);
+
     // Initialize Meshtastic session
     // Node number: use lower 4 bytes of base MAC
     uint8_t mac[8];
@@ -739,16 +997,38 @@ extern "C" bool meshy_start(void) {
     uint32_t node_num = ((uint32_t)mac[2] << 24) | ((uint32_t)mac[3] << 16) |
                         ((uint32_t)mac[4] << 8) | mac[5];
 
-    s_session.init(REGION_US, MODEM_MEDIUM_FAST, ROLE_CLIENT, node_num);
+    // freq_slot: 0=auto (hash-based), 1+=explicit override
+    int32_t freq_slot = g_settings.meshy_freq_slot > 0
+        ? (int32_t)(g_settings.meshy_freq_slot - 1)  // settings 1-based → 0-based slot
+        : -1;                                          // -1 = hash-based auto
+
+    s_session.init(region, preset, role, node_num, freq_slot);
     s_session.channels.addDefaultChannel();
 
-    MESHY_LOGI("Session initialized: node=!%08lx region=US preset=MediumFast",
-             (unsigned long)node_num);
+    // Add extra channels from NVS store
+    int extra_added = 0;
+    for (int i = 0; i < meshy_channels_count(); i++) {
+        const meshy_channel_cfg_t *ch = meshy_channels_get(i);
+        if (!ch || !ch->enabled) continue;
+        int idx = s_session.channels.addChannel(
+            ch->name, ch->psk, ch->psk_len, false);
+        if (idx >= 0) extra_added++;
+    }
+
+    MESHY_LOGI("Session initialized: node=!%08lx region=%s preset=%s role=%s tx=%ddBm hop=%d slot=%s +%dch",
+             (unsigned long)node_num, region_name, preset_name, role_name,
+             tx_pwr, g_settings.meshy_hop_limit,
+             g_settings.meshy_freq_slot > 0 ? "manual" : "auto",
+             extra_added);
+
+    // Ensure PKI keypair exists (generates on first boot, loads from NVS after)
+    meshy_pki_ensure();
 
     // Create queues and allocate message history in PSRAM
     if (!s_rx_queue) s_rx_queue = xQueueCreate(16, sizeof(meshy_msg_t));
     if (!s_tx_queue) s_tx_queue = xQueueCreate(8, sizeof(tx_request_t));
     if (!s_node_mutex) s_node_mutex = xSemaphoreCreateMutex();
+    if (!s_spi_mutex)  s_spi_mutex  = xSemaphoreCreateMutex();
     if (!s_msg_history) {
         s_msg_history = (meshy_msg_t *)heap_caps_calloc(MESHY_MSG_HISTORY, sizeof(meshy_msg_t), MALLOC_CAP_SPIRAM);
         if (!s_msg_history) {
@@ -782,12 +1062,13 @@ extern "C" bool meshy_start(void) {
     s_running = true;
     s_stats.running = true;
 
-    // IMPORTANT: Meshy tasks do SPI transactions to the SX1262.
-    // SPI DMA requires buffers in internal RAM — PSRAM stacks cause
-    // ESP_ERR_NO_MEM (0x101) from spi_device_polling_transmit.
-    // Must use xTaskCreate (internal RAM stack), NOT xTaskCreateWithCaps(SPIRAM).
-    xTaskCreate(meshy_rx_task, "meshy_rx", 6144, NULL, 3, &s_rx_task_hdl);
-    xTaskCreate(meshy_tx_task, "meshy_tx", 4096, NULL, 2, &s_tx_task_hdl);
+    // Meshy tasks do SPI transactions to the SX1262.
+    // Previously required internal RAM stacks because SPI DMA accessed stack buffers.
+    // Now safe for PSRAM stacks: hardware_spi.cpp pre-allocates DMA bounce buffers
+    // in internal RAM and copies to/from them — task stack location doesn't matter.
+    // Using PSRAM stacks frees ~10KB of internal RAM for other allocations.
+    xTaskCreateWithCaps(meshy_rx_task, "meshy_rx", 6144, NULL, 3, &s_rx_task_hdl, MALLOC_CAP_SPIRAM);
+    xTaskCreateWithCaps(meshy_tx_task, "meshy_tx", 4096, NULL, 2, &s_tx_task_hdl, MALLOC_CAP_SPIRAM);
 
     MESHY_LOGI("Meshy started — listening on %.3f MHz", s_stats.freq_mhz);
     return true;
@@ -802,15 +1083,22 @@ extern "C" void meshy_stop(void) {
     for (int i = 0; i < 20 && (s_rx_task_hdl || s_tx_task_hdl); i++)
         vTaskDelay(pdMS_TO_TICKS(100));
 
-    // Put radio to standby
+    // Put radio to standby (actual power-down, not back into RX)
     if (s_sx1262) {
-        s_sx1262->start_lora_transmit(Cpp_Bus_Driver::Sx126x::Chip_Mode::RX);
+        s_sx1262->set_standby(Cpp_Bus_Driver::Sx126x::Stdby_Config::STDBY_RC);
     }
 
     // Flush any buffered SD log data
     meshy_sd_flush();
 
     MESHY_LOGI("Meshy stopped");
+}
+
+extern "C" void meshy_restart(void) {
+    MESHY_LOGI("Restarting with new settings...");
+    meshy_stop();
+    vTaskDelay(pdMS_TO_TICKS(100));  // let tasks fully clean up
+    meshy_start();
 }
 
 extern "C" bool meshy_send_text(const char *text) {

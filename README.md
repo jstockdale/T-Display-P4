@@ -2,18 +2,18 @@
  * @Description: ADS-B Receiver on LILYGO T-Display-P4
  * @Author: John Stockdale / Off by One (fork of LILYGO_L original)
  * @Date: 2025-06-13 15:12:02
- * @LastEditTime: 2026-03-17
+ * @LastEditTime: 2026-03-23
  * @License: GPL 3.0
 -->
-<h1 align="center">ADS-B Receiver – T-Display-P4</h1>
+<h1 align="center">ADS-B Scope – T-Display-P4</h1>
 
 <p align="center">
-  A portable 1090 MHz ADS-B receiver built on the LILYGO T-Display-P4, using an RTL-SDR USB dongle for RF reception and the ESP32-P4's dual RISC-V cores for real-time Mode-S decoding.
+  A portable 1090 MHz ADS-B receiver and Meshtastic-compatible mesh radio built on the LILYGO T-Display-P4, using an RTL-SDR USB dongle for RF reception, an SX1262 LoRa radio for mesh networking, and the ESP32-P4's dual RISC-V cores for real-time signal processing.
 </p>
 
 ## Overview
 
-This project turns a LILYGO T-Display-P4 development board into a standalone ADS-B receiver. An RTL-SDR dongle connected via USB Host receives 1090 MHz transponder signals, which are decoded in real-time on the ESP32-P4. Decoded aircraft are displayed on the built-in touchscreen, logged to SD card with full positional data, and can be viewed live on a map via the companion web app, ADS-B Scope.
+This project turns a LILYGO T-Display-P4 development board into a portable ADS-B receiver, Meshtastic-compatible mesh radio, and (yes, really) an MP3 player 🎵. An RTL-SDR dongle connected via USB Host receives 1090 MHz transponder signals, which are decoded in real-time on the ESP32-P4. The onboard SX1262 LoRa radio runs a Meshtastic-compatible mesh network for off-grid messaging. Decoded aircraft and mesh messages are displayed on the built-in touchscreen, logged to SD card, and can be viewed live via the companion web app, ADS-B Scope.
 
 ![Screenshot of ADS-B Scope](adsb_scope.png)
 
@@ -26,9 +26,12 @@ This project turns a LILYGO T-Display-P4 development board into a standalone ADS
 - **USB hot-plug** – RTL-SDR can be connected/disconnected at any time; firmware detects disconnect (10 consecutive read errors), frees stuck USB transfer, and re-initializes cleanly on reconnect
 - **Three-state RTL-SDR status** – status bar and CIT page distinguish between disconnected (grey), connected (green), and error (red) states
 - **SD card CSV logging** – UTC timestamps, raw Mode-S hex, decoded fields (ICAO, callsign, altitude, speed, heading, vertical rate, position, squawk), receiver GPS metadata (sats, HDOP). PSRAM-buffered writes with periodic flush for clean filesystem state.
+- **Meshy mesh networking** – compatible TX/RX on the SX1262 LoRa radio with channel encryption, PKI direct message decryption, node discovery, position/telemetry display, MQTT gateway forwarding, and configurable hop limit (1–7, default 5). See [Meshy](#meshy--meshtastic-mesh-radio) section below.
+- **Music player** – SD card MP3 playback via the ES8311 DAC with ID3 tag parsing, cover art display, 512 KB PSRAM readahead buffer, and gapless track scanning. Because every SIGINT platform needs a jukebox 🎶🐱
 - **GPS timezone with DST** – L76K GNSS (5 Hz) sets the system clock with 650ms serial delay compensation; timezone determined from GPS coordinates using a compiled 0.1° grid covering 61 regions with 12 DST rules; syncs the PCF8563 RTC with local time
+- **Persistent settings** – all device and radio settings stored in NVS with version-migrated blob, validated on load, deferred writes from LVGL via internal-RAM helper task (PSRAM stack safe)
 - **Serial console** – interactive command mode (Ctrl+C) with file management, status, version query; ADS-B output buffered and replayed on return to log mode
-- **ADS-B Scope** – WebSerial-based live map viewer with firmware flashing, CSV replay, file browser ([adsb-scope.offx1.com](https://adsb-scope.offx1.com))
+- **ADS-B Scope** – WebSerial-based live map viewer with firmware flashing, CSV replay, file browser, Meshy message panel ([adsb-scope.offx1.com](https://adsb-scope.offx1.com))
 - **SD card reliability** – power-cycled on boot via XL9535 GPIO to reset card state machine after hard resets
 - **Status bar** – dynamic icons for GPS (sat count + fix status), ADS-B (aircraft count + connection state), SD card (mounted/logging), and battery level with automatic spacing based on rendered text width
 
@@ -36,6 +39,8 @@ This project turns a LILYGO T-Display-P4 development board into a standalone ADS
 
 - **WiFi disabled** – ESP-Hosted SDIO DMA corrupts internal RAM heap metadata (Espressif Issue #17889); WiFi/NTP unavailable until resolved or AT firmware is deployed on the C6
 - **WebSerial triggers device reboot** – USB-JTAG auto-reset circuit fires on DTR toggle during port open; handled gracefully (scope reconnects, boot log is parsed)
+- **No SD card in AMOLED unit** – AMOLED variant tested without SD card; logging unavailable on that unit (hardware limitation, not software)
+- **Meshtastic identity shows as "Unknown"** – MQTT gateways display our node as "UNK" until they receive our NODEINFO broadcast. Resolves automatically after the first NODEINFO propagation cycle.
 
 ## ADS-B Scope
 
@@ -52,11 +57,13 @@ Features:
 - Sortable aircraft table with drag-resizable panel
 - Color modes: MONO (terminal green), RAINBOW (by ICAO hash), ALT (altitude heatmap), SPD (speed heatmap)
 - Label modes: altitude or distance from receiver
-- Serial log panel with ADS-B/GNSS/Other filters and pause-to-inspect
+- Serial log panel with ADS-B/GNSS/Meshy/Other filters and pause-to-inspect
+- Meshy panel with live message feed, node map overlay, position tracking, text/join/position/telemetry filters, PKI DM detection with "DM" badge, dedup with multi-reception expansion, and shift+click range selection for node analysis
 - SD card file browser over serial (list, download, replay, delete)
-- CSV replay with timeline scrubber and variable speed (0.25×–32×)
+- CSV replay with timeline scrubber and variable speed (0.25×–32×), supporting both ADS-B and Meshy CSV files simultaneously
 - OTA firmware flashing via esptool-js (WebSerial)
 - Firmware version checking against `latest.version.json` with update badge
+- Google Analytics integration (G-T71ZHWG166) loaded at end of body for offline resilience
 - Auto-reconnect after flash
 - Responsive layout with touch-friendly targets for mobile use
 - DTR/RTS deasserted on connect to minimize resets
@@ -81,10 +88,57 @@ df                show SD card free space
 status            show receiver status
 version           show firmware version
 tz [hours]        show or set UTC offset (e.g. tz -7)
+meshy_tx <text>   send Meshy text message (broadcast)
 mount             mount SD card
 unmount           safely unmount SD card
 reboot            software reset
 ```
+
+## Meshy – Meshtastic-compatible Mesh Radio
+
+The firmware implements a Meshtastic-compatible LoRa mesh radio using the onboard SX1262 (HPD16A module via SPI). It can send and receive encrypted text messages, broadcast node identity, and interoperate with standard Meshtastic devices on the same channel.
+
+### What it does
+
+- **Channel-encrypted TX/RX** – text messages and NODEINFO broadcasts encrypted with the standard Meshtastic AES-CTR scheme, compatible with any Meshtastic device on the same channel + PSK
+- **PKI direct message decryption** – receives X25519/XChaCha20-Poly1305 encrypted DMs addressed to this node, using a persistent keypair stored in NVS. Public key is broadcast in NODEINFO packets.
+- **MQTT gateway forwarding** – `ok_to_mqtt` flag encoded in the Data protobuf bitfield (field 9, bit 0) so MQTT gateways forward our packets to the internet. Confirmed working with 34+ gateways across the Bay Area mesh.
+- **Node discovery** – receives and stores NODEINFO, position, and telemetry from other nodes (512-node table in PSRAM). Nodes with public keys are tagged `[PKI]`.
+- **Configurable settings** – region (US/EU/etc), preset (LongFast through ShortSlow), frequency slot, TX power (10–30 dBm), hop limit (1–7, default 5), role (Client/ClientMute/RouterLate), NODEINFO broadcast period, and MQTT forwarding toggle. All settings persist across reboots.
+- **SD card logging** – all decoded messages logged to CSV with timestamps, RSSI, SNR, hop count, port type, decoded payload, and PKI flag
+- **Web app integration** – live Meshy panel in ADS-B Scope shows message feed with node names, position pins on the map, telemetry readouts, PKI DM badges, and radio config display (region, preset, role, TX power, hop count, frequency)
+
+### On-device Meshy UI
+
+- Draggable message panel with text input and send button
+- Message canvas with emoji-capable rendering (1800px scrollable)
+- Settings panel: LoRa Radio enable/disable, SD Card Logging, Region, Preset, Freq Slot, OK to MQTT, Hop Limit, TX Power, Role, NODEINFO period
+- Factory reset dialog with separate checkboxes for settings, Meshy channels, and PKI keypair
+
+### Architecture notes
+
+- CSMA/CA random backoff before TX (per Meshtastic spec)
+- SPI mutex shared between RX polling (50ms) and TX
+- RX/TX task stacks on internal RAM (SPI DMA requirement)
+- Message history: 1000 slots in PSRAM (376 KB)
+- Node table: 512 slots in PSRAM (69 KB)
+- NVS writes dispatched to a short-lived internal-RAM task (SPI flash disables cache, making PSRAM inaccessible)
+
+## Music Player 🎵
+
+Because every open-source SIGINT platform deserves a soundtrack 🎧🛩️
+
+The firmware includes an SD card MP3 player using the onboard ES8311 DAC and NS4150B amplifier. Drop `.mp3` files in `/sdcard/music/` and they show up in the on-device player.
+
+### Features
+
+- MP3 decoding via minimp3 (header-only, no external dependencies)
+- ID3v2 tag parsing for track title, artist, and album
+- Cover art extraction and display on the AMOLED/LCD screen
+- 512 KB PSRAM readahead buffer with 64 KB chunk fills for gapless playback
+- Configurable sample rate via `set_clock_rate()` – 44.1 kHz default
+- Track scanning at boot with up to 128 tracks
+- Readahead fill task on PSRAM stack (4 KB)
 
 ## CSV Log Format
 
@@ -96,35 +150,6 @@ timestamp_utc,raw_msg,icao,callsign,altitude_ft,speed_kt,heading_deg,vrate_fpm,l
 ```
 
 Timestamps are ISO-8601 UTC with millisecond resolution. Raw Mode-S hex is the second column for easy replay. Every row includes receiver GPS sats/HDOP for data quality assessment.
-
-## Timezone System
-
-The device automatically detects the local timezone from GPS coordinates using an offline lookup table. The system uses a 0.1° (~11km) resolution grid covering the entire world, RLE-compressed to ~165KB in flash. It includes DST transition rules for all major regions.
-
-### How it works
-1. GPS fix provides latitude/longitude
-2. Grid lookup maps coordinates to one of 61 timezone regions
-3. Each region specifies a base UTC offset and an optional DST rule
-4. DST rules encode "Nth weekday of month" transitions (e.g., 2nd Sunday of March)
-5. The current UTC date determines whether DST is active
-6. Total offset = base + DST delta
-
-### Regenerating timezone data
-If timezone rules change (rare), regenerate the data file:
-```bash
-pip install geopandas shapely requests numpy
-python3 generate_tz_data.py
-# Outputs: timezone_data.h (~165KB, copy to source directory)
-```
-
-### Serial console timezone commands
-```
-timezone              show current timezone info
-timezone auto         use GPS-based automatic timezone (default)
-timezone UTC-8        set manual offset (PST)
-timezone UTC+5:30     set manual offset (IST)
-tz                    alias for timezone
-```
 
 ## Hardware
 
@@ -155,19 +180,26 @@ All ADS-B firmware source is in `main/examples/lvgl_9_ui/`:
 
 | File | Description |
 |---|---|
-| `main.cpp` | Boot, peripheral init, GPS task, LVGL UI, task orchestration, screen detection, USB pre-alloc |
+| `main.cpp` | Boot, peripheral init, GPS task, LVGL UI, task orchestration, screen detection, USB pre-alloc, settings persistence |
 | `class_driver.c / .h` | USB host, RTL-SDR reader task, aircraft table, SD logging, stats with error state |
 | `mode-s.c / .h` | Mode S decoder (from dump1090/libmodes) |
 | `serial_console.c / .h` | Interactive console with command mode and PSRAM replay buffer |
-| `lvgl_ui.cpp / .h` | LVGL UI: ADS-B app, status bar, CIT tests, generic TouchPoint, rotation persistence |
+| `lvgl_ui.cpp / .h` | LVGL UI: ADS-B app, Meshy app, music player, settings panels, status bar, CIT tests, rotation persistence |
 | `esp_libusb.c / .h` | USB-to-librtlsdr shim, idempotent init, early DMA pre-alloc |
 | `librtlsdr.c` | RTL-SDR driver (adapted from osmocom) |
+| `device_settings.h` | Settings struct (1024-byte NVS blob), version-migrated load/save, validation, deferred NVS write via internal-RAM task |
+| `meshtastic_task.cpp / .h` | Meshy FreeRTOS tasks: SX1262 RX polling, TX queue, CSMA/CA, node table, message history, SD CSV logging |
+| `meshtastic_radio.h` | `MeshSession` class: channel encrypt/decrypt, packet build, PKI decrypt, hop limit, ok_to_mqtt |
+| `meshtastic_pb.h` | Meshtastic protobuf encoder/decoder: Data, User, Position, Telemetry, bitfield (ok_to_mqtt) |
+| `meshtastic_crypto.h` | AES-CTR channel encryption, X25519 ECDH, XChaCha20-Poly1305 PKI, SHA-256 KDF (mbedtls) |
+| `meshy_channels.h` | Channel store (NVS), PSK management, node identity, PKI keypair generation/persistence |
+| `music_player.cpp / .h` | MP3 player: minimp3 decode, ES8311 DAC output, ID3 parsing, cover art, 512 KB PSRAM readahead |
 | `tz_lookup.c / .h` | GPS coordinate → timezone offset with DST |
 | `timezone_data.h` | Generated 0.1° grid (61 regions, 12 DST rules) |
 | `generate_tz_data.py` | Timezone data generator script |
 | `screen_detect.h` | Runtime screen type detection (HI8561 vs RM69A10) |
 | `t_display_p4_driver.cpp / .h` | Runtime MIPI DSI panel creation for both display variants |
-| `adsb_scope.html` | ADS-B Scope companion web app |
+| `adsb_scope.htm` | ADS-B Scope companion web app (single-file HTML) |
 
 ## Architecture
 
@@ -183,6 +215,27 @@ Aircraft Table (256 slots, 60s expiry)
     ├──→ On-device LVGL display (lvgl_ui.cpp, aircraft table + stats panel)
     ├──→ Serial output (serial_console.c, buffered during CMD mode)
     └──→ SD card CSV log (PSRAM buffer, periodic flush)
+
+SX1262 LoRa Radio (913.125 MHz MediumFast default)
+    │ SPI with shared mutex, 50ms RX poll
+    ▼
+Meshtastic Protocol (meshtastic_radio.h)
+    │ AES-CTR channel decrypt / XChaCha20 PKI decrypt
+    ▼
+Message Processing (meshtastic_task.cpp)
+    │
+    ├──→ Node table (512 slots, PSRAM) – name, position, telemetry, public keys
+    ├──→ Message history (1000 slots, PSRAM) – dedup by packet ID
+    ├──→ On-device Meshy panel (lvgl_ui.cpp, scrollable message canvas)
+    ├──→ Serial output (tagged [MESHY] lines, parsed by webapp)
+    └──→ SD card CSV log (meshy_YYYY-MM-DDTHHMMSSZ.csv)
+
+ES8311 DAC + NS4150B Amplifier
+    │ I2S, 44.1 kHz, 16-bit stereo
+    ▼
+Music Player (music_player.cpp)
+    │ minimp3 decode → 512KB PSRAM readahead → I2S write
+    └──→ On-device player UI (track list, cover art, playback controls)
 
 L76K GPS (UART, 5 Hz NMEA)
     │
@@ -210,17 +263,31 @@ Serial Console (serial_console.c)
 
 | Stage | Internal RAM Free |
 |---|---|
-| Boot | 253 KB |
-| After USB DMA reservation | 233 KB |
-| After SD mount | ~189 KB |
-| After USB host + pre-alloc | ~179 KB |
-| Before LVGL task | ~179 KB |
-| After LVGL init | ~149 KB |
-| After ICM20948 | ~135 KB |
-| After UI + all tasks | ~83 KB |
-| PSRAM free | ~19 MB |
+| Boot | ~220 KB |
+| After SD mount | ~154 KB |
+| After USB host + pre-alloc | ~143 KB |
+| Before LVGL task | ~133 KB |
+| After UI + all tasks | ~71 KB |
+| Steady state (heartbeat) | ~75 KB |
+| Largest free block (steady) | ~32 KB |
+| PSRAM free (steady) | ~17 MB |
 
 USB bulk transfer buffer (17 KB) is pre-allocated immediately after `usb_host_install()` while internal RAM is still contiguous. A 20 KB DMA reservation block is held from the very start of boot and released just before allocation to guarantee a contiguous hole even under fragmentation.
+
+All application task stacks (speaker, readahead, ethernet, NFC, microphone, etc.) are allocated from PSRAM via `xTaskCreateWithCaps()`. Only `usb_host_lib_task` (8 KB) and the Meshy RX/TX tasks remain on internal RAM due to SPI DMA requirements. NVS writes are dispatched to a short-lived internal-RAM task because SPI flash operations disable the cache, making PSRAM inaccessible.
+
+### PSRAM consumers
+
+| What | Size |
+|---|---|
+| Meshy message history | 376 KB (1000 slots) |
+| Meshy node table | 69 KB (512 slots) |
+| Trail slots | 601 KB (64 aircraft) |
+| Music readahead buffer | 512 KB |
+| LVGL draw buffer + art | ~2 MB |
+| Speaker task stack | 32 KB |
+| LVGL task stack | 64 KB |
+| Other task stacks | ~40 KB |
 
 ## Quick Start – Pre-built Binary
 
@@ -300,42 +367,56 @@ cd build && esptool.py --chip esp32p4 merge_bin -o ../release.bin \
 
 1. **Restore WiFi** – either fix ESP-Hosted SDIO DMA or flash C6 with AT firmware
 2. **On-device radar scope** – canvas-drawn aircraft positions on map
-3. **Settings app** – timezone UI, brightness, SD format, WiFi config
-4. **Seed POSIX clock from RTC at boot** – so timestamps are approximately correct before GPS fix
-5. **SD card graceful handling** – detect "no card" early, skip retries, suppress runtime re-mount attempts
-6. **Smaller font for aircraft table** – enable montserrat_14/16 in LVGL config for more rows
+3. **PKI DM sending** – `buildPkiTx` with recipient pubkey lookup, DM recipient selector in UI
+4. **Webapp PKI DM display** – show decrypted DM text in Meshy panel
+5. **Seed POSIX clock from RTC at boot** – so timestamps are approximately correct before GPS fix
+6. **SD card graceful handling** – detect "no card" early, skip retries, suppress runtime re-mount attempts
 7. **tz-embedded open source release** – timezone library as standalone repo
-8. ~~Fix screen~~ – fixed: root cause was `esp_lcd_panel_reset()` called after `Screen_Init()` wiping DSI lane config
-9. ~~Fix USB DMA heap corruption~~ – fixed: early pre-alloc of 17KB bulk transfer buffer before heap fragmentation
-10. ~~Re-enable LVGL aircraft display~~ – fixed: on-device ADS-B app with stats panel, aircraft table, rotation toggle
-11. ~~Investigate WebSerial reset~~ – DTR race handled gracefully; scope deasserts DTR/RTS and parses reboot log
-12. ~~SD card corruption on reboot~~ – fixed: power-cycle SD card via XL9535 SD_EN early in boot to reset card state machine
-13. ~~Heading display~~ – fixed: ground speed heading (DF17 TC19 subtypes 1/2) now correctly applied
-14. ~~ADS-B decoding~~ – fixed: removed double-decode in on_msg that zeroed all messages via memset
-15. ~~Timezone~~ – fixed: GPS-derived timezone with DST support, 0.1° resolution grid covering 61 regions
-16. ~~Runtime screen detection~~ – fixed: single firmware supports both HI8561 LCD and RM69A10 AMOLED via I2C probe
-17. ~~USB hot-plug~~ – fixed: consecutive error detection, transfer buffer free/re-alloc, three-state status
+8. **scope_aircraft_t array consolidation** – three separate 64-slot arrays in lvgl_ui.cpp (~10 KB .bss savings)
+9. **Meshy decode-failed packet logging** – log raw bytes for protocol debugging
+10. **PKI DM field testing** – verify XChaCha20-Poly1305 with real Meshtastic DMs from other devices
+11. ~~Fix screen~~ – fixed: root cause was `esp_lcd_panel_reset()` called after `Screen_Init()` wiping DSI lane config
+12. ~~Fix USB DMA heap corruption~~ – fixed: early pre-alloc of 17KB bulk transfer buffer before heap fragmentation
+13. ~~Re-enable LVGL aircraft display~~ – fixed: on-device ADS-B app with stats panel, aircraft table, rotation toggle
+14. ~~Investigate WebSerial reset~~ – DTR race handled gracefully; scope deasserts DTR/RTS and parses reboot log
+15. ~~SD card corruption on reboot~~ – fixed: power-cycle SD card via XL9535 SD_EN early in boot to reset card state machine
+16. ~~Heading display~~ – fixed: ground speed heading (DF17 TC19 subtypes 1/2) now correctly applied
+17. ~~ADS-B decoding~~ – fixed: removed double-decode in on_msg that zeroed all messages via memset
+18. ~~Timezone~~ – fixed: GPS-derived timezone with DST support, 0.1° resolution grid covering 61 regions
+19. ~~Runtime screen detection~~ – fixed: single firmware supports both HI8561 LCD and RM69A10 AMOLED via I2C probe
+20. ~~USB hot-plug~~ – fixed: consecutive error detection, transfer buffer free/re-alloc, three-state status
+21. ~~Settings not persisting~~ – fixed: `static volatile` flag in header gave each translation unit its own copy; now `extern` with definition in main.cpp
+22. ~~ok_to_mqtt not reaching MQTT gateways~~ – fixed: was incorrectly in radio header `via_mqtt` bit; now encoded in encrypted Data protobuf field 9 (bitfield bit 0)
+23. ~~CLIENT_MUTE blocking TX~~ – fixed: CLIENT_MUTE only suppresses relay, not origination
+24. ~~NVS crash on settings save~~ – fixed: NVS write from PSRAM-stack task crashed on cache disable; now dispatches to internal-RAM helper task
 
 ## Acknowledgments
 
 This project builds on the work of several open source authors:
 
-- **[kvhnuke](https://github.com/kvhnuke/esp32-rtl-sdr)** — Original proof of concept for RTL-SDR on ESP32 via USB Host. The ESP32 USB-to-librtlsdr shim layer (`esp_libusb.c/h`) and the adapted `librtlsdr.c` driver originated from this project. Thank you for proving it could be done.
+- **[kvhnuke](https://github.com/kvhnuke/esp32-rtl-sdr)** – Original proof of concept for RTL-SDR on ESP32 via USB Host. The ESP32 USB-to-librtlsdr shim layer (`esp_libusb.c/h`) and the adapted `librtlsdr.c` driver originated from this project. Thank you for proving it could be done.
 
-- **[Salvatore Sanfilippo (antirez)](https://github.com/antirez/dump1090)** — Author of dump1090, the Mode S decoder for RTL-SDR devices. The `mode-s.c` decoder is derived from dump1090's signal processing, preamble detection, CRC validation, and message decoding. Released under the BSD 3-Clause License.
+- **[Salvatore Sanfilippo (antirez)](https://github.com/antirez/dump1090)** – Author of dump1090, the Mode S decoder for RTL-SDR devices. The `mode-s.c` decoder is derived from dump1090's signal processing, preamble detection, CRC validation, and message decoding. Released under the BSD 3-Clause License.
 
-- **[Thomas Watson](https://github.com/watson/libmodes)** — Author of libmodes, which refactored the dump1090 decoder into a clean reusable C library with the `mode_s_init` / `mode_s_detect` / `mode_s_decode` API that this project uses directly.
+- **[Thomas Watson](https://github.com/watson/libmodes)** – Author of libmodes, which refactored the dump1090 decoder into a clean reusable C library with the `mode_s_init` / `mode_s_detect` / `mode_s_decode` API that this project uses directly.
 
-- **[LILYGO](https://github.com/Xinyuan-LilyGO/T-Display-P4)** — T-Display-P4 hardware design and the base ESP-IDF project with LVGL UI framework, peripheral drivers, and board support package.
+- **[Meshtastic](https://meshtastic.org/)** – The Meshtastic protocol specification and firmware were the reference for the mesh networking implementation. The protobuf wire format, channel encryption scheme (AES-CTR), PKI encryption (X25519 + XChaCha20-Poly1305), and radio parameters are all modeled on Meshtastic project's open documentation. **No Meshtastic code is utilized by or included in this repository.**
 
-- **[osmocom / Steve Markgraf](https://github.com/steve-m/librtlsdr)** — Original librtlsdr and the R820T/R828D tuner drivers.
+- **[meshtastic-lite][https://github.com/jstockdale/meshtastic-lite] – Header-only C/C++ Meshtastic LoRa protocol stack for embedded systems.
+
+- **[Martin Fiedler / minimp3](https://github.com/lieff/minimp3)** – Header-only MP3 decoder used for music playback. Public domain.
+
+- **[LILYGO](https://github.com/Xinyuan-LilyGO/T-Display-P4)** – T-Display-P4 hardware design and the base ESP-IDF project with LVGL UI framework, peripheral drivers, and board support package.
+
+- **[osmocom / Steve Markgraf](https://github.com/steve-m/librtlsdr)** – Original librtlsdr and the R820T/R828D tuner drivers.
 
 ## License
 
 This project contains code under multiple licenses:
 
-- **ADS-B Scope, serial console, SD logging, timezone system, and all Off by One contributions: BSD 3-Clause**
+- **ADS-B Scope, Meshtastic-compatible implementation, music player, serial console, SD logging, timezone system, and all Off by One contributions: BSD 3-Clause**
 - Mode S decoder: **BSD 3-Clause** (antirez/dump1090, watson/libmodes)
+- minimp3: **Public Domain** (CC0)
 - RTL-SDR driver and tuner code: **GPL v2** (osmocom/librtlsdr)
 - LILYGO board support and UI framework: **GPL v3** (LILYGO)
 

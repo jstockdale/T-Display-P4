@@ -20,12 +20,36 @@
 #include "esp_system.h"
 #include "esp_chip_info.h"
 #include "esp_mac.h"
+#include "music_player.h"
+#include "meshtastic_task.h"
+#include "meshy_channels.h"
+#include <sys/time.h>
 #include "esp_flash.h"
 #include "t_display_p4_driver.h"
 #include "screen_detect.h"
+#include "driver/jpeg_decode.h"
 
 extern "C" {
     extern void adsb_set_sort(int col, bool ascending);
+}
+
+// Format clock time respecting g_settings.time_24h and optional seconds
+static void format_clock_time(int hour, int minute, char *buf, size_t bufsize,
+                               int second = -1) {
+    if (g_settings.time_24h) {
+        if (second >= 0)
+            snprintf(buf, bufsize, "%02d:%02d:%02d", hour, minute, second);
+        else
+            snprintf(buf, bufsize, "%02d:%02d", hour, minute);
+    } else {
+        int h12 = hour % 12;
+        if (h12 == 0) h12 = 12;
+        const char *ap = hour >= 12 ? "p" : "a";
+        if (second >= 0)
+            snprintf(buf, bufsize, "%d:%02d:%02d%s", h12, minute, second, ap);
+        else
+            snprintf(buf, bufsize, "%d:%02d%s", h12, minute, ap);
+    }
 }
 
 // ═══════════════════════════════════════════════════════
@@ -35,14 +59,13 @@ extern "C" {
 // ═══════════════════════════════════════════════════════
 
 #define SCOPE_TRAIL_DEPTH 600   // 10 minutes at 1 position/second
-#define SCOPE_TRAIL_MAX   32
+#define SCOPE_TRAIL_MAX   64
 
 struct ScopeTrailPt { double lat, lon; };
 struct ScopeTrailAC {
     uint32_t icao;
     int head;       // next write position (ring buffer)
     int count;      // valid entries (up to SCOPE_TRAIL_DEPTH)
-    int64_t last_update_us; // esp_timer_get_time() of last position update
     ScopeTrailPt pts[SCOPE_TRAIL_DEPTH];
 };
 
@@ -53,9 +76,8 @@ static int g_trail_count = 0;
 static void scope_trail_timer_cb(void *arg) {
     if (!g_trails) return;
 
-    static scope_aircraft_t ac_buf[SCOPE_TRAIL_MAX];
-    int ac_count = adsb_get_aircraft_for_scope(ac_buf, SCOPE_TRAIL_MAX);
-    int64_t now = esp_timer_get_time();
+    static scope_aircraft_t ac_buf[64];
+    int ac_count = adsb_get_aircraft_for_scope(ac_buf, 64);
 
     for (int i = 0; i < ac_count; i++) {
         if (!ac_buf[i].has_position) continue;
@@ -65,27 +87,17 @@ static void scope_trail_timer_cb(void *arg) {
         for (int t = 0; t < g_trail_count; t++) {
             if (g_trails[t].icao == ac_buf[i].icao) { slot = t; break; }
         }
-        // No existing slot — try to allocate or evict
-        if (slot < 0) {
-            if (g_trail_count < SCOPE_TRAIL_MAX) {
-                slot = g_trail_count++;
-            } else {
-                // Evict the oldest (least recently updated) trail
-                int oldest = 0;
-                for (int t = 1; t < g_trail_count; t++) {
-                    if (g_trails[t].last_update_us < g_trails[oldest].last_update_us)
-                        oldest = t;
-                }
-                slot = oldest;
-            }
+        if (slot < 0 && g_trail_count < SCOPE_TRAIL_MAX) {
+            slot = g_trail_count++;
             g_trails[slot].icao = ac_buf[i].icao;
             g_trails[slot].head = 0;
             g_trails[slot].count = 0;
         }
-        g_trails[slot].pts[g_trails[slot].head] = { ac_buf[i].lat, ac_buf[i].lon };
-        g_trails[slot].head = (g_trails[slot].head + 1) % SCOPE_TRAIL_DEPTH;
-        if (g_trails[slot].count < SCOPE_TRAIL_DEPTH) g_trails[slot].count++;
-        g_trails[slot].last_update_us = now;
+        if (slot >= 0) {
+            g_trails[slot].pts[g_trails[slot].head] = { ac_buf[i].lat, ac_buf[i].lon };
+            g_trails[slot].head = (g_trails[slot].head + 1) % SCOPE_TRAIL_DEPTH;
+            if (g_trails[slot].count < SCOPE_TRAIL_DEPTH) g_trails[slot].count++;
+        }
     }
 }
 
@@ -115,7 +127,6 @@ namespace Lvgl_Ui
     const System::Win_Home_App_Icon System::_win_home_app_icon_list[] =
         {
             {"Cit", &win_home_app_icon_cit_110x110px_rgb565a8},
-            {"Music", &win_home_app_icon_music_110x110px_rgb565a8},
     };
 
     const System::Win_Home_App_Icon System::_win_home_app_icon_fixed_list[] =
@@ -614,21 +625,49 @@ namespace Lvgl_Ui
                                 break;
                                 } }, LV_EVENT_ALL, this);
 
-        lv_obj_add_event_cb(image_button[1], [](lv_event_t *e)
-                            {
-                                System *self = static_cast<System *>(lv_event_get_user_data(e));
-                                lv_event_code_t code = lv_event_get_code(e);
+        // Music app button (2nd position — styled button, warm gradient with music note)
+        {
+            lv_obj_t *music_btn = lv_button_create(tileview_tile_1);
+            lv_obj_set_size(music_btn, APP_STYLE_ICON_WIDTH_HEIGHT, APP_STYLE_ICON_WIDTH_HEIGHT);
+            lv_obj_set_style_radius(music_btn, 20, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_bg_color(music_btn, lv_color_hex(0xC44B2D), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_bg_grad_color(music_btn, lv_color_hex(0x8B2FC9), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_bg_grad_dir(music_btn, LV_GRAD_DIR_VER, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(music_btn, LV_OPA_COVER, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_shadow_width(music_btn, 0, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_border_width(music_btn, 0, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_bg_color(music_btn, lv_color_hex(0x9A3522), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_PRESSED);
+#if defined SCREEN_ROTATION_DIRECTION_0
+            lv_obj_align(music_btn, LV_ALIGN_TOP_LEFT,
+                         _app_style.icon.edge_distance.width + APP_STYLE_ICON_WIDTH_HEIGHT + _app_style.icon.icon_distance.width,
+                         _app_style.icon.edge_distance.height + 300);
+#elif defined SCREEN_ROTATION_DIRECTION_90
+            lv_obj_align(music_btn, LV_ALIGN_TOP_LEFT,
+                         _app_style.icon.edge_distance.width + APP_STYLE_ICON_WIDTH_HEIGHT + _app_style.icon.icon_distance.width + 400,
+                         _app_style.icon.edge_distance.height);
+#endif
+            lv_obj_t *icon_lbl = lv_label_create(music_btn);
+            lv_label_set_text(icon_lbl, LV_SYMBOL_AUDIO);
+            lv_obj_set_style_text_font(icon_lbl, &lv_font_montserrat_48, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_text_color(icon_lbl, lv_color_white(), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_center(icon_lbl);
 
-                                switch (code)
+            lv_obj_t *music_label = lv_label_create(tileview_tile_1);
+            lv_label_set_text(music_label, "Music");
+            lv_obj_set_style_text_align(music_label, LV_TEXT_ALIGN_CENTER, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_text_font(music_label, &lv_font_montserrat_22, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_size(music_label, _app_style.label.width, _app_style.label.height);
+            lv_obj_set_style_text_color(music_label, lv_color_white(), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_align_to(music_label, music_btn, LV_ALIGN_OUT_BOTTOM_MID, 0, 0);
+
+            lv_obj_add_event_cb(music_btn, [](lv_event_t *e)
                                 {
-                                case LV_EVENT_CLICKED:
-                                self->init_win_music();
-
-                                lv_screen_load_anim(self->_registry.win.music.root, LV_SCR_LOAD_ANIM_FADE_OUT, 500, 0, true);
-                                break;
-                                default:
-                                break;
-                                } }, LV_EVENT_ALL, this);
+                                    System *self = static_cast<System *>(lv_event_get_user_data(e));
+                                    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+                                    self->init_win_music();
+                                    lv_screen_load_anim(self->_registry.win.music.root, LV_SCR_LOAD_ANIM_FADE_OUT, 500, 0, true);
+                                }, LV_EVENT_ALL, this);
+        }
 
         // Meshy app button (3rd position — styled button, green mesh icon)
         {
@@ -782,8 +821,8 @@ namespace Lvgl_Ui
 
         // 时钟
         _registry.win.home.clock.time_label = lv_label_create(tileview_tile_1);
-        char buffer_time[10];
-        snprintf(buffer_time, sizeof(buffer_time), "%02d:%02d", _time.hour, _time.minute);
+        char buffer_time[16];
+        format_clock_time(_time.hour, _time.minute, buffer_time, sizeof(buffer_time), g_settings.show_seconds ? _time.second : -1);
         lv_label_set_text(_registry.win.home.clock.time_label, buffer_time);
         lv_obj_set_style_text_align(_registry.win.home.clock.time_label, LV_TEXT_ALIGN_LEFT, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
         lv_obj_set_style_text_font(_registry.win.home.clock.time_label, &lvgl_font_lineseedkr_rg_120, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
@@ -948,8 +987,8 @@ namespace Lvgl_Ui
 
     void System::status_bar_time_update(void)
     {
-        char buffer_time[10];
-        snprintf(buffer_time, sizeof(buffer_time), "%02d:%02d", _time.hour, _time.minute);
+        char buffer_time[16];
+        format_clock_time(_time.hour, _time.minute, buffer_time, sizeof(buffer_time), g_settings.show_seconds ? _time.second : -1);
         lv_label_set_text(_registry.status_bar.time_label, buffer_time);
     }
 
@@ -1092,8 +1131,8 @@ namespace Lvgl_Ui
 
     void System::win_home_time_update(void)
     {
-        char buffer_time[10];
-        snprintf(buffer_time, sizeof(buffer_time), "%02d:%02d", _time.hour, _time.minute);
+        char buffer_time[16];
+        format_clock_time(_time.hour, _time.minute, buffer_time, sizeof(buffer_time), g_settings.show_seconds ? _time.second : -1);
         lv_label_set_text(_registry.win.home.clock.time_label, buffer_time);
 
         std::string month_str = "null";
@@ -1162,8 +1201,8 @@ namespace Lvgl_Ui
         _registry.status_bar.time_label = lv_label_create(_registry.status_bar.root);
         lv_obj_set_style_text_color(_registry.status_bar.time_label, lv_color_white(), (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
         lv_obj_set_style_text_font(_registry.status_bar.time_label, &lv_font_montserrat_22, (lv_style_selector_t)LV_PART_MAIN | (lv_style_selector_t)LV_STATE_DEFAULT);
-        char buffer_time[10];
-        snprintf(buffer_time, sizeof(buffer_time), "%02d:%02d", _time.hour, _time.minute);
+        char buffer_time[16];
+        format_clock_time(_time.hour, _time.minute, buffer_time, sizeof(buffer_time), g_settings.show_seconds ? _time.second : -1);
         lv_label_set_text(_registry.status_bar.time_label, buffer_time);
         lv_obj_align(_registry.status_bar.time_label, LV_ALIGN_LEFT_MID, 0, 0);
 
@@ -3415,7 +3454,7 @@ namespace Lvgl_Ui
 
         // Stats panel — connection info, node count, freq
         lv_obj_t *stats_panel = lv_obj_create(_registry.win.meshy.root);
-        lv_obj_set_size(stats_panel, w - 20, 90);
+        lv_obj_set_size(stats_panel, w - 20, 110);
         lv_obj_set_pos(stats_panel, 10, content_top);
         lv_obj_set_style_bg_color(stats_panel, lv_color_hex(0x143020), (lv_style_selector_t)LV_PART_MAIN);
         lv_obj_set_style_bg_opa(stats_panel, LV_OPA_COVER, (lv_style_selector_t)LV_PART_MAIN);
@@ -3432,10 +3471,11 @@ namespace Lvgl_Ui
         lv_obj_set_width(_registry.win.meshy.stats_label, w - 40);
         lv_obj_align(_registry.win.meshy.stats_label, LV_ALIGN_TOP_LEFT, 0, 0);
 
-        // Message list — fills remaining space
-        int32_t msg_top = content_top + 96;
+        // Message list — fills remaining space minus TX bar
+        int32_t tx_bar_h = 56;
+        int32_t msg_top = content_top + 116;
         lv_obj_t *msg_panel = lv_obj_create(_registry.win.meshy.root);
-        lv_obj_set_size(msg_panel, w - 20, h - msg_top - 4);
+        lv_obj_set_size(msg_panel, w - 20, h - msg_top - tx_bar_h - 8);
         lv_obj_set_pos(msg_panel, 10, msg_top);
         lv_obj_set_style_bg_color(msg_panel, lv_color_hex(0x0A1A10), (lv_style_selector_t)LV_PART_MAIN);
         lv_obj_set_style_bg_opa(msg_panel, LV_OPA_COVER, (lv_style_selector_t)LV_PART_MAIN);
@@ -3447,32 +3487,116 @@ namespace Lvgl_Ui
         lv_obj_add_flag(msg_panel, LV_OBJ_FLAG_SCROLL_MOMENTUM);
         lv_obj_add_flag(msg_panel, LV_OBJ_FLAG_SCROLL_ELASTIC);
 
+        // TX input bar
+        lv_obj_t *tx_bar = lv_obj_create(_registry.win.meshy.root);
+        lv_obj_set_size(tx_bar, w - 20, tx_bar_h);
+        lv_obj_set_pos(tx_bar, 10, h - tx_bar_h - 4);
+        lv_obj_set_style_bg_color(tx_bar, lv_color_hex(0x0A1A10), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(tx_bar, LV_OPA_COVER, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_border_color(tx_bar, lv_color_hex(0x2D8C3A), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_border_width(tx_bar, 1, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_radius(tx_bar, 8, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_pad_all(tx_bar, 6, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_remove_flag(tx_bar, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(tx_bar, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(tx_bar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(tx_bar, 6, (lv_style_selector_t)LV_PART_MAIN);
+
+        // Textarea
+        _registry.win.meshy.tx_textarea = lv_textarea_create(tx_bar);
+        lv_obj_set_flex_grow(_registry.win.meshy.tx_textarea, 1);
+        lv_obj_set_height(_registry.win.meshy.tx_textarea, 40);
+        lv_textarea_set_one_line(_registry.win.meshy.tx_textarea, true);
+        lv_textarea_set_max_length(_registry.win.meshy.tx_textarea, 230);
+        lv_textarea_set_placeholder_text(_registry.win.meshy.tx_textarea, "Send message...");
+        lv_obj_set_style_bg_color(_registry.win.meshy.tx_textarea, lv_color_hex(0x143020), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_border_color(_registry.win.meshy.tx_textarea, lv_color_hex(0x2D8C3A), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_text_color(_registry.win.meshy.tx_textarea, lv_color_hex(0x00DD00), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_text_font(_registry.win.meshy.tx_textarea, &lv_font_montserrat_16, (lv_style_selector_t)LV_PART_MAIN);
+
+        // Send button
+        lv_obj_t *tx_send = lv_button_create(tx_bar);
+        lv_obj_set_size(tx_send, 70, 40);
+        lv_obj_set_style_bg_color(tx_send, lv_color_hex(0x2D8C3A), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_shadow_width(tx_send, 0, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_radius(tx_send, 6, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_t *tx_lbl = lv_label_create(tx_send);
+        lv_label_set_text(tx_lbl, "Send");
+        lv_obj_set_style_text_color(tx_lbl, lv_color_white(), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_text_font(tx_lbl, &lv_font_montserrat_16, (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_center(tx_lbl);
+
+        // On-screen keyboard — overlays message area when textarea focused
+        lv_obj_t *kb = lv_keyboard_create(_registry.win.meshy.root);
+        lv_obj_set_size(kb, w, h * 2 / 5);
+        lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+        lv_keyboard_set_textarea(kb, _registry.win.meshy.tx_textarea);
+        lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_bg_color(kb, lv_color_hex(0x0A1A10), (lv_style_selector_t)LV_PART_MAIN);
+        lv_obj_set_style_border_color(kb, lv_color_hex(0x2D8C3A), (lv_style_selector_t)LV_PART_MAIN);
+
+        // Show keyboard on textarea focus, hide on defocus
+        lv_obj_add_event_cb(_registry.win.meshy.tx_textarea, [](lv_event_t *e) {
+            lv_obj_t *kb = (lv_obj_t *)lv_event_get_user_data(e);
+            if (lv_event_get_code(e) == LV_EVENT_FOCUSED) {
+                lv_keyboard_set_textarea(kb, lv_event_get_target_obj(e));
+                lv_obj_remove_flag(kb, LV_OBJ_FLAG_HIDDEN);
+            } else if (lv_event_get_code(e) == LV_EVENT_DEFOCUSED ||
+                       lv_event_get_code(e) == LV_EVENT_READY) {
+                lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+            }
+        }, LV_EVENT_ALL, kb);
+
+        // Send button callback
+        lv_obj_add_event_cb(tx_send, [](lv_event_t *e) {
+            System *self = static_cast<System *>(lv_event_get_user_data(e));
+            if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+            lv_obj_t *ta = self->_registry.win.meshy.tx_textarea;
+            const char *text = lv_textarea_get_text(ta);
+            if (!text || text[0] == '\0') return;
+            if (meshy_send_text(text)) {
+                lv_textarea_set_text(ta, "");
+            }
+        }, LV_EVENT_ALL, this);
+
         _registry.win.meshy.msg_label = nullptr;
         _registry.win.meshy.msg_canvas = nullptr;
-        _registry.win.meshy.msg_canvas_buf = nullptr;
 
-        // Canvas for emoji-capable message display
-        int32_t msg_canvas_w = w - 40;
-        int32_t msg_canvas_max_h = 2800;  // ~100 lines at 28px — ring buffer keeps newest
-        size_t msg_buf_size = msg_canvas_w * msg_canvas_max_h * 2; // RGB565
+        // Message display — 1800px scrollable canvas for emoji-capable rendering.
+        // Messages render top-down from line 0. Panel scrolls to show newest.
+        int32_t msg_canvas_w = w - 40;   // panel width minus padding
+        int32_t msg_canvas_h = 1800;      // ~64 lines at 28px
         _registry.win.meshy.msg_canvas_w = msg_canvas_w;
-        _registry.win.meshy.msg_canvas_max_h = msg_canvas_max_h;
-        _registry.win.meshy.msg_canvas_buf = heap_caps_aligned_alloc(64, msg_buf_size, MALLOC_CAP_SPIRAM);
+        _registry.win.meshy.msg_canvas_max_h = msg_canvas_h;
+        _registry.win.meshy.msg_canvas_stride = 0;
 
-        if (_registry.win.meshy.msg_canvas_buf) {
-            _registry.win.meshy.msg_canvas = lv_canvas_create(msg_panel);
-            lv_canvas_set_buffer(_registry.win.meshy.msg_canvas,
-                                 _registry.win.meshy.msg_canvas_buf,
-                                 msg_canvas_w, 100, LV_COLOR_FORMAT_RGB565);
-            lv_canvas_fill_bg(_registry.win.meshy.msg_canvas, lv_color_hex(0x0A1A10), LV_OPA_COVER);
+        lv_obj_t *mc = lv_canvas_create(msg_panel);
+        lv_draw_buf_t *db = lv_draw_buf_create(msg_canvas_w, msg_canvas_h,
+                                                 LV_COLOR_FORMAT_RGB565, LV_STRIDE_AUTO);
+        if (mc && db) {
+            lv_canvas_set_draw_buf(mc, db);
+            lv_canvas_fill_bg(mc, lv_color_hex(0x0A1A10), LV_OPA_COVER);
+            _registry.win.meshy.msg_canvas = mc;
+            _registry.win.meshy.msg_canvas_buf = db->data;
+            _registry.win.meshy.msg_canvas_stride = db->header.stride;
+            ESP_LOGI("MESHY", "Canvas %ldx%ld via lv_draw_buf_create, data=%p stride=%u",
+                     (long)msg_canvas_w, (long)msg_canvas_h, db->data, (unsigned)db->header.stride);
         } else {
-            // Fallback to plain label if PSRAM alloc fails
+            ESP_LOGW("MESHY", "Canvas alloc failed — falling back to label");
+            if (mc) lv_obj_delete(mc);
+            if (db) lv_draw_buf_destroy(db);
+            _registry.win.meshy.msg_canvas = nullptr;
+            _registry.win.meshy.msg_canvas_buf = nullptr;
             _registry.win.meshy.msg_label = lv_label_create(msg_panel);
             lv_obj_set_style_text_color(_registry.win.meshy.msg_label, lv_color_hex(0x88DDAA), (lv_style_selector_t)LV_PART_MAIN);
             lv_obj_set_style_text_font(_registry.win.meshy.msg_label, &lv_font_montserrat_22, (lv_style_selector_t)LV_PART_MAIN);
             lv_label_set_text(_registry.win.meshy.msg_label, "Listening...");
             lv_obj_set_width(_registry.win.meshy.msg_label, w - 40);
         }
+
+        // Enable vertical scrolling on the message panel
+        lv_obj_set_scrollbar_mode(msg_panel, LV_SCROLLBAR_MODE_ACTIVE);
+        lv_obj_add_flag(msg_panel, LV_OBJ_FLAG_SCROLLABLE);
 
         // Swipe to return home
         lv_obj_add_event_cb(_registry.win.meshy.root, [](lv_event_t *e) {
@@ -3499,19 +3623,17 @@ namespace Lvgl_Ui
         if (_registry.win.meshy.stats_label)
             lv_label_set_text(_registry.win.meshy.stats_label, stats_text);
 
-        // Canvas path — full color emoji
+        // Canvas path — 1800px scrollable, newest messages, auto-scroll
         if (_registry.win.meshy.msg_canvas && _registry.win.meshy.msg_canvas_buf) {
             lv_obj_t *canvas = _registry.win.meshy.msg_canvas;
             lv_obj_t *panel = lv_obj_get_parent(canvas);
             int32_t cw = _registry.win.meshy.msg_canvas_w;
-            int32_t max_h = _registry.win.meshy.msg_canvas_max_h;
-            int32_t line_h = 28;  // montserrat_22 line height + spacing
+            int32_t buf_h = _registry.win.meshy.msg_canvas_max_h;  // 1800
+            int32_t line_h = 28;
             lv_color_t text_color = lv_color_hex(0x88DDAA);
-            lv_color_t bg_color = lv_color_hex(0x0A1A10);
-            int32_t max_lines = (max_h - 10) / line_h;
+            int32_t max_lines = (buf_h - 10) / line_h;
 
-            // Collect pointers to the start of each line
-            // Only keep the most recent max_lines lines
+            // Parse lines from message text
             static const char *line_starts[200];
             static int line_lens[200];
             int total_lines = 0;
@@ -3525,7 +3647,7 @@ namespace Lvgl_Ui
                 p = *eol ? eol + 1 : eol;
             }
 
-            // Only render the newest lines that fit
+            // Show newest lines that fit in canvas buffer
             int render_start = 0;
             int render_count = total_lines;
             if (render_count > max_lines) {
@@ -3533,36 +3655,30 @@ namespace Lvgl_Ui
                 render_count = max_lines;
             }
 
-            int32_t content_h = render_count * line_h + 10;
-            if (content_h < 100) content_h = 100;
-
-            // Check scroll position before update
+            // Check if user is at bottom before redraw
             bool at_bottom = true;
             if (panel) {
                 int32_t scroll_remaining = lv_obj_get_scroll_bottom(panel);
                 at_bottom = (scroll_remaining < 60);
             }
 
-            // Set canvas to content height and clear
-            lv_canvas_set_buffer(canvas, _registry.win.meshy.msg_canvas_buf,
-                                 cw, content_h, LV_COLOR_FORMAT_RGB565);
-            lv_canvas_fill_bg(canvas, bg_color, LV_OPA_COVER);
+            // Clear and redraw
+            lv_canvas_fill_bg(canvas, lv_color_hex(0x0A1A10), LV_OPA_COVER);
 
-            // Draw messages line by line with emoji support
             draw_text_emoji_reset_pool();
             lv_layer_t layer;
             lv_canvas_init_layer(canvas, &layer);
 
             int32_t y = 4;
             static char line_buf[512];
-            for (int i = render_start; i < render_start + render_count && y < content_h - line_h; i++) {
+            for (int i = render_start; i < render_start + render_count && y < buf_h - line_h; i++) {
                 int len = line_lens[i];
                 if (len > (int)sizeof(line_buf) - 1) len = sizeof(line_buf) - 1;
                 memcpy(line_buf, line_starts[i], len);
                 line_buf[len] = '\0';
 
                 draw_text_with_emoji((uint16_t *)_registry.win.meshy.msg_canvas_buf,
-                                     cw, content_h, &layer,
+                                     cw, buf_h, &layer,
                                      line_buf, 4, y,
                                      &lv_font_montserrat_22, text_color);
                 y += line_h;
@@ -3570,14 +3686,17 @@ namespace Lvgl_Ui
 
             lv_canvas_finish_layer(canvas, &layer);
 
-            // Force LVGL to see new content
-            lv_canvas_set_buffer(canvas, _registry.win.meshy.msg_canvas_buf,
-                                 cw, content_h, LV_COLOR_FORMAT_RGB565);
+            // Canvas stays at full buf_h — don't resize widget.
+            // LVGL canvas fill_bg/layer ops need widget height == draw_buf height.
             lv_obj_invalidate(canvas);
 
-            // Auto-scroll to bottom if user was at bottom
-            if (panel && at_bottom) {
-                lv_obj_scroll_to_y(panel, LV_COORD_MAX, LV_ANIM_OFF);
+            // Auto-scroll panel so the last drawn line is visible
+            if (panel && at_bottom && y > 100) {
+                // Scroll to put the last line at the bottom of the visible panel
+                int32_t panel_h = lv_obj_get_content_height(panel);
+                int32_t target_y = y - panel_h + 20;
+                if (target_y < 0) target_y = 0;
+                lv_obj_scroll_to_y(panel, target_y, LV_ANIM_OFF);
             }
             return;
         }
@@ -3633,14 +3752,15 @@ namespace Lvgl_Ui
         _registry.win.scope.canvas_w = canvas_w;
         _registry.win.scope.canvas_h = canvas_h;
 
-        // Allocate canvas buffer in PSRAM — 64-byte aligned for LVGL 9 cache line
+        // Allocate canvas buffer in PSRAM — aligned per LVGL 9 PPA requirements
         size_t buf_size = canvas_w * canvas_h * 2; // RGB565
         if (!_registry.win.scope.canvas_buf) {
-            _registry.win.scope.canvas_buf = heap_caps_aligned_alloc(64, buf_size, MALLOC_CAP_SPIRAM);
-            ESP_LOGI("SCOPE", "Canvas %dx%d buf=%zuB at %p (aligned=%d)",
+            size_t align = LV_DRAW_BUF_ALIGN < 64 ? 64 : LV_DRAW_BUF_ALIGN;
+            _registry.win.scope.canvas_buf = heap_caps_aligned_alloc(align, buf_size, MALLOC_CAP_SPIRAM);
+            ESP_LOGI("SCOPE", "Canvas %dx%d buf=%zuB at %p (align=%zu, mod=%zu)",
                      (int)canvas_w, (int)canvas_h, buf_size,
-                     _registry.win.scope.canvas_buf,
-                     _registry.win.scope.canvas_buf ? (((uintptr_t)_registry.win.scope.canvas_buf % 64) == 0) : -1);
+                     _registry.win.scope.canvas_buf, align,
+                     _registry.win.scope.canvas_buf ? ((uintptr_t)_registry.win.scope.canvas_buf % align) : 0);
         }
         if (!_registry.win.scope.canvas_buf) {
             ESP_LOGE("SCOPE", "Failed to allocate canvas buffer (%zu bytes)", buf_size);
@@ -4261,6 +4381,13 @@ namespace Lvgl_Ui
           int visible_trails = 0;
           for (int t = 0; t < g_trail_count; t++) {
               if (g_trails[t].count < 2) continue;
+              // Match the age/selection filter used in the draw loop
+              int32_t t_age = 999000;
+              for (int a = 0; a < ac_count; a++) {
+                  if (ac[a].icao == g_trails[t].icao) { t_age = ac[a].age_ms; break; }
+              }
+              bool t_sel = (g_trails[t].icao == _registry.win.scope.selected_icao);
+              if (t_age > 180000 && !t_sel) continue;
               visible_trails++;
           }
           int segs_per_trail = (visible_trails > 0) ?
@@ -4278,11 +4405,13 @@ namespace Lvgl_Ui
                     trail_age_ms = ac[a].age_ms; break;
                 }
             }
+            bool trail_sel = (g_trails[t].icao == _registry.win.scope.selected_icao);
+            // Hide trails for aircraft aged out >180s (unless selected)
+            if (trail_age_ms > 180000 && !trail_sel) continue;
             bool trail_gray = (trail_age_ms > 60000);
             lv_color_t trail_ac_color = trail_gray ? lv_color_hex(0x556677) :
                 scope_aircraft_color(_registry.win.scope.color_mode,
                                      g_trails[t].icao, trail_alt, trail_spd);
-            bool trail_sel = (g_trails[t].icao == _registry.win.scope.selected_icao);
             if (trail_sel && _registry.win.scope.color_mode == 0 && !trail_gray)
                 trail_ac_color = lv_color_hex(0x4dabf7);
             int trail_width = (visible_trails > 20) ? 1 : 2;
@@ -4741,9 +4870,11 @@ namespace Lvgl_Ui
             lv_obj_t *slider = add_slider(row, 5, 100, (int32_t)g_settings.brightness);
             lv_obj_add_event_cb(slider, [](lv_event_t *e) {
                 if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+                System *self = static_cast<System *>(lv_event_get_user_data(e));
                 g_settings.brightness = (uint8_t)lv_slider_get_value(lv_event_get_target_obj(e));
-                // Brightness will be applied by the main task
-            }, LV_EVENT_ALL, nullptr);
+                if (self->_device_brightness_callback)
+                    self->_device_brightness_callback(g_settings.brightness);
+            }, LV_EVENT_ALL, this);
             // Save on release
             lv_obj_add_event_cb(slider, [](lv_event_t *e) {
                 if (lv_event_get_code(e) != LV_EVENT_RELEASED) return;
@@ -4797,34 +4928,241 @@ namespace Lvgl_Ui
         // ═══════════════════════════════════════════════════════════════
         add_section(LV_SYMBOL_BELL "  Time & Date");
 
-        // Timezone
+        // Timezone controls — shared state for refresh
+        static lv_obj_t *tz_val_lbl = nullptr;   // timezone value label
+        static lv_obj_t *tz_minus_btn = nullptr;  // − button
+        static lv_obj_t *tz_plus_btn = nullptr;   // + button
+        static lv_obj_t *dst_sw = nullptr;        // DST toggle
+        static lv_obj_t *dst_info_lbl = nullptr;  // DST auto info label
+
+        // Helper: get auto-detected timezone string for display
+        auto get_auto_tz = [&]() -> const char * {
+            static char abuf[24];
+            receiver_pos_t rx = adsb_get_receiver_pos();
+            if (rx.fix_valid) {
+                struct timeval tv; gettimeofday(&tv, NULL);
+                struct tm tm_utc; gmtime_r(&tv.tv_sec, &tm_utc);
+                tz_result_t tz = tz_lookup(rx.lat, rx.lon,
+                    tm_utc.tm_year + 1900, tm_utc.tm_mon + 1, tm_utc.tm_mday);
+                int h = tz.total_offset_min / 60;
+                int m = abs(tz.total_offset_min) % 60;
+                snprintf(abuf, sizeof(abuf), "UTC%+d:%02d%s", h, m,
+                         tz.dst_active ? " DST" : "");
+                return abuf;
+            }
+            return "No GPS fix";
+        };
+
+        // Helper: get manual timezone string (without DST — shown separately)
+        auto get_manual_tz = [&]() -> const char * {
+            static char mbuf[16];
+            snprintf(mbuf, sizeof(mbuf), "UTC%+d:%02d",
+                     g_settings.tz_offset_h, abs(g_settings.tz_offset_m));
+            return mbuf;
+        };
+
+        // Helper: refresh timezone UI state based on tz_auto
+        auto tz_ui_refresh = [&]() {
+            bool manual = !g_settings.tz_auto;
+            lv_color_t dim = lv_color_hex(0x445566);
+            lv_color_t active = lv_color_hex(0xccddee);
+
+            // Timezone value label
+            if (tz_val_lbl) {
+                lv_label_set_text(tz_val_lbl, g_settings.tz_auto ? get_auto_tz() : get_manual_tz());
+                lv_obj_set_style_text_color(tz_val_lbl, manual ? active : dim, (lv_style_selector_t)LV_PART_MAIN);
+            }
+            // ± buttons visibility
+            if (tz_minus_btn) { if (manual) lv_obj_remove_flag(tz_minus_btn, LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(tz_minus_btn, LV_OBJ_FLAG_HIDDEN); }
+            if (tz_plus_btn)  { if (manual) lv_obj_remove_flag(tz_plus_btn, LV_OBJ_FLAG_HIDDEN);  else lv_obj_add_flag(tz_plus_btn, LV_OBJ_FLAG_HIDDEN); }
+            // DST toggle vs info label
+            if (dst_sw) { if (manual) lv_obj_remove_flag(dst_sw, LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(dst_sw, LV_OBJ_FLAG_HIDDEN); }
+            if (dst_info_lbl) {
+                if (manual) {
+                    lv_obj_add_flag(dst_info_lbl, LV_OBJ_FLAG_HIDDEN);
+                } else {
+                    lv_obj_remove_flag(dst_info_lbl, LV_OBJ_FLAG_HIDDEN);
+                    receiver_pos_t rx = adsb_get_receiver_pos();
+                    if (rx.fix_valid) {
+                        struct timeval tv; gettimeofday(&tv, NULL);
+                        struct tm tm_utc; gmtime_r(&tv.tv_sec, &tm_utc);
+                        tz_result_t tz = tz_lookup(rx.lat, rx.lon,
+                            tm_utc.tm_year + 1900, tm_utc.tm_mon + 1, tm_utc.tm_mday);
+                        lv_label_set_text(dst_info_lbl, tz.has_dst ? (tz.dst_active ? "Active" : "Inactive") : "N/A");
+                    } else {
+                        lv_label_set_text(dst_info_lbl, "---");
+                    }
+                    lv_obj_set_style_text_color(dst_info_lbl, dim, (lv_style_selector_t)LV_PART_MAIN);
+                }
+            }
+        };
+
+        // Auto Timezone toggle
         {
             lv_obj_t *row = add_row();
-            add_row_label(row, "Timezone");
-            lv_obj_t *btn = add_value_btn(row, settings_tz_string());
-            lv_obj_add_event_cb(btn, [](lv_event_t *e) {
-                if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-                // Cycle common timezones: -12 through +14
-                g_settings.tz_offset_h++;
-                if (g_settings.tz_offset_h > 14) g_settings.tz_offset_h = -12;
-                lv_obj_t *lbl = lv_obj_get_child(lv_event_get_target_obj(e), 0);
-                if (lbl) lv_label_set_text(lbl, settings_tz_string());
+            add_row_label(row, "Auto Timezone");
+            lv_obj_t *sw = lv_switch_create(row);
+            lv_obj_set_size(sw, 56, 30);
+            lv_obj_align(sw, LV_ALIGN_RIGHT_MID, 0, 0);
+            lv_obj_set_style_bg_color(sw, lv_color_hex(0x2a3a46), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_bg_color(sw, lv_color_hex(0x00e5a0), (lv_style_selector_t)(LV_PART_INDICATOR | LV_STATE_CHECKED));
+            if (g_settings.tz_auto) lv_obj_add_state(sw, LV_STATE_CHECKED);
+            lv_obj_add_event_cb(sw, [](lv_event_t *e) {
+                if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+                g_settings.tz_auto = lv_obj_has_state(lv_event_get_target_obj(e), LV_STATE_CHECKED);
+                settings_apply_timezone();
                 settings_save();
+                // Refresh timezone UI widgets
+                bool manual = !g_settings.tz_auto;
+                lv_color_t dim = lv_color_hex(0x445566);
+                lv_color_t active = lv_color_hex(0xccddee);
+                if (tz_val_lbl) {
+                    if (g_settings.tz_auto) {
+                        // Show auto-detected offset
+                        receiver_pos_t rx = adsb_get_receiver_pos();
+                        if (rx.fix_valid) {
+                            struct timeval tv; gettimeofday(&tv, NULL);
+                            struct tm tm_utc; gmtime_r(&tv.tv_sec, &tm_utc);
+                            tz_result_t tz = tz_lookup(rx.lat, rx.lon,
+                                tm_utc.tm_year + 1900, tm_utc.tm_mon + 1, tm_utc.tm_mday);
+                            lv_label_set_text(tz_val_lbl, settings_format_offset(tz.total_offset_min, tz.dst_active));
+                        } else {
+                            lv_label_set_text(tz_val_lbl, "No GPS fix");
+                        }
+                    } else {
+                        lv_label_set_text(tz_val_lbl, settings_format_offset(
+                            g_settings.tz_offset_h * 60 + g_settings.tz_offset_m, false));
+                    }
+                    lv_obj_set_style_text_color(tz_val_lbl, manual ? active : dim, (lv_style_selector_t)LV_PART_MAIN);
+                }
+                if (tz_minus_btn) { if (manual) lv_obj_remove_flag(tz_minus_btn, LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(tz_minus_btn, LV_OBJ_FLAG_HIDDEN); }
+                if (tz_plus_btn)  { if (manual) lv_obj_remove_flag(tz_plus_btn, LV_OBJ_FLAG_HIDDEN);  else lv_obj_add_flag(tz_plus_btn, LV_OBJ_FLAG_HIDDEN); }
+                if (dst_sw)       { if (manual) lv_obj_remove_flag(dst_sw, LV_OBJ_FLAG_HIDDEN);       else lv_obj_add_flag(dst_sw, LV_OBJ_FLAG_HIDDEN); }
+                if (dst_info_lbl) {
+                    if (manual) {
+                        lv_obj_add_flag(dst_info_lbl, LV_OBJ_FLAG_HIDDEN);
+                    } else {
+                        lv_obj_remove_flag(dst_info_lbl, LV_OBJ_FLAG_HIDDEN);
+                        receiver_pos_t rx = adsb_get_receiver_pos();
+                        if (rx.fix_valid) {
+                            struct timeval tv; gettimeofday(&tv, NULL);
+                            struct tm tm_utc; gmtime_r(&tv.tv_sec, &tm_utc);
+                            tz_result_t tz = tz_lookup(rx.lat, rx.lon,
+                                tm_utc.tm_year + 1900, tm_utc.tm_mon + 1, tm_utc.tm_mday);
+                            lv_label_set_text(dst_info_lbl, tz.has_dst ? (tz.dst_active ? "Active" : "Inactive") : "N/A");
+                        } else {
+                            lv_label_set_text(dst_info_lbl, "---");
+                        }
+                        lv_obj_set_style_text_color(dst_info_lbl, dim, (lv_style_selector_t)LV_PART_MAIN);
+                    }
+                }
             }, LV_EVENT_ALL, nullptr);
         }
 
-        // DST
+        // Timezone row — with ± buttons for manual mode
+        {
+            lv_obj_t *row = add_row();
+            add_row_label(row, "Timezone");
+
+            // Container for [−] [value] [+] on the right
+            lv_obj_t *ctl = lv_obj_create(row);
+            lv_obj_set_size(ctl, LV_SIZE_CONTENT, 36);
+            lv_obj_align(ctl, LV_ALIGN_RIGHT_MID, 0, 0);
+            lv_obj_set_style_bg_opa(ctl, 0, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_border_width(ctl, 0, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_pad_all(ctl, 0, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_remove_flag(ctl, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_set_flex_flow(ctl, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(ctl, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            lv_obj_set_style_pad_column(ctl, 4, (lv_style_selector_t)LV_PART_MAIN);
+
+            // − button
+            tz_minus_btn = lv_button_create(ctl);
+            lv_obj_set_size(tz_minus_btn, 36, 32);
+            lv_obj_set_style_bg_color(tz_minus_btn, lv_color_hex(0x1a2a36), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_shadow_width(tz_minus_btn, 0, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_radius(tz_minus_btn, 4, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_t *ml = lv_label_create(tz_minus_btn);
+            lv_label_set_text(ml, LV_SYMBOL_MINUS);
+            lv_obj_set_style_text_color(ml, lv_color_hex(0xccddee), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_center(ml);
+            lv_obj_add_event_cb(tz_minus_btn, [](lv_event_t *e) {
+                if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+                g_settings.tz_offset_h--;
+                if (g_settings.tz_offset_h < -12) g_settings.tz_offset_h = 14;
+                settings_apply_timezone();
+                settings_save();
+                if (tz_val_lbl) lv_label_set_text(tz_val_lbl,
+                    settings_format_offset(g_settings.tz_offset_h * 60 + g_settings.tz_offset_m, false));
+            }, LV_EVENT_ALL, nullptr);
+
+            // Value label
+            tz_val_lbl = lv_label_create(ctl);
+            lv_obj_set_style_text_font(tz_val_lbl, &lv_font_montserrat_16, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_min_width(tz_val_lbl, 90, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_text_align(tz_val_lbl, LV_TEXT_ALIGN_CENTER, (lv_style_selector_t)LV_PART_MAIN);
+
+            // + button
+            tz_plus_btn = lv_button_create(ctl);
+            lv_obj_set_size(tz_plus_btn, 36, 32);
+            lv_obj_set_style_bg_color(tz_plus_btn, lv_color_hex(0x1a2a36), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_shadow_width(tz_plus_btn, 0, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_radius(tz_plus_btn, 4, (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_t *pl = lv_label_create(tz_plus_btn);
+            lv_label_set_text(pl, LV_SYMBOL_PLUS);
+            lv_obj_set_style_text_color(pl, lv_color_hex(0xccddee), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_center(pl);
+            lv_obj_add_event_cb(tz_plus_btn, [](lv_event_t *e) {
+                if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+                g_settings.tz_offset_h++;
+                if (g_settings.tz_offset_h > 14) g_settings.tz_offset_h = -12;
+                settings_apply_timezone();
+                settings_save();
+                if (tz_val_lbl) lv_label_set_text(tz_val_lbl,
+                    settings_format_offset(g_settings.tz_offset_h * 60 + g_settings.tz_offset_m, false));
+            }, LV_EVENT_ALL, nullptr);
+        }
+
+        // DST row — toggle (manual) or info label (auto)
         {
             lv_obj_t *row = add_row();
             add_row_label(row, "Daylight Saving");
-            add_toggle(row, &g_settings.dst_enabled);
+
+            // Manual mode: toggle switch
+            dst_sw = lv_switch_create(row);
+            lv_obj_set_size(dst_sw, 56, 30);
+            lv_obj_align(dst_sw, LV_ALIGN_RIGHT_MID, 0, 0);
+            lv_obj_set_style_bg_color(dst_sw, lv_color_hex(0x2a3a46), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_bg_color(dst_sw, lv_color_hex(0x00e5a0), (lv_style_selector_t)(LV_PART_INDICATOR | LV_STATE_CHECKED));
+            if (g_settings.dst_enabled) lv_obj_add_state(dst_sw, LV_STATE_CHECKED);
+            lv_obj_add_event_cb(dst_sw, [](lv_event_t *e) {
+                if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+                g_settings.dst_enabled = lv_obj_has_state(lv_event_get_target_obj(e), LV_STATE_CHECKED);
+                settings_apply_timezone();
+                settings_save();
+            }, LV_EVENT_ALL, nullptr);
+
+            // Auto mode: info label (read-only)
+            dst_info_lbl = lv_label_create(row);
+            lv_obj_align(dst_info_lbl, LV_ALIGN_RIGHT_MID, 0, 0);
+            lv_obj_set_style_text_font(dst_info_lbl, &lv_font_montserrat_16, (lv_style_selector_t)LV_PART_MAIN);
         }
+
+        // Apply initial state
+        tz_ui_refresh();
 
         // 24h format
         {
             lv_obj_t *row = add_row();
             add_row_label(row, "24-Hour Format");
             add_toggle(row, &g_settings.time_24h);
+        }
+
+        // Show seconds
+        {
+            lv_obj_t *row = add_row();
+            add_row_label(row, "Show Seconds");
+            add_toggle(row, &g_settings.show_seconds);
         }
 
         // ═══════════════════════════════════════════════════════════════
@@ -4846,16 +5184,50 @@ namespace Lvgl_Ui
             add_toggle(row, &g_settings.adsb_sd_logging);
         }
 
+        // Bias-T power (live toggle — no radio reset needed)
+        {
+            lv_obj_t *row = add_row();
+            add_row_label(row, "Bias-T Power");
+            lv_obj_t *sw = lv_switch_create(row);
+            lv_obj_set_size(sw, 56, 30);
+            lv_obj_align(sw, LV_ALIGN_RIGHT_MID, 0, 0);
+            lv_obj_set_style_bg_color(sw, lv_color_hex(0x2a3a46), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_bg_color(sw, lv_color_hex(0x00e5a0), (lv_style_selector_t)(LV_PART_INDICATOR | LV_STATE_CHECKED));
+            if (g_settings.adsb_bias_tee) lv_obj_add_state(sw, LV_STATE_CHECKED);
+            lv_obj_add_event_cb(sw, [](lv_event_t *e) {
+                if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+                lv_obj_t *sw = lv_event_get_target_obj(e);
+                bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+                g_settings.adsb_bias_tee = on;
+                adsb_set_bias_tee(on);
+                settings_save();
+            }, LV_EVENT_ALL, nullptr);
+        }
+
         // ═══════════════════════════════════════════════════════════════
         // MESHTASTIC
         // ═══════════════════════════════════════════════════════════════
         add_section(LV_SYMBOL_WIFI "  Meshy");
 
-        // Enable
+        // Enable — actually start/stop radio
         {
             lv_obj_t *row = add_row();
             add_row_label(row, "LoRa Radio");
-            add_toggle(row, &g_settings.meshy_enabled);
+            lv_obj_t *sw = lv_switch_create(row);
+            lv_obj_set_size(sw, 56, 30);
+            lv_obj_align(sw, LV_ALIGN_RIGHT_MID, 0, 0);
+            lv_obj_set_style_bg_color(sw, lv_color_hex(0x2a3a46), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_bg_color(sw, lv_color_hex(0x00e5a0), (lv_style_selector_t)(LV_PART_INDICATOR | LV_STATE_CHECKED));
+            if (g_settings.meshy_enabled) lv_obj_add_state(sw, LV_STATE_CHECKED);
+            lv_obj_add_event_cb(sw, [](lv_event_t *e) {
+                if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+                lv_obj_t *sw = lv_event_get_target_obj(e);
+                bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+                g_settings.meshy_enabled = on;
+                settings_save();
+                if (on) meshy_start();
+                else    meshy_stop();
+            }, LV_EVENT_ALL, nullptr);
         }
 
         // SD logging
@@ -4876,6 +5248,7 @@ namespace Lvgl_Ui
                 lv_obj_t *lbl = lv_obj_get_child(lv_event_get_target_obj(e), 0);
                 if (lbl) lv_label_set_text(lbl, settings_region_name(g_settings.meshy_region));
                 settings_save();
+                if (g_settings.meshy_enabled) meshy_restart();
             }, LV_EVENT_ALL, nullptr);
         }
 
@@ -4890,21 +5263,57 @@ namespace Lvgl_Ui
                 lv_obj_t *lbl = lv_obj_get_child(lv_event_get_target_obj(e), 0);
                 if (lbl) lv_label_set_text(lbl, settings_preset_name(g_settings.meshy_preset));
                 settings_save();
+                if (g_settings.meshy_enabled) meshy_restart();
             }, LV_EVENT_ALL, nullptr);
         }
 
-        // Channel index
+        // Frequency slot override
         {
             lv_obj_t *row = add_row();
-            add_row_label(row, "Channel");
-            static char ch_buf[4];
-            snprintf(ch_buf, sizeof(ch_buf), "%d", g_settings.meshy_channel);
-            lv_obj_t *btn = add_value_btn(row, ch_buf);
+            add_row_label(row, "Freq Slot");
+            static char slot_buf[8];
+            if (g_settings.meshy_freq_slot == 0)
+                snprintf(slot_buf, sizeof(slot_buf), "Auto");
+            else
+                snprintf(slot_buf, sizeof(slot_buf), "%d", g_settings.meshy_freq_slot);
+            lv_obj_t *btn = add_value_btn(row, slot_buf);
             lv_obj_add_event_cb(btn, [](lv_event_t *e) {
                 if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-                g_settings.meshy_channel = (g_settings.meshy_channel + 1) % 8;
+                // Cycle: 0 (Auto) → 1 → 2 → ... → 50 → 0
+                g_settings.meshy_freq_slot = (g_settings.meshy_freq_slot + 1) % 51;
+                static char buf[8];
+                if (g_settings.meshy_freq_slot == 0)
+                    snprintf(buf, sizeof(buf), "Auto");
+                else
+                    snprintf(buf, sizeof(buf), "%d", g_settings.meshy_freq_slot);
+                lv_obj_t *lbl = lv_obj_get_child(lv_event_get_target_obj(e), 0);
+                if (lbl) lv_label_set_text(lbl, buf);
+                settings_save();
+                if (g_settings.meshy_enabled) meshy_restart();
+            }, LV_EVENT_ALL, nullptr);
+        }
+
+        // OK to MQTT
+        {
+            lv_obj_t *row = add_row();
+            add_row_label(row, "OK to MQTT");
+            add_toggle(row, &g_settings.meshy_ok_to_mqtt);
+        }
+
+        // Hop Limit
+        {
+            lv_obj_t *row = add_row();
+            add_row_label(row, "Hop Limit");
+            static char hop_buf[4];
+            snprintf(hop_buf, sizeof(hop_buf), "%d", g_settings.meshy_hop_limit);
+            lv_obj_t *btn = add_value_btn(row, hop_buf);
+            lv_obj_add_event_cb(btn, [](lv_event_t *e) {
+                if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+                uint8_t h = g_settings.meshy_hop_limit;
+                h = (h >= 7) ? 1 : h + 1;
+                g_settings.meshy_hop_limit = h;
                 static char buf[4];
-                snprintf(buf, sizeof(buf), "%d", g_settings.meshy_channel);
+                snprintf(buf, sizeof(buf), "%d", h);
                 lv_obj_t *lbl = lv_obj_get_child(lv_event_get_target_obj(e), 0);
                 if (lbl) lv_label_set_text(lbl, buf);
                 settings_save();
@@ -4929,6 +5338,45 @@ namespace Lvgl_Ui
                 snprintf(buf, sizeof(buf), "%ddBm", g_settings.meshy_tx_power);
                 lv_obj_t *lbl = lv_obj_get_child(lv_event_get_target_obj(e), 0);
                 if (lbl) lv_label_set_text(lbl, buf);
+                settings_save();
+                if (g_settings.meshy_enabled) meshy_restart();
+            }, LV_EVENT_ALL, nullptr);
+        }
+
+        // Role
+        {
+            lv_obj_t *row = add_row();
+            add_row_label(row, "Role");
+            lv_obj_t *btn = add_value_btn(row, settings_role_name(g_settings.meshy_role));
+            lv_obj_add_event_cb(btn, [](lv_event_t *e) {
+                if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+                g_settings.meshy_role = (g_settings.meshy_role + 1) % 3;
+                lv_obj_t *lbl = lv_obj_get_child(lv_event_get_target_obj(e), 0);
+                if (lbl) lv_label_set_text(lbl, settings_role_name(g_settings.meshy_role));
+                settings_save();
+                if (g_settings.meshy_enabled) meshy_restart();
+            }, LV_EVENT_ALL, nullptr);
+        }
+
+        // NODEINFO Period
+        {
+            lv_obj_t *row = add_row();
+            add_row_label(row, "NODEINFO");
+            static const uint16_t ni_vals[] = {15, 30, 60, 120, 240, 480, 1440};
+            static const char *ni_labels[] = {"15m", "30m", "1h", "2h", "4h", "8h", "24h"};
+            int cur = 1; // default 30m
+            for (int i = 0; i < 7; i++) if (g_settings.meshy_nodeinfo_period_m == ni_vals[i]) { cur = i; break; }
+            lv_obj_t *btn = add_value_btn(row, ni_labels[cur]);
+            lv_obj_add_event_cb(btn, [](lv_event_t *e) {
+                if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+                static const uint16_t vals[] = {15, 30, 60, 120, 240, 480, 1440};
+                static const char *labels[] = {"15m", "30m", "1h", "2h", "4h", "8h", "24h"};
+                int cur = 1;
+                for (int i = 0; i < 7; i++) if (g_settings.meshy_nodeinfo_period_m == vals[i]) { cur = i; break; }
+                cur = (cur + 1) % 7;
+                g_settings.meshy_nodeinfo_period_m = vals[cur];
+                lv_obj_t *lbl = lv_obj_get_child(lv_event_get_target_obj(e), 0);
+                if (lbl) lv_label_set_text(lbl, labels[cur]);
                 settings_save();
             }, LV_EVENT_ALL, nullptr);
         }
@@ -5007,8 +5455,11 @@ namespace Lvgl_Ui
             lv_obj_t *slider = add_slider(row, 0, 100, (int32_t)g_settings.volume);
             lv_obj_add_event_cb(slider, [](lv_event_t *e) {
                 if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+                System *self = static_cast<System *>(lv_event_get_user_data(e));
                 g_settings.volume = (uint8_t)lv_slider_get_value(lv_event_get_target_obj(e));
-            }, LV_EVENT_ALL, nullptr);
+                if (self->_device_volume_callback)
+                    self->_device_volume_callback(g_settings.volume);
+            }, LV_EVENT_ALL, this);
             lv_obj_add_event_cb(slider, [](lv_event_t *e) {
                 if (lv_event_get_code(e) != LV_EVENT_RELEASED) return;
                 settings_save();
@@ -5026,6 +5477,21 @@ namespace Lvgl_Ui
         // SYSTEM
         // ═══════════════════════════════════════════════════════════════
         add_section(LV_SYMBOL_CHARGE "  System");
+
+        // Reboot device
+        {
+            lv_obj_t *row = add_row();
+            add_row_label(row, "Reboot Device");
+            lv_obj_t *btn = add_value_btn(row, "REBOOT");
+            lv_obj_set_style_bg_color(btn, lv_color_hex(0x1a2a3a), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_set_style_border_color(btn, lv_color_hex(0x2a4a6a), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_t *rlbl = lv_obj_get_child(btn, 0);
+            if (rlbl) lv_obj_set_style_text_color(rlbl, lv_color_hex(0x4dabf7), (lv_style_selector_t)LV_PART_MAIN);
+            lv_obj_add_event_cb(btn, [](lv_event_t *e) {
+                if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+                esp_restart();
+            }, LV_EVENT_ALL, nullptr);
+        }
 
         // Memory info
         {
@@ -5076,7 +5542,7 @@ namespace Lvgl_Ui
         {
             lv_obj_t *row = add_row();
             add_row_label(row, "Factory Reset");
-            lv_obj_t *btn = add_value_btn(row, "RESET");
+            lv_obj_t *btn = add_value_btn(row, "RESET...");
             lv_obj_set_style_bg_color(btn, lv_color_hex(0x3a1a1a), (lv_style_selector_t)LV_PART_MAIN);
             lv_obj_set_style_border_color(btn, lv_color_hex(0x6a2a2a), (lv_style_selector_t)LV_PART_MAIN);
             lv_obj_t *rlbl = lv_obj_get_child(btn, 0);
@@ -5084,14 +5550,191 @@ namespace Lvgl_Ui
             lv_obj_add_event_cb(btn, [](lv_event_t *e) {
                 System *self = static_cast<System *>(lv_event_get_user_data(e));
                 if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-                // Clear NVS blob and apply defaults
-                settings_reset();
-                g_last_touch_ms = esp_log_timestamp();
-                // Navigate home
-                lv_display_set_rotation(lv_display_get_default(), self->_home_rotation);
-                self->set_vibration();
-                self->init_win_home();
-                lv_screen_load_anim(self->_registry.win.home.root, LV_SCR_LOAD_ANIM_FADE_OUT, 100, 0, true);
+
+                // ─── Reset Options Dialog ──────────────────────────────
+                lv_obj_t *overlay = lv_obj_create(self->_registry.win.settings.root);
+                lv_obj_set_size(overlay, self->_width, self->_height);
+                lv_obj_align(overlay, LV_ALIGN_CENTER, 0, 0);
+                lv_obj_set_style_bg_color(overlay, lv_color_hex(0x000000), LV_PART_MAIN);
+                lv_obj_set_style_bg_opa(overlay, 200, LV_PART_MAIN);
+                lv_obj_set_style_border_width(overlay, 0, LV_PART_MAIN);
+
+                lv_obj_t *dialog = lv_obj_create(overlay);
+                lv_obj_set_size(dialog, 440, 500);
+                lv_obj_center(dialog);
+                lv_obj_set_style_bg_color(dialog, lv_color_hex(0x1A1A1A), LV_PART_MAIN);
+                lv_obj_set_style_radius(dialog, 20, LV_PART_MAIN);
+                lv_obj_set_style_border_width(dialog, 0, LV_PART_MAIN);
+                lv_obj_set_style_pad_all(dialog, 20, LV_PART_MAIN);
+                lv_obj_set_flex_flow(dialog, LV_FLEX_FLOW_COLUMN);
+                lv_obj_set_style_pad_row(dialog, 12, LV_PART_MAIN);
+
+                // Title
+                lv_obj_t *title = lv_label_create(dialog);
+                lv_label_set_text(title, "Factory Reset");
+                lv_obj_set_style_text_color(title, lv_color_hex(0xff4444), LV_PART_MAIN);
+                lv_obj_set_style_text_font(title, &lv_font_montserrat_26, LV_PART_MAIN);
+
+                lv_obj_t *desc = lv_label_create(dialog);
+                lv_label_set_text(desc, "Select what to reset:");
+                lv_obj_set_style_text_color(desc, lv_color_hex(0xAAAAAA), LV_PART_MAIN);
+                lv_obj_set_style_text_font(desc, &lv_font_montserrat_22, LV_PART_MAIN);
+
+                // Checkbox: Device Settings
+                lv_obj_t *cb_settings = lv_checkbox_create(dialog);
+                lv_checkbox_set_text(cb_settings, "Device Settings");
+                lv_obj_add_state(cb_settings, LV_STATE_CHECKED);  // default on
+                lv_obj_set_style_text_color(cb_settings, lv_color_white(), LV_PART_MAIN);
+                lv_obj_set_style_text_font(cb_settings, &lv_font_montserrat_22, LV_PART_MAIN);
+
+                // Checkbox: Meshy Identity + Channels
+                lv_obj_t *cb_meshy = lv_checkbox_create(dialog);
+                lv_checkbox_set_text(cb_meshy, "Meshy Identity + Channels");
+                lv_obj_set_style_text_color(cb_meshy, lv_color_white(), LV_PART_MAIN);
+                lv_obj_set_style_text_font(cb_meshy, &lv_font_montserrat_22, LV_PART_MAIN);
+
+                // Checkbox: PKI Keypair
+                lv_obj_t *cb_pki = lv_checkbox_create(dialog);
+                lv_checkbox_set_text(cb_pki, "PKI Keypair (X25519)");
+                lv_obj_set_style_text_color(cb_pki, lv_color_white(), LV_PART_MAIN);
+                lv_obj_set_style_text_font(cb_pki, &lv_font_montserrat_22, LV_PART_MAIN);
+
+                // Warning label
+                lv_obj_t *warn = lv_label_create(dialog);
+                lv_label_set_text(warn, "PKI reset generates a new key.\nOther nodes won't recognize you.");
+                lv_obj_set_style_text_color(warn, lv_color_hex(0x996633), LV_PART_MAIN);
+                lv_obj_set_style_text_font(warn, &lv_font_montserrat_16, LV_PART_MAIN);
+                lv_obj_set_width(warn, 390);
+
+                // Button row
+                lv_obj_t *btn_row = lv_obj_create(dialog);
+                lv_obj_set_size(btn_row, 400, 55);
+                lv_obj_set_style_bg_opa(btn_row, 0, LV_PART_MAIN);
+                lv_obj_set_style_border_width(btn_row, 0, LV_PART_MAIN);
+                lv_obj_set_style_pad_all(btn_row, 0, LV_PART_MAIN);
+                lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+                lv_obj_set_style_pad_column(btn_row, 15, LV_PART_MAIN);
+                lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+                // Cancel button
+                lv_obj_t *cancel_btn = lv_button_create(btn_row);
+                lv_obj_set_size(cancel_btn, 180, 45);
+                lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x333333), LV_PART_MAIN);
+                lv_obj_set_style_radius(cancel_btn, 10, LV_PART_MAIN);
+                lv_obj_set_style_shadow_width(cancel_btn, 0, LV_PART_MAIN);
+                lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
+                lv_label_set_text(cancel_lbl, "Cancel");
+                lv_obj_set_style_text_color(cancel_lbl, lv_color_white(), LV_PART_MAIN);
+                lv_obj_set_style_text_font(cancel_lbl, &lv_font_montserrat_22, LV_PART_MAIN);
+                lv_obj_center(cancel_lbl);
+                lv_obj_set_user_data(cancel_btn, overlay);
+                lv_obj_add_event_cb(cancel_btn, [](lv_event_t *e) {
+                    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+                    lv_obj_t *ov = (lv_obj_t *)lv_obj_get_user_data(lv_event_get_target_obj(e));
+                    if (ov) lv_obj_delete(ov);
+                }, LV_EVENT_ALL, nullptr);
+
+                // Confirm button — stores checkbox refs in user_data via static struct
+                lv_obj_t *confirm_btn = lv_button_create(btn_row);
+                lv_obj_set_size(confirm_btn, 180, 45);
+                lv_obj_set_style_bg_color(confirm_btn, lv_color_hex(0x661111), LV_PART_MAIN);
+                lv_obj_set_style_radius(confirm_btn, 10, LV_PART_MAIN);
+                lv_obj_set_style_shadow_width(confirm_btn, 0, LV_PART_MAIN);
+                lv_obj_t *confirm_lbl = lv_label_create(confirm_btn);
+                lv_label_set_text(confirm_lbl, "RESET");
+                lv_obj_set_style_text_color(confirm_lbl, lv_color_hex(0xff4444), LV_PART_MAIN);
+                lv_obj_set_style_text_font(confirm_lbl, &lv_font_montserrat_22, LV_PART_MAIN);
+                lv_obj_center(confirm_lbl);
+
+                // Pack refs for the confirm callback
+                struct ResetCtx {
+                    lv_obj_t *overlay;
+                    lv_obj_t *cb_settings;
+                    lv_obj_t *cb_meshy;
+                    lv_obj_t *cb_pki;
+                    System   *self;
+                };
+                static ResetCtx s_reset_ctx;
+                s_reset_ctx = { overlay, cb_settings, cb_meshy, cb_pki, self };
+                lv_obj_set_user_data(confirm_btn, &s_reset_ctx);
+
+                lv_obj_add_event_cb(confirm_btn, [](lv_event_t *e) {
+                    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+                    ResetCtx *ctx = (ResetCtx *)lv_obj_get_user_data(lv_event_get_target_obj(e));
+                    if (!ctx) return;
+
+                    bool reset_settings = lv_obj_has_state(ctx->cb_settings, LV_STATE_CHECKED);
+                    bool reset_meshy    = lv_obj_has_state(ctx->cb_meshy, LV_STATE_CHECKED);
+                    bool reset_pki      = lv_obj_has_state(ctx->cb_pki, LV_STATE_CHECKED);
+
+                    // 1. Optionally reset device settings
+                    if (reset_settings) {
+                        settings_reset();
+                    }
+
+                    // 2. Optionally reset Meshy identity + channels
+                    //    Always erase the NVS blob first (clean slate, clears corruption).
+                    //    Then rebuild with only the preserved fields.
+                    if (reset_meshy || reset_pki) {
+                        // Save PKI if keeping it
+                        uint8_t saved_priv[32] = {0}, saved_pub[32] = {0};
+                        uint8_t saved_valid = 0;
+                        if (!reset_pki && g_meshy_channels.pki_valid) {
+                            memcpy(saved_priv, g_meshy_channels.pki_private_key, 32);
+                            memcpy(saved_pub, g_meshy_channels.pki_public_key, 32);
+                            saved_valid = g_meshy_channels.pki_valid;
+                        }
+
+                        // Save identity if keeping it
+                        char saved_long[MESHY_LONG_NAME_LEN] = {0};
+                        char saved_short[MESHY_SHORT_NAME_LEN] = {0};
+                        if (!reset_meshy) {
+                            memcpy(saved_long, g_meshy_channels.node_long_name, sizeof(saved_long));
+                            memcpy(saved_short, g_meshy_channels.node_short_name, sizeof(saved_short));
+                        }
+
+                        // Erase NVS — clean slate
+                        nvs_handle_t nvs;
+                        if (nvs_open(MESHY_CH_NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+                            nvs_erase_all(nvs);
+                            nvs_commit(nvs);
+                            nvs_close(nvs);
+                        }
+
+                        // Rebuild in-memory struct from zero
+                        memset(&g_meshy_channels, 0, sizeof(g_meshy_channels));
+
+                        // Restore preserved fields
+                        if (saved_valid) {
+                            memcpy(g_meshy_channels.pki_private_key, saved_priv, 32);
+                            memcpy(g_meshy_channels.pki_public_key, saved_pub, 32);
+                            g_meshy_channels.pki_valid = saved_valid;
+                        }
+                        if (!reset_meshy) {
+                            memcpy(g_meshy_channels.node_long_name, saved_long, sizeof(saved_long));
+                            memcpy(g_meshy_channels.node_short_name, saved_short, sizeof(saved_short));
+                        }
+
+                        // Wipe saved private key from stack
+                        memset(saved_priv, 0, sizeof(saved_priv));
+
+                        // Write the clean blob back to NVS
+                        meshy_channels_save();
+
+                        ESP_LOGI("SETTINGS", "Meshy reset: identity=%s pki=%s (NVS erased + rebuilt)",
+                                 reset_meshy ? "cleared" : "kept",
+                                 reset_pki ? "cleared" : "kept");
+                    }
+
+                    // Clean up and navigate home
+                    g_last_touch_ms = esp_log_timestamp();
+                    lv_obj_delete(ctx->overlay);
+                    lv_display_set_rotation(lv_display_get_default(), ctx->self->_home_rotation);
+                    ctx->self->set_vibration();
+                    ctx->self->init_win_home();
+                    lv_screen_load_anim(ctx->self->_registry.win.home.root, LV_SCR_LOAD_ANIM_FADE_OUT, 100, 0, true);
+                }, LV_EVENT_ALL, nullptr);
+
             }, LV_EVENT_ALL, this);
         }
 
@@ -6836,14 +7479,265 @@ namespace Lvgl_Ui
         }
     }
 
+    // ─── Album Art: HW JPEG decode + fallback ──────────────────────────────
+
+    // Persistent decoded pixel buffer and LVGL image descriptor (allocated once, never freed)
+    static uint8_t  *s_art_pixels = nullptr;     // PSRAM: decoded RGB565 pixels
+    static size_t    s_art_pixels_alloc = 0;     // allocated size
+    static lv_image_dsc_t s_art_dsc = {};        // LVGL image descriptor
+    static int       s_art_track_idx = -1;       // track index of current art (-1 = none)
+
+    // Max art pixel buffer: 1024x1024 (padded to 16) RGB565 = 2MB PSRAM.
+    // Covers virtually all embedded album art. After decode, we downscale
+    // in-place to display size (544x544) to minimize LVGL render cost.
+    #define ART_PIXEL_MAX_W  1024   // max decode width
+    #define ART_PIXEL_MAX_H  1024   // max decode height
+    #define ART_PIXEL_BUF_SIZE (ART_PIXEL_MAX_W * ART_PIXEL_MAX_H * 2)
+    #define ART_DISPLAY_SIZE 544    // target display size (padded to 16 for HW compat)
+
+    // Persistent HW JPEG decoder — acquired once, never released
+    static jpeg_decoder_handle_t s_jpeg_decoder = NULL;
+
+    // Lazy-init: allocate pixel buffer and JPEG engine once on first use
+    static bool art_ensure_resources(void) {
+        if (!s_art_pixels) {
+            // Must use jpeg_alloc_decoder_mem for DMA-aligned output buffer
+            jpeg_decode_memory_alloc_cfg_t mem_cfg = {
+                .buffer_direction = JPEG_DEC_ALLOC_OUTPUT_BUFFER,
+            };
+            size_t actual_size = 0;
+            s_art_pixels = (uint8_t *)jpeg_alloc_decoder_mem(ART_PIXEL_BUF_SIZE, &mem_cfg, &actual_size);
+            s_art_pixels_alloc = s_art_pixels ? actual_size : 0;
+            if (s_art_pixels)
+                ESP_LOGI("ART", "Allocated %u bytes for art pixels (DMA-aligned, PSRAM)", (unsigned)actual_size);
+            else
+                ESP_LOGE("ART", "Failed to allocate art pixel buffer (%u bytes)", (unsigned)ART_PIXEL_BUF_SIZE);
+        }
+        if (!s_jpeg_decoder) {
+            jpeg_decode_engine_cfg_t eng_cfg = {
+                .intr_priority = 0,
+                .timeout_ms = 1000,
+            };
+            esp_err_t err = jpeg_new_decoder_engine(&eng_cfg, &s_jpeg_decoder);
+            if (err != ESP_OK || !s_jpeg_decoder) {
+                ESP_LOGE("ART", "Failed to acquire JPEG decoder: 0x%x", err);
+                s_jpeg_decoder = NULL;
+            }
+        }
+        return s_art_pixels && s_jpeg_decoder;
+    }
+
+    // In-place box downscale RGB565 pixels in a buffer.
+    // Safe because output is always smaller — we write rows we've already read.
+    static void downscale_rgb565_inplace(uint8_t *buf, int src_w, int src_h, int dst_w, int dst_h) {
+        uint16_t *src = (uint16_t *)buf;
+        uint16_t *dst = (uint16_t *)buf;
+
+        for (int dy = 0; dy < dst_h; dy++) {
+            int sy0 = (dy * src_h) / dst_h;
+            int sy1 = ((dy + 1) * src_h) / dst_h;
+            if (sy1 <= sy0) sy1 = sy0 + 1;
+
+            for (int dx = 0; dx < dst_w; dx++) {
+                int sx0 = (dx * src_w) / dst_w;
+                int sx1 = ((dx + 1) * src_w) / dst_w;
+                if (sx1 <= sx0) sx1 = sx0 + 1;
+
+                // Box filter: average all source pixels in this cell
+                uint32_t r_acc = 0, g_acc = 0, b_acc = 0;
+                int count = 0;
+                for (int sy = sy0; sy < sy1 && sy < src_h; sy++) {
+                    for (int sx = sx0; sx < sx1 && sx < src_w; sx++) {
+                        uint16_t px = src[sy * src_w + sx];
+                        r_acc += (px >> 11) & 0x1F;
+                        g_acc += (px >> 5) & 0x3F;
+                        b_acc += px & 0x1F;
+                        count++;
+                    }
+                }
+                if (count > 0) {
+                    dst[dy * dst_w + dx] = ((r_acc / count) << 11) |
+                                           ((g_acc / count) << 5) |
+                                           (b_acc / count);
+                }
+            }
+        }
+    }
+
+    // Fallback: generate a gradient image for tracks without embedded art.
+    // Uses a simple color derived from the track title hash.
+    // Writes directly into persistent s_art_pixels (no allocation).
+    static void generate_fallback_art(int width, int height) {
+        if (!s_art_pixels) return;
+        size_t needed = width * height * 2;  // RGB565
+        if (needed > s_art_pixels_alloc) return;  // shouldn't happen with 270x270
+
+        // Hash track title for color seed
+        music_player_info_t info = music_player_get_info();
+        uint32_t hash = 0x811c9dc5;
+        if (info.title) {
+            for (const char *p = info.title; *p; p++)
+                hash = (hash ^ (uint8_t)*p) * 0x01000193;
+        }
+
+        // Two complementary colors from hash
+        uint8_t r1 = (hash >> 0) & 0x7F;   // darker tones
+        uint8_t g1 = (hash >> 8) & 0x7F;
+        uint8_t b1 = (hash >> 16) & 0x7F;
+        uint8_t r2 = 0x40 + ((hash >> 4) & 0x3F);
+        uint8_t g2 = 0x40 + ((hash >> 12) & 0x3F);
+        uint8_t b2 = 0x40 + ((hash >> 20) & 0x3F);
+
+        uint16_t *px = (uint16_t *)s_art_pixels;
+        for (int y = 0; y < height; y++) {
+            int t = (y * 255) / (height - 1);  // 0..255 vertical gradient
+            uint8_t r = r1 + ((r2 - r1) * t) / 255;
+            uint8_t g = g1 + ((g2 - g1) * t) / 255;
+            uint8_t b = b1 + ((b2 - b1) * t) / 255;
+            uint16_t rgb565 = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+            for (int x = 0; x < width; x++) {
+                px[y * width + x] = rgb565;
+            }
+        }
+
+        s_art_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+        s_art_dsc.header.w = width;
+        s_art_dsc.header.h = height;
+        s_art_dsc.data_size = needed;
+        s_art_dsc.data = s_art_pixels;
+    }
+
+    // Decode JPEG album art using ESP32-P4 hardware JPEG decoder.
+    // Uses persistent s_art_pixels buffer and s_jpeg_decoder engine.
+    // If the decoded image is larger than ART_DISPLAY_SIZE, downscales in-place.
+    // Returns true if decode succeeded and s_art_dsc is ready for LVGL.
+    static bool decode_album_art_jpeg(void) {
+        size_t jpeg_size = 0;
+        const uint8_t *jpeg_data = music_player_get_album_art(&jpeg_size);
+        if (!jpeg_data || jpeg_size < 100) return false;
+        if (!s_art_pixels || !s_jpeg_decoder) return false;
+
+        // Get image dimensions
+        jpeg_decode_picture_info_t pic_info = {};
+        esp_err_t err = jpeg_decoder_get_info(jpeg_data, jpeg_size, &pic_info);
+        if (err != ESP_OK) {
+            ESP_LOGW("ART", "JPEG get_info failed: 0x%x", err);
+            return false;
+        }
+
+        ESP_LOGI("ART", "JPEG: %lux%lu", (unsigned long)pic_info.width, (unsigned long)pic_info.height);
+
+        // HW decoder pads output to multiples of 16
+        uint32_t out_w = (pic_info.width + 15) & ~15;
+        uint32_t out_h = (pic_info.height + 15) & ~15;
+        size_t needed = out_w * out_h * 2;  // RGB565
+
+        // Check if decoded image fits in our pre-allocated buffer
+        if (needed > s_art_pixels_alloc) {
+            ESP_LOGW("ART", "JPEG %lux%lu too large for buffer (%u > %u)",
+                     (unsigned long)out_w, (unsigned long)out_h,
+                     (unsigned)needed, (unsigned)s_art_pixels_alloc);
+            return false;
+        }
+
+        // Decode to RGB565 using persistent HW decoder
+        jpeg_decode_cfg_t dec_cfg = {
+            .output_format = JPEG_DECODE_OUT_FORMAT_RGB565,
+            .rgb_order = JPEG_DEC_RGB_ELEMENT_ORDER_BGR,  // LVGL expects BGR565
+            .conv_std = JPEG_YUV_RGB_CONV_STD_BT601,
+        };
+
+        uint32_t out_size = 0;
+        err = jpeg_decoder_process(s_jpeg_decoder, &dec_cfg, jpeg_data, jpeg_size,
+                                   s_art_pixels, s_art_pixels_alloc, &out_size);
+
+        if (err != ESP_OK) {
+            ESP_LOGW("ART", "JPEG decode failed: 0x%x", err);
+            return false;
+        }
+
+        // Downscale in-place if larger than display size.
+        // Box filter averages source pixels — no extra allocation.
+        uint32_t final_w = out_w;
+        uint32_t final_h = out_h;
+        if (out_w > ART_DISPLAY_SIZE || out_h > ART_DISPLAY_SIZE) {
+            // Scale proportionally to fit ART_DISPLAY_SIZE, pad to 16
+            float scale = (float)ART_DISPLAY_SIZE / (out_w > out_h ? out_w : out_h);
+            final_w = ((uint32_t)(out_w * scale) + 15) & ~15;
+            final_h = ((uint32_t)(out_h * scale) + 15) & ~15;
+            if (final_w < 16) final_w = 16;
+            if (final_h < 16) final_h = 16;
+
+            ESP_LOGI("ART", "Downscaling %lux%lu → %lux%lu",
+                     (unsigned long)out_w, (unsigned long)out_h,
+                     (unsigned long)final_w, (unsigned long)final_h);
+            downscale_rgb565_inplace(s_art_pixels, out_w, out_h, final_w, final_h);
+        }
+
+        ESP_LOGI("ART", "Art ready: %lux%lu RGB565", (unsigned long)final_w, (unsigned long)final_h);
+
+        s_art_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+        s_art_dsc.header.w = final_w;
+        s_art_dsc.header.h = final_h;
+        s_art_dsc.data_size = final_w * final_h * 2;
+        s_art_dsc.data = s_art_pixels;
+
+        return true;
+    }
+
+    // Update album art widget for the given track. Called from init_win_music
+    // and from the 500ms timer on track change.
+    static void refresh_album_art(lv_obj_t *art_widget, int track_idx) {
+        if (!art_widget) return;
+        if (track_idx == s_art_track_idx) return;  // already showing this track's art
+
+        // Lazy-init persistent pixel buffer + JPEG engine on first call
+        if (!art_ensure_resources()) {
+            ESP_LOGW("ART", "Art resources unavailable");
+            return;
+        }
+
+        bool has_art = false;
+        if (track_idx >= 0) {
+            has_art = music_player_load_album_art(track_idx);
+            if (has_art) {
+                has_art = decode_album_art_jpeg();
+            }
+        }
+
+        if (!has_art) {
+            // Generate fallback gradient (writes into persistent s_art_pixels)
+            ESP_LOGI("ART", "No embedded art for track %d, using gradient", track_idx);
+            generate_fallback_art(270, 270);  // half-size, LVGL will scale up to 540
+        }
+
+        s_art_track_idx = track_idx;
+
+        if (s_art_dsc.data) {
+            lv_image_set_src(art_widget, &s_art_dsc);
+            lv_obj_set_size(art_widget, 540, 540);
+            lv_image_set_inner_align(art_widget, LV_IMAGE_ALIGN_STRETCH);
+            // Force redraw — same &s_art_dsc pointer but different pixel data
+            lv_obj_invalidate(art_widget);
+        }
+    }
+
     void System::init_win_music(void)
     {
+        // Re-scan SD card for tracks every time window opens.
+        // Handles: SD card inserted/removed, files added/deleted since boot.
+        // Only scan if not currently playing — avoids overwriting track data mid-playback.
+        music_player_info_t pre_info = music_player_get_info();
+        if (pre_info.state == MUSIC_STATE_STOPPED) {
+            music_player_scan();
+        }
+
         // 主界面
         _registry.win.music.root = lv_obj_create(NULL);
         lv_obj_set_style_bg_color(_registry.win.music.root, lv_color_hex(0xE0DFDE), (lv_style_selector_t)LV_PART_MAIN);
 
         lv_obj_t *album_cover_img = lv_image_create(_registry.win.music.root);
-        lv_image_set_src(album_cover_img, &win_music_album_cover_540x540px_rgb565a8);
+        _registry.win.music.album_art = album_cover_img;
         lv_obj_set_size(album_cover_img, 540, 540);
 #if defined SCREEN_ROTATION_DIRECTION_0
         lv_obj_align(album_cover_img, LV_ALIGN_TOP_MID, 0, 50);
@@ -6852,18 +7746,53 @@ namespace Lvgl_Ui
 #else
 #error "unknown macro definition, please select the correct macro definition."
 #endif
+        // Load album art for current track (HW JPEG decode or fallback gradient)
+        {
+            music_player_info_t minfo_art = music_player_get_info();
+            s_art_track_idx = -1;  // force refresh
+            refresh_album_art(album_cover_img, minfo_art.track_index);
+        }
 
         lv_obj_set_size(_registry.win.music.root, _width, _height);
         lv_obj_set_scrollbar_mode(_registry.win.music.root, LV_SCROLLBAR_MODE_OFF);
 
+        // ─── Close button (upper right) ────────────────────────────────
+        {
+            lv_obj_t *close_btn = lv_button_create(_registry.win.music.root);
+            lv_obj_set_size(close_btn, 50, 50);
+            lv_obj_set_style_bg_color(close_btn, lv_color_black(), LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(close_btn, 120, LV_PART_MAIN);
+            lv_obj_set_style_shadow_width(close_btn, 0, LV_PART_MAIN);
+            lv_obj_set_style_border_width(close_btn, 0, LV_PART_MAIN);
+            lv_obj_set_style_radius(close_btn, 25, LV_PART_MAIN);  // circle
+#if defined SCREEN_ROTATION_DIRECTION_0
+            lv_obj_align(close_btn, LV_ALIGN_TOP_RIGHT, -15, 55);
+#elif defined SCREEN_ROTATION_DIRECTION_90
+            lv_obj_align(close_btn, LV_ALIGN_TOP_RIGHT, -15, 25);
+#endif
+            lv_obj_t *close_lbl = lv_label_create(close_btn);
+            lv_label_set_text(close_lbl, LV_SYMBOL_CLOSE);
+            lv_obj_set_style_text_color(close_lbl, lv_color_white(), LV_PART_MAIN);
+            lv_obj_center(close_lbl);
+
+            lv_obj_add_event_cb(close_btn, [](lv_event_t *e) {
+                if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+                System *self = static_cast<System *>(lv_event_get_user_data(e));
+                self->set_vibration();
+                self->init_win_home();
+                lv_screen_load_anim(self->_registry.win.home.root, LV_SCR_LOAD_ANIM_FADE_OUT, 100, 0, true);
+                self->_edge_touch_flag = false;
+            }, LV_EVENT_ALL, this);
+        }
+
         lv_obj_t *song_name_btn = lv_button_create(_registry.win.music.root);
-        lv_obj_set_size(song_name_btn, 260, 60);
+        lv_obj_set_size(song_name_btn, 460, 60);
         lv_obj_set_style_radius(song_name_btn, LV_RADIUS_CIRCLE, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_bg_color(song_name_btn, lv_color_black(), LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_bg_opa(song_name_btn, 60, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_shadow_width(song_name_btn, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
 #if defined SCREEN_ROTATION_DIRECTION_0
-        lv_obj_align(song_name_btn, LV_ALIGN_TOP_LEFT, 30, 590);
+        lv_obj_align(song_name_btn, LV_ALIGN_TOP_MID, 0, 600);
 #elif defined SCREEN_ROTATION_DIRECTION_90
         lv_obj_align(song_name_btn, LV_ALIGN_TOP_LEFT, 560, 70);
 #else
@@ -6871,25 +7800,30 @@ namespace Lvgl_Ui
 #endif
 
         lv_obj_t *song_name_label = lv_label_create(song_name_btn);
-        lv_label_set_text(song_name_label, "Gymnopedie 1");
+        music_player_info_t minfo = music_player_get_info();
+        lv_label_set_text(song_name_label, minfo.title);
+        lv_label_set_long_mode(song_name_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+        lv_obj_set_width(song_name_label, 420);
+        _registry.win.music.label.song_name = song_name_label;
         lv_obj_set_style_text_color(song_name_label, lv_color_white(), LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_text_font(song_name_label, &lvgl_font_misans_bold_27, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_text_align(song_name_label, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_text_align(song_name_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_center(song_name_label);
 
         lv_obj_t *artist_btn = lv_button_create(_registry.win.music.root);
-        lv_obj_set_size(artist_btn, 170, 50);
+        lv_obj_set_size(artist_btn, 300, 50);
         lv_obj_set_style_radius(artist_btn, LV_RADIUS_CIRCLE, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_bg_color(artist_btn, lv_color_black(), LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_bg_opa(artist_btn, 60, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_shadow_width(artist_btn, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_align_to(artist_btn, song_name_btn, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 10);
+        lv_obj_align_to(artist_btn, song_name_btn, LV_ALIGN_OUT_BOTTOM_MID, 0, 10);
 
         lv_obj_t *artist_label = lv_label_create(artist_btn);
-        lv_label_set_text(artist_label, "Erik Satie");
+        lv_label_set_text(artist_label, minfo.artist);
+        _registry.win.music.label.artist = artist_label;
         lv_obj_set_style_text_color(artist_label, lv_color_white(), LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_text_font(artist_label, &lv_font_montserrat_26, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_text_align(song_name_label, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_text_align(artist_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_center(artist_label);
 
         // 创建播放按键图片按钮
@@ -6918,6 +7852,9 @@ namespace Lvgl_Ui
                                         self->_registry.win.music.play_flag = false;
 
                                         self->set_win_music_play_imagebutton_status(self->_registry.win.music.play_flag);
+
+                                        // Actually pause the music player
+                                        music_player_pause();
                                     }
                                     else // 按键点击 切换为播放模式
                                     {
@@ -6925,7 +7862,13 @@ namespace Lvgl_Ui
 
                                         self->set_win_music_play_imagebutton_status(self->_registry.win.music.play_flag);
 
-                                        self->set_music_start_end(true);
+                                        // Resume if paused, or start if stopped
+                                        music_player_info_t pinfo = music_player_get_info();
+                                        if (pinfo.state == MUSIC_STATE_PAUSED) {
+                                            music_player_resume();
+                                        } else {
+                                            self->set_music_start_end(true);
+                                        }
                                     }
                                 } }, LV_EVENT_ALL, this);
 
@@ -6938,6 +7881,19 @@ namespace Lvgl_Ui
         lv_obj_set_size(_registry.win.music.imagebutton.switch_left, 95, 95);
         // lv_obj_align_to(_registry.win.music.imagebutton.switch_left, _registry.win.music.imagebutton.play, LV_ALIGN_OUT_LEFT_MID, -10, 0);
 
+        // Previous track callback
+        lv_obj_add_event_cb(_registry.win.music.imagebutton.switch_left, [](lv_event_t *e) {
+            if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+            System *self = static_cast<System *>(lv_event_get_user_data(e));
+            music_player_prev();
+            // Update labels
+            music_player_info_t info = music_player_get_info();
+            if (self->_registry.win.music.label.song_name)
+                lv_label_set_text(self->_registry.win.music.label.song_name, info.title);
+            if (self->_registry.win.music.label.artist)
+                lv_label_set_text(self->_registry.win.music.label.artist, info.artist);
+        }, LV_EVENT_ALL, this);
+
         // 创建右切换按键图片按钮
         _registry.win.music.imagebutton.switch_right = lv_imagebutton_create(_registry.win.music.root);
         lv_imagebutton_set_src(_registry.win.music.imagebutton.switch_right, LV_IMAGEBUTTON_STATE_RELEASED, NULL, &win_music_play_switch_right_1_95x95px_rgb565a8, NULL);
@@ -6946,6 +7902,19 @@ namespace Lvgl_Ui
         // 设置按钮大小和位置
         lv_obj_set_size(_registry.win.music.imagebutton.switch_right, 95, 95);
         // lv_obj_align_to(_registry.win.music.imagebutton.switch_right, _registry.win.music.imagebutton.play, LV_ALIGN_OUT_RIGHT_MID, 10, 0);
+
+        // Next track callback
+        lv_obj_add_event_cb(_registry.win.music.imagebutton.switch_right, [](lv_event_t *e) {
+            if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+            System *self = static_cast<System *>(lv_event_get_user_data(e));
+            music_player_next();
+            // Update labels
+            music_player_info_t info = music_player_get_info();
+            if (self->_registry.win.music.label.song_name)
+                lv_label_set_text(self->_registry.win.music.label.song_name, info.title);
+            if (self->_registry.win.music.label.artist)
+                lv_label_set_text(self->_registry.win.music.label.artist, info.artist);
+        }, LV_EVENT_ALL, this);
 
         // 创建左侧当前播放时间按钮
         lv_obj_t *current_time_btn = lv_button_create(_registry.win.music.root);
@@ -7045,6 +8014,53 @@ namespace Lvgl_Ui
                                     self->set_win_music_current_total_time(set_current_time_s, self->_registry.win.music.total_time_s);
                                 } }, LV_EVENT_ALL, this);
 
+        // ─── Volume slider ──────────────────────────────────────────────────
+        {
+            // Volume icon (speaker symbol)
+            lv_obj_t *vol_icon = lv_label_create(_registry.win.music.root);
+            lv_label_set_text(vol_icon, LV_SYMBOL_VOLUME_MID);
+            lv_obj_set_style_text_color(vol_icon, lv_color_hex(0x555555), LV_PART_MAIN);
+            lv_obj_set_style_text_font(vol_icon, &lv_font_montserrat_22, LV_PART_MAIN);
+#if defined SCREEN_ROTATION_DIRECTION_0
+            lv_obj_align(vol_icon, LV_ALIGN_BOTTOM_LEFT, 30, -128);
+#elif defined SCREEN_ROTATION_DIRECTION_90
+            lv_obj_align(vol_icon, LV_ALIGN_BOTTOM_LEFT, 560, -128);
+#endif
+
+            lv_obj_t *vol_slider = lv_slider_create(_registry.win.music.root);
+            lv_slider_set_range(vol_slider, 0, 100);
+            lv_slider_set_value(vol_slider, (int32_t)g_settings.volume, LV_ANIM_OFF);
+            lv_obj_set_style_bg_color(vol_slider, lv_color_hex(0x999999), LV_PART_MAIN);
+            lv_obj_set_style_bg_color(vol_slider, lv_color_white(), LV_PART_INDICATOR);
+            lv_obj_set_style_bg_color(vol_slider, lv_color_white(), LV_PART_KNOB);
+            lv_obj_set_style_radius(vol_slider, 4, LV_PART_MAIN);
+            lv_obj_set_style_radius(vol_slider, 4, LV_PART_INDICATOR);
+            lv_obj_set_style_radius(vol_slider, 50, LV_PART_KNOB);
+            lv_obj_set_style_pad_left(vol_slider, 0, LV_PART_KNOB);
+            lv_obj_set_style_pad_right(vol_slider, 0, LV_PART_KNOB);
+            lv_obj_set_style_width(vol_slider, 10, LV_PART_KNOB);
+            lv_obj_set_style_height(vol_slider, 10, LV_PART_KNOB);
+#if defined SCREEN_ROTATION_DIRECTION_0
+            lv_obj_set_size(vol_slider, 380, 6);
+            lv_obj_align(vol_slider, LV_ALIGN_BOTTOM_MID, 20, -133);
+#elif defined SCREEN_ROTATION_DIRECTION_90
+            lv_obj_set_size(vol_slider, 540, 6);
+            lv_obj_align(vol_slider, LV_ALIGN_BOTTOM_MID, 280, -133);
+#endif
+
+            lv_obj_add_event_cb(vol_slider, [](lv_event_t *e) {
+                if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+                System *self = static_cast<System *>(lv_event_get_user_data(e));
+                g_settings.volume = (uint8_t)lv_slider_get_value(lv_event_get_target_obj(e));
+                if (self->_device_volume_callback)
+                    self->_device_volume_callback(g_settings.volume);
+            }, LV_EVENT_ALL, this);
+            lv_obj_add_event_cb(vol_slider, [](lv_event_t *e) {
+                if (lv_event_get_code(e) != LV_EVENT_RELEASED) return;
+                settings_save();
+            }, LV_EVENT_ALL, nullptr);
+        }
+
         // 创建底部黑色长条按钮
         lv_obj_t *bottom_bar_btn = lv_button_create(_registry.win.music.root);
         lv_obj_set_style_bg_color(bottom_bar_btn, lv_color_black(), LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -7067,9 +8083,171 @@ namespace Lvgl_Ui
         lv_obj_set_style_text_font(bottom_bar_label, &lv_font_montserrat_26, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_center(bottom_bar_label);
 
+        // ─── Playlist panel (hidden, shown on bottom bar tap) ──────────
+        // Full-screen overlay with scrollable track list
+        lv_obj_t *playlist_panel = lv_obj_create(_registry.win.music.root);
+        lv_obj_set_size(playlist_panel, _width, _height - 50);
+        lv_obj_align(playlist_panel, LV_ALIGN_BOTTOM_MID, 0, 0);
+        lv_obj_set_style_bg_color(playlist_panel, lv_color_hex(0x1A1A1A), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(playlist_panel, 240, LV_PART_MAIN);
+        lv_obj_set_style_radius(playlist_panel, 20, LV_PART_MAIN);
+        lv_obj_set_style_border_width(playlist_panel, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(playlist_panel, 15, LV_PART_MAIN);
+        lv_obj_set_style_pad_row(playlist_panel, 8, LV_PART_MAIN);
+        lv_obj_set_scrollbar_mode(playlist_panel, LV_SCROLLBAR_MODE_AUTO);
+        lv_obj_set_flex_flow(playlist_panel, LV_FLEX_FLOW_COLUMN);
+        lv_obj_add_flag(playlist_panel, LV_OBJ_FLAG_HIDDEN);  // start hidden
+
+        // Static refs for rebuild from callbacks
+        static lv_obj_t *s_playlist_panel = nullptr;
+        static System *s_playlist_self = nullptr;
+        static int32_t s_playlist_width = 0;
+        static void (*s_rebuild_fn)(void) = nullptr;
+        s_playlist_panel = playlist_panel;
+        s_playlist_self = this;
+        s_playlist_width = _width;
+
+        // Rebuild playlist contents — called on open and after track selection
+        s_rebuild_fn = []() {
+            if (!s_playlist_panel || !s_playlist_self) return;
+
+            // Delete all children and rebuild
+            lv_obj_clean(s_playlist_panel);
+
+            // Header
+            lv_obj_t *pl_header = lv_label_create(s_playlist_panel);
+            lv_label_set_text(pl_header, "Up Next");
+            lv_obj_set_style_text_color(pl_header, lv_color_hex(0xAAAAAA), LV_PART_MAIN);
+            lv_obj_set_style_text_font(pl_header, &lv_font_montserrat_22, LV_PART_MAIN);
+            lv_obj_set_style_pad_bottom(pl_header, 8, LV_PART_MAIN);
+
+            music_player_info_t pl_info = music_player_get_info();
+            int count = music_player_track_count();
+
+            for (int i = 0; i < count; i++) {
+                const music_track_t *trk = music_player_get_track(i);
+                if (!trk) continue;
+
+                lv_obj_t *row_btn = lv_button_create(s_playlist_panel);
+                lv_obj_set_size(row_btn, s_playlist_width - 60, 65);
+                lv_obj_set_style_radius(row_btn, 12, LV_PART_MAIN);
+                lv_obj_set_style_shadow_width(row_btn, 0, LV_PART_MAIN);
+                lv_obj_set_style_border_width(row_btn, 0, LV_PART_MAIN);
+                lv_obj_set_style_pad_left(row_btn, 15, LV_PART_MAIN);
+                lv_obj_set_style_pad_ver(row_btn, 8, LV_PART_MAIN);
+
+                bool is_current = (i == pl_info.track_index);
+                lv_obj_set_style_bg_color(row_btn, is_current ? lv_color_hex(0x333333) : lv_color_hex(0x222222), LV_PART_MAIN);
+
+                // Track number
+                lv_obj_t *num_lbl = lv_label_create(row_btn);
+                char num_str[12];
+                snprintf(num_str, sizeof(num_str), "%d.", i + 1);
+                lv_label_set_text(num_lbl, num_str);
+                lv_obj_set_style_text_color(num_lbl, is_current ? lv_color_hex(0x4dabf7) : lv_color_hex(0x888888), LV_PART_MAIN);
+                lv_obj_set_style_text_font(num_lbl, &lv_font_montserrat_22, LV_PART_MAIN);
+                lv_obj_align(num_lbl, LV_ALIGN_LEFT_MID, 0, 0);
+
+                // Title
+                lv_obj_t *title_lbl = lv_label_create(row_btn);
+                lv_label_set_text(title_lbl, trk->title);
+                lv_label_set_long_mode(title_lbl, LV_LABEL_LONG_DOT);
+                lv_obj_set_width(title_lbl, s_playlist_width - 160);
+                lv_obj_set_style_text_color(title_lbl, is_current ? lv_color_white() : lv_color_hex(0xCCCCCC), LV_PART_MAIN);
+                lv_obj_set_style_text_font(title_lbl, &lv_font_montserrat_22, LV_PART_MAIN);
+                lv_obj_align(title_lbl, LV_ALIGN_LEFT_MID, 35, 0);
+
+                // Now-playing indicator
+                if (is_current) {
+                    lv_obj_t *now_lbl = lv_label_create(row_btn);
+                    lv_label_set_text(now_lbl, LV_SYMBOL_PLAY);
+                    lv_obj_set_style_text_color(now_lbl, lv_color_hex(0x4dabf7), LV_PART_MAIN);
+                    lv_obj_align(now_lbl, LV_ALIGN_RIGHT_MID, -5, 0);
+                }
+
+                // Tap to jump to track — stays open, rebuilds to show new highlight
+                lv_obj_add_event_cb(row_btn, [](lv_event_t *e) {
+                    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+                    int idx = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target_obj(e));
+
+                    int cnt = music_player_track_count();
+                    if (cnt > 0) {
+                        music_player_set_track((idx - 1 + cnt) % cnt);
+                        music_player_next();
+                    }
+
+                    // Update labels
+                    music_player_info_t info = music_player_get_info();
+                    if (s_playlist_self->_registry.win.music.label.song_name)
+                        lv_label_set_text(s_playlist_self->_registry.win.music.label.song_name, info.title);
+                    if (s_playlist_self->_registry.win.music.label.artist)
+                        lv_label_set_text(s_playlist_self->_registry.win.music.label.artist, info.artist);
+
+                    // Rebuild playlist to refresh highlights (panel stays open)
+                    // Use lv_async to avoid modifying tree during event processing
+                    lv_async_call([](void *) {
+                        if (s_rebuild_fn) s_rebuild_fn();
+                    }, nullptr);
+                }, LV_EVENT_ALL, s_playlist_self);
+                lv_obj_set_user_data(row_btn, (void *)(intptr_t)i);
+            }
+
+            // Close button at bottom
+            lv_obj_t *close_pl_btn = lv_button_create(s_playlist_panel);
+            lv_obj_set_size(close_pl_btn, s_playlist_width - 60, 55);
+            lv_obj_set_style_bg_color(close_pl_btn, lv_color_hex(0x333333), LV_PART_MAIN);
+            lv_obj_set_style_radius(close_pl_btn, 12, LV_PART_MAIN);
+            lv_obj_set_style_shadow_width(close_pl_btn, 0, LV_PART_MAIN);
+            lv_obj_set_style_border_width(close_pl_btn, 0, LV_PART_MAIN);
+            lv_obj_t *close_pl_lbl = lv_label_create(close_pl_btn);
+            lv_label_set_text(close_pl_lbl, LV_SYMBOL_DOWN "  Close");
+            lv_obj_set_style_text_color(close_pl_lbl, lv_color_white(), LV_PART_MAIN);
+            lv_obj_set_style_text_font(close_pl_lbl, &lv_font_montserrat_22, LV_PART_MAIN);
+            lv_obj_center(close_pl_lbl);
+            lv_obj_add_event_cb(close_pl_btn, [](lv_event_t *e) {
+                if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+                if (s_playlist_panel)
+                    lv_obj_add_flag(s_playlist_panel, LV_OBJ_FLAG_HIDDEN);
+            }, LV_EVENT_ALL, nullptr);
+        };
+
+        // Build initial playlist content
+        s_rebuild_fn();
+
+        // Bottom bar: toggle playlist on tap, rebuild on show
+        lv_obj_add_event_cb(bottom_bar_btn, [](lv_event_t *e) {
+            if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+            if (!s_playlist_panel) return;
+            if (lv_obj_has_flag(s_playlist_panel, LV_OBJ_FLAG_HIDDEN)) {
+                s_rebuild_fn();  // refresh highlights before showing
+                lv_obj_remove_flag(s_playlist_panel, LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lv_obj_add_flag(s_playlist_panel, LV_OBJ_FLAG_HIDDEN);
+            }
+        }, LV_EVENT_ALL, nullptr);
+
         set_win_music_play_imagebutton_status(_registry.win.music.play_flag);
 
         set_win_music_current_total_time(_registry.win.music.current_time_s, _registry.win.music.total_time_s);
+
+        // Periodic timer to update UI from music_player state (position, track info)
+        static lv_timer_t *s_music_timer = nullptr;
+        if (s_music_timer) { lv_timer_delete(s_music_timer); s_music_timer = nullptr; }
+        s_music_timer = lv_timer_create([](lv_timer_t *t) {
+            System *self = static_cast<System *>(lv_timer_get_user_data(t));
+            if (self->_current_win != Current_Win::MUSIC) return;
+            music_player_info_t info = music_player_get_info();
+            if (info.state == MUSIC_STATE_PLAYING || info.state == MUSIC_STATE_PAUSED) {
+                self->set_win_music_current_total_time(info.position_s, info.duration_s);
+            }
+            // Update song/artist if track changed
+            if (self->_registry.win.music.label.song_name)
+                lv_label_set_text(self->_registry.win.music.label.song_name, info.title);
+            if (self->_registry.win.music.label.artist)
+                lv_label_set_text(self->_registry.win.music.label.artist, info.artist);
+            // Refresh album art if track changed
+            refresh_album_art(self->_registry.win.music.album_art, info.track_index);
+        }, 500, this);
 
         lv_obj_add_event_cb(_registry.win.music.root, [](lv_event_t *e)
                             {
@@ -7093,11 +8271,41 @@ namespace Lvgl_Ui
                                     }
                                 } }, LV_EVENT_ALL, this);
 
+        // ─── Cleanup on screen destroy ─────────────────────────────────
+        // When navigating away, lv_screen_load_anim(..., true) destroys
+        // this screen. Null all statics to prevent use-after-free from
+        // queued lv_async_call or lingering timer callbacks.
+        lv_obj_add_event_cb(_registry.win.music.root, [](lv_event_t *e) {
+            if (lv_event_get_code(e) != LV_EVENT_DELETE) return;
+            // Kill the timer before its next tick can touch deleted widgets
+            if (s_music_timer) {
+                lv_timer_delete(s_music_timer);
+                s_music_timer = nullptr;
+            }
+            // Null all statics that point into the destroyed screen tree
+            s_playlist_panel = nullptr;
+            s_playlist_self = nullptr;
+            s_rebuild_fn = nullptr;
+            // Reset art track index so next open forces a refresh
+            s_art_track_idx = -1;
+        }, LV_EVENT_DELETE, nullptr);
+
         init_status_bar(_registry.win.music.root);
 
         lv_obj_update_layout(_registry.win.music.root);
 
-        set_music_start_end(true);
+        // Auto-play if tracks available
+        if (music_player_track_count() > 0) {
+            _registry.win.music.play_flag = true;
+            set_win_music_play_imagebutton_status(true);
+            set_music_start_end(true);
+        } else {
+            // No tracks — show instructions
+            if (_registry.win.music.label.song_name)
+                lv_label_set_text(_registry.win.music.label.song_name, "No mp3s found in");
+            if (_registry.win.music.label.artist)
+                lv_label_set_text(_registry.win.music.label.artist, "/sdcard/music/");
+        }
 
         _current_win = Current_Win::MUSIC;
     }
@@ -7110,9 +8318,9 @@ namespace Lvgl_Ui
 
             lv_obj_set_size(_registry.win.music.imagebutton.play, 140, 140);
 #if defined SCREEN_ROTATION_DIRECTION_0
-            lv_obj_align(_registry.win.music.imagebutton.play, LV_ALIGN_BOTTOM_MID, 0, -130);
+            lv_obj_align(_registry.win.music.imagebutton.play, LV_ALIGN_BOTTOM_MID, 0, -165);
 #elif defined SCREEN_ROTATION_DIRECTION_90
-            lv_obj_align(_registry.win.music.imagebutton.play, LV_ALIGN_BOTTOM_MID, 260, -130);
+            lv_obj_align(_registry.win.music.imagebutton.play, LV_ALIGN_BOTTOM_MID, 260, -165);
 #else
 #error "unknown macro definition, please select the correct macro definition."
 #endif
@@ -7125,9 +8333,9 @@ namespace Lvgl_Ui
 
             lv_obj_set_size(_registry.win.music.imagebutton.play, 117, 117);
 #if defined SCREEN_ROTATION_DIRECTION_0
-            lv_obj_align(_registry.win.music.imagebutton.play, LV_ALIGN_BOTTOM_MID, 0, -142);
+            lv_obj_align(_registry.win.music.imagebutton.play, LV_ALIGN_BOTTOM_MID, 0, -177);
 #elif defined SCREEN_ROTATION_DIRECTION_90
-            lv_obj_align(_registry.win.music.imagebutton.play, LV_ALIGN_BOTTOM_MID, 260, -142);
+            lv_obj_align(_registry.win.music.imagebutton.play, LV_ALIGN_BOTTOM_MID, 260, -177);
 #else
 #error "unknown macro definition, please select the correct macro definition."
 #endif

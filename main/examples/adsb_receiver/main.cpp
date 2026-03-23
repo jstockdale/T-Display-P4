@@ -44,6 +44,8 @@
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
 #include "driver/sdmmc_host.h"
+#include "driver/sdspi_host.h"
+#include "driver/spi_common.h"
 #include "New Notification 010_c2_b16_s44100.h"
 #include "ICM20948_WE.h"
 #include "meshtastic_task.h"
@@ -64,11 +66,17 @@
 
 #include "class_driver.h"
 #include "serial_console.h"
+#include "music_player.h"
 #include "nvs_flash.h"
 #include "device_settings.h"
+#include "meshy_channels.h"
 
 // Global settings instance — declared extern in device_settings.h
 device_settings_t g_settings;
+volatile bool g_settings_save_pending = false;
+volatile bool g_settings_reset_pending = false;
+// Global channel store — declared extern in meshy_channels.h
+meshy_channel_store_t g_meshy_channels;
 // WiFi disabled — Espressif Issue #17889 (SDMMC controller DMA conflict)
 // WiFi disabled — esp_hosted and esp_wifi_remote removed from build
 // to prevent SDIO auto-init that fragments internal heap (Issue #17889)
@@ -339,6 +347,27 @@ uint32_t g_screen_height = HI8561_SCREEN_HEIGHT;
 // Screen timeout / wake state (accessed from lvgl_ui.cpp settings)
 volatile uint32_t g_last_touch_ms = 0;
 volatile bool g_screen_blanked = false;
+
+// GPS fix epoch — set once on first quality GPS fix.
+// Both ADS-B and Meshy SD logs use this for rename timestamps.
+// Zero means no fix yet — log lines use [boot+X] format.
+extern "C" volatile time_t g_gps_fix_epoch = 0;
+
+// Bridge: allow C music_player code to reconfigure I2S + ES8311 clock rate.
+// Called when an MP3/WAV has a different sample rate than the current output.
+static uint32_t s_current_output_rate = 44100;
+extern "C" bool music_set_output_rate(uint32_t rate_hz) {
+    if (rate_hz == s_current_output_rate) return true;
+    bool ok = ES8311_IIS_Bus->set_clock_rate(rate_hz);
+    if (ok) ok = ES8311->set_clock_coeff(256, rate_hz);
+    if (ok) {
+        s_current_output_rate = rate_hz;
+        ESP_LOGI("MUSIC", "Output rate changed to %lu Hz", (unsigned long)rate_hz);
+    } else {
+        ESP_LOGW("MUSIC", "Failed to set output rate %lu Hz", (unsigned long)rate_hz);
+    }
+    return ok;
+}
 
 #if defined SCREEN_ROTATION_DIRECTION_0
 auto System_Ui = std::make_unique<Lvgl_Ui::System>(SCREEN_WIDTH_MAX, SCREEN_HEIGHT_MAX);
@@ -654,7 +683,7 @@ void lvgl_ui_task(void *arg)
 
         // Temporary: print every 5 seconds to confirm handler is running
         if (++tick_count % 500 == 0)
-            printf("lvgl tick %lu, next_ms=%lu\n", tick_count, time_till_next_ms);
+            ESP_LOGI("LVGL", "tick %lu, next_ms=%lu", tick_count, time_till_next_ms);
 
         usleep(1000 * time_till_next_ms);
     }
@@ -766,8 +795,36 @@ void device_speaker_task(void *arg)
             ES8311->write_data(c2_b16_s44100, sizeof(c2_b16_s44100));
             break;
         case Es8311_Mode::PLAY_MUSIC:
-            Play_Wav_File(SD_FILE_PATH_MUSIC);
+        {
+            // Play tracks in a loop until explicitly stopped
+            Music_Play_End_Flag = false;
+            int consecutive_failures = 0;
+            while (!Music_Play_End_Flag) {
+                music_player_ack_track_change();
+                music_player_play_blocking();
+                if (Music_Play_End_Flag) break;
+                // If play_blocking returned immediately (file not found / SD removed),
+                // state will be STOPPED. Don't loop forever.
+                music_player_info_t pinfo = music_player_get_info();
+                if (pinfo.state == MUSIC_STATE_STOPPED && pinfo.position_s == 0) {
+                    consecutive_failures++;
+                    if (consecutive_failures >= 3) {
+                        ESP_LOGW("MUSIC", "Too many consecutive failures — stopping");
+                        break;
+                    }
+                } else {
+                    consecutive_failures = 0;
+                }
+                // Track ended naturally or next/prev → keep playing
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+            // Update UI — playback stopped
+            _lock_acquire(&lvgl_api_lock);
+            System_Ui->_registry.win.music.play_flag = false;
+            System_Ui->set_win_music_play_imagebutton_status(false);
+            _lock_release(&lvgl_api_lock);
             break;
+        }
         default:
             break;
         }
@@ -1159,6 +1216,7 @@ void device_gps_task(void *arg)
                     static size_t last_rtc_write = 0;
 
                     if (rmc.location_status == "A" &&
+                        gga_ok && gga.gps_mode_status > 0 &&
                         rmc.utc.update_flag &&
                         rmc.data.update_flag)
                     {
@@ -1191,7 +1249,14 @@ void device_gps_task(void *arg)
                             gettimeofday(&tv_sys, NULL);
                             long long drift_s = (long long)(gps_epoch - tv_sys.tv_sec);
 
-                            // Only step if off by more than 1 second
+                            // Record GPS fix epoch for SD log renames (once)
+                            if (g_gps_fix_epoch == 0) {
+                                g_gps_fix_epoch = gps_epoch;
+                                serial_console_print("\033[0;36m[GNSS] GPS fix acquired — epoch %lld\033[0m\n",
+                                    (long long)gps_epoch);
+                            }
+
+                            // Only step clock if off by more than 1 second
                             if (drift_s > 1 || drift_s < -1) {
                                 struct timeval tv_now = {
                                     .tv_sec = gps_epoch,
@@ -1202,13 +1267,13 @@ void device_gps_task(void *arg)
                                     drift_s, utc_year, utc_mon, utc_day,
                                     utc_hour, utc_min, utc_sec,
                                     GPS_SERIAL_DELAY_US / 1000);
+                            }
 
-                                // Rename boot-numbered SD log to UTC timestamp
-                                static bool log_renamed = false;
-                                if (!log_renamed) {
-                                    sd_log_rename_with_time();
-                                    log_renamed = true;
-                                }
+                            // Rename boot-numbered SD logs to UTC timestamp (once, after fix)
+                            static bool log_renamed = false;
+                            if (!log_renamed && g_gps_fix_epoch > 0) {
+                                sd_log_rename_with_time();
+                                log_renamed = true;
                             }
 
                             // --- Set PCF8563 RTC at first fix, then every 60s ---
@@ -1408,6 +1473,7 @@ void device_rtc_task(void *arg)
 {
     printf("device_rtc_task start\n");
 
+    static bool rtc_clock_synced = false;  // one-time sync to system clock
     size_t cycle_time = 0;
 
     while (1)
@@ -1417,8 +1483,30 @@ void device_rtc_task(void *arg)
             Cpp_Bus_Driver::Pcf8563x::Time t;
             if (PCF8563->get_time(t) == true)
             {
-                printf("pcf8563 year:[%d] month:[%d] day:[%d] time:[%d:%d:%d] week:[%d]\n", t.year, t.month, t.day,
+                ESP_LOGI("RTC", "pcf8563 year:[%d] month:[%d] day:[%d] time:[%d:%d:%d] week:[%d]", t.year, t.month, t.day,
                        t.hour, t.minute, t.second, static_cast<uint8_t>(t.week));
+
+                // One-time: seed POSIX system clock from RTC so gettimeofday()
+                // returns approximate real time before GPS fix arrives.
+                // RTC stores LOCAL time, so we reverse the tz offset to get UTC.
+                if (!rtc_clock_synced && t.year >= 24) {
+                    struct tm tm_rtc = {};
+                    tm_rtc.tm_year = t.year + 2000 - 1900;
+                    tm_rtc.tm_mon  = t.month - 1;
+                    tm_rtc.tm_mday = t.day;
+                    tm_rtc.tm_hour = t.hour;
+                    tm_rtc.tm_min  = t.minute;
+                    tm_rtc.tm_sec  = t.second;
+                    time_t local_epoch = mktime(&tm_rtc);
+                    int16_t tz_off_min = get_tz_offset_minutes();
+                    time_t utc_epoch = local_epoch - tz_off_min * 60;
+                    if (utc_epoch > 1704067200) {  // sanity: after 2024-01-01
+                        struct timeval tv_rtc = { .tv_sec = utc_epoch, .tv_usec = 0 };
+                        settimeofday(&tv_rtc, NULL);
+                        ESP_LOGI("RTC", "System clock set from RTC: UTC epoch %lld", (long long)utc_epoch);
+                    }
+                    rtc_clock_synced = true;
+                }
 
                 System_Ui->set_time(t);
 
@@ -1454,7 +1542,7 @@ void device_rtc_task(void *arg)
             }
             else
             {
-                printf("pcf8563 integrity of the clock information is not guaranteed\n");
+                ESP_LOGW("RTC", "pcf8563 integrity of the clock information is not guaranteed");
 
                 if (System_Ui->get_current_win() == Lvgl_Ui::System::Current_Win::CIT_RTC_TEST)
                 {
@@ -1677,11 +1765,21 @@ void device_meshy_app_task(void *arg)
 
                 int pos = 0;
                 pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
-                    "Freq: %.3f MHz  %s",
-                    stats.freq_mhz,
-                    stats.running ? "ACTIVE" : "STOPPED");
+                    "%s %s  %s  %ddBm",
+                    settings_region_name(g_settings.meshy_region),
+                    settings_preset_name(g_settings.meshy_preset),
+                    settings_role_name(g_settings.meshy_role),
+                    g_settings.meshy_tx_power);
+                if (g_settings.meshy_freq_slot > 0)
+                    pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
+                        "  slot:%d", g_settings.meshy_freq_slot);
                 pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
-                    "\nRX: %lu decoded  Nodes: %lu  TX: %lu",
+                    "\n%.3f MHz  %s  +%d ch",
+                    stats.freq_mhz,
+                    stats.running ? "ACTIVE" : "STOPPED",
+                    meshy_channels_count());
+                pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
+                    "\nRX: %lu  Nodes: %lu  TX: %lu",
                     (unsigned long)stats.rx_decoded,
                     (unsigned long)stats.known_nodes,
                     (unsigned long)stats.tx_packets);
@@ -1993,8 +2091,87 @@ bool Set_T_Mixrf_Lr1121_Sleep()
 #endif
 
 static sdmmc_card_t *sd_card_handle = NULL;
+static bool sd_using_spi = false;     // track current mode for clean teardown
+static spi_host_device_t sd_spi_host = SPI3_HOST;
 
-bool Sdmmc_Init(const char *base_path, int max_retries = 1)
+// SD card init — SPI mode (default, coexists with ESP-Hosted SDIO on Slot 1)
+static bool Sd_Spi_Init(const char *base_path, int max_retries = 1)
+{
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+        .format_if_mount_failed = false,
+        .max_files = 5,
+        .allocation_unit_size = 16 * 1024,
+    };
+
+    sdmmc_card_t *card;
+
+    printf("initializing sd card (SPI mode)\n");
+
+    // LDO power for SD card
+    sd_pwr_ctrl_ldo_config_t ldo_config = { .ldo_chan_id = 4 };
+    sd_pwr_ctrl_handle_t pwr_ctrl_handle = NULL;
+    int32_t assert = sd_pwr_ctrl_new_on_chip_ldo(&ldo_config, &pwr_ctrl_handle);
+    if (assert != ESP_OK)
+        printf("failed to create a new on-chip ldo power control driver\n");
+
+    // Initialize SPI bus for SD card (SPI3_HOST — SPI2 is used by SX1262)
+    spi_bus_config_t bus_cfg = {};
+    bus_cfg.mosi_io_num = SD_MOSI;   // GPIO 44 (was SDIO_1_CMD)
+    bus_cfg.miso_io_num = SD_MISO;   // GPIO 39 (was SDIO_1_D0)
+    bus_cfg.sclk_io_num = SD_SCLK;   // GPIO 43 (was SDIO_1_CLK)
+    bus_cfg.quadwp_io_num = -1;
+    bus_cfg.quadhd_io_num = -1;
+    bus_cfg.max_transfer_sz = 4096;
+
+    assert = spi_bus_initialize(sd_spi_host, &bus_cfg, SPI_DMA_CH_AUTO);
+    if (assert != ESP_OK) {
+        printf("SPI bus init failed: 0x%lx\n", (long)assert);
+        return false;
+    }
+
+    // SPI device config for SD card
+    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot_config.host_id = sd_spi_host;
+    slot_config.gpio_cs = static_cast<gpio_num_t>(SD_CS);  // GPIO 42 (was SDIO_1_D3)
+
+    // Host config for SPI mode
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot = sd_spi_host;
+    host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;  // 40MHz SPI
+    host.pwr_ctrl_handle = pwr_ctrl_handle;
+
+    printf("mounting filesystem\n");
+
+    // Retry mount — SD card may need extra time to come online
+    for (int attempt = 0; attempt < max_retries; attempt++) {
+        assert = esp_vfs_fat_sdspi_mount(base_path, &host, &slot_config, &mount_config, &card);
+        if (assert == ESP_OK) break;
+        if (attempt < max_retries - 1) {
+            printf("SD mount attempt %d failed (0x%lx), retrying in 1s...\n", attempt + 1, (long)assert);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+    if (assert != ESP_OK) {
+        printf("failed to mount filesystem\n");
+        spi_bus_free(sd_spi_host);
+        return false;
+    }
+
+    printf("filesystem mounted\n");
+    printf("[MEM] after SD mount: internal=%u\n", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    sdmmc_card_print_info(stdout, card);
+    sd_card_handle = card;
+    sd_using_spi = true;
+
+    // Clear FAT32 dirty flag after mount
+    sd_clear_dirty_flag();
+
+    return true;
+}
+
+// SD card init — SDMMC mode (faster, but conflicts with ESP-Hosted SDIO)
+// Use when WiFi is disabled and high throughput is needed.
+static bool Sdmmc_Init(const char *base_path, int max_retries = 1)
 {
     esp_vfs_fat_sdmmc_mount_config_t mount_config =
         {
@@ -2005,7 +2182,7 @@ bool Sdmmc_Init(const char *base_path, int max_retries = 1)
 
     sdmmc_card_t *card;
 
-    printf("initializing sd card\n");
+    printf("initializing sd card (SDMMC mode)\n");
 
     sd_pwr_ctrl_ldo_config_t ldo_config = { .ldo_chan_id = 4 };
     sd_pwr_ctrl_handle_t pwr_ctrl_handle = NULL;
@@ -2050,6 +2227,7 @@ bool Sdmmc_Init(const char *base_path, int max_retries = 1)
     printf("[MEM] after SD mount: internal=%u\n", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     sdmmc_card_print_info(stdout, card);
     sd_card_handle = card;
+    sd_using_spi = false;
 
     // Clear FAT32 dirty flag after mount
     sd_clear_dirty_flag();
@@ -2087,6 +2265,9 @@ extern "C" void sd_safe_shutdown(void) {
     sd_log_close();
     if (sd_card_handle) {
         esp_vfs_fat_sdcard_unmount("/sdcard", sd_card_handle);
+        if (sd_using_spi) {
+            spi_bus_free(sd_spi_host);
+        }
         sd_card_handle = NULL;
         printf("[SD] Filesystem unmounted cleanly\n");
     }
@@ -2097,11 +2278,11 @@ extern "C" bool sd_remount(void) {
         printf("[SD] Already mounted\n");
         return true;
     }
-    bool ok = Sdmmc_Init("/sdcard", 1);  // single attempt, no retries
+    bool ok = Sd_Spi_Init("/sdcard", 1);  // SPI mode, single attempt
     if (ok) {
-        printf("[SD] Filesystem mounted\n");
+        printf("[SD] Filesystem mounted (SPI)\n");
     } else {
-        printf("[SD] Mount failed\n");
+        printf("[SD] SPI mount failed\n");
     }
     return ok;
 }
@@ -2121,8 +2302,24 @@ void System_Ui_Callback_Init(void)
 {
     System_Ui->_device_vibration_callback = [](uint8_t vibration_count)
     {
+        if (!g_settings.haptic_enabled) return;
         AW86224_Vibration_Play_Count = vibration_count;
         vTaskResume(Vibration_Task_Handle);
+    };
+
+    System_Ui->_device_brightness_callback = [](uint8_t percent)
+    {
+        if (g_screen_blanked) return;  // don't override blank state
+        if (screen_is_rm69a10()) {
+            set_rm69a10_brightness(Screen_Mipi_Dpi_Panel, percent * 255 / 100);
+        } else {
+            HI8561_T->start_pwm_gradient_time(percent, 100);
+        }
+    };
+
+    System_Ui->_device_volume_callback = [](uint8_t percent)
+    {
+        ES8311->set_dac_volume(percent * 255 / 100);
     };
 
     System_Ui->_win_cit_speaker_test_callback = [](void)
@@ -2279,17 +2476,20 @@ void System_Ui_Callback_Init(void)
     {
         if (status == true)
         {
+            Music_Play_End_Flag = false;
             ES8311_Speaker_Mode = Es8311_Mode::PLAY_MUSIC;
             vTaskResume(Speaker_Task_Handle);
         }
         else
+        {
             Music_Play_End_Flag = true;
+            music_player_stop();
+        }
     };
 
     System_Ui->_set_music_current_time_s_callback = [](double current_time_s)
     {
-        Set_Music_Current_Time_S = current_time_s;
-        Set_Music_Current_Time_S_Flag = true;
+        music_player_seek(current_time_s);
     };
 
 #if defined CONFIG_BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
@@ -2652,7 +2852,7 @@ void ES8311_Init(void)
     ES8311->set_adc_gain(Cpp_Bus_Driver::Es8311::Adc_Gain::GAIN_18DB);
     ES8311->set_adc_pga_gain(Cpp_Bus_Driver::Es8311::Adc_Pga_Gain::GAIN_30DB);
     ES8311->set_adc_volume(191);
-    ES8311->set_dac_volume(200);
+    ES8311->set_dac_volume(g_settings.volume * 255 / 100);
 }
 
 bool ICM20948_Init(void)
@@ -3147,18 +3347,14 @@ void rtlsdr_adsb_start(void)
     printf("[MEM] after USB transfer pre-alloc: internal=%u\n",
            heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
-    task_created = xTaskCreatePinnedToCore(class_driver_task,
-                                           "class",
-                                           16 * 1024,
-                                           NULL,
-                                           CLASS_TASK_PRIORITY,
-                                           &s_class_driver_task_hdl,
-                                           0);
+    task_created = xTaskCreateWithCaps(class_driver_task, "class",
+                                       16 * 1024, NULL, CLASS_TASK_PRIORITY,
+                                       &s_class_driver_task_hdl, MALLOC_CAP_SPIRAM);
     assert(task_created == pdTRUE);
     vTaskDelay(10);
 
     // Lightweight watcher — handles BOOT button press to cleanly shut down USB
-    xTaskCreate(usb_quit_watcher_task, "usb_quit", 2048, NULL, 1, NULL);
+    xTaskCreateWithCaps(usb_quit_watcher_task, "usb_quit", 2048, NULL, 1, NULL, MALLOC_CAP_SPIRAM);
 
     ESP_LOGI(TAG, "RTL-SDR ADS-B tasks started");
 }
@@ -3180,6 +3376,9 @@ extern "C" void app_main(void)
         }
     }
     settings_load();
+    meshy_channels_load();
+    meshy_channels_ensure_identity();
+    settings_apply_timezone();
     printf("[SETTINGS] Loaded: tz=%+d:%02d%s brightness=%d meshy=%s adsb=%s\n",
            g_settings.tz_offset_h, g_settings.tz_offset_m,
            g_settings.dst_enabled ? " DST" : "",
@@ -3374,9 +3573,9 @@ extern "C" void app_main(void)
     XL9535->pin_write(XL9535_SD_EN, Cpp_Bus_Driver::Xl95x5::Value::LOW);   // power ON
     vTaskDelay(pdMS_TO_TICKS(100));  // let card power up and stabilize
 
-    bool sd_mounted = Sdmmc_Init(SD_BASE_PATH, 3);
+    bool sd_mounted = Sd_Spi_Init(SD_BASE_PATH, 3);
     if (!sd_mounted)
-        printf("Sdmmc_Init fail -- wallpaper resources unavailable\n");
+        printf("Sd_Spi_Init fail -- wallpaper resources unavailable\n");
     else
         esp_register_shutdown_handler(sd_safe_shutdown);
 
@@ -3514,13 +3713,15 @@ extern "C" void app_main(void)
 #if CONFIG_ENABLE_USB_DISPLAY == true
 #else
     if (screen_is_hi8561()) {
-        HI8561_T->start_pwm_gradient_time(100, 500);
+        HI8561_T->start_pwm_gradient_time(g_settings.brightness, 500);
     } else {
-        for (uint8_t i = 0; i < 255; i += 5)
+        uint8_t target = g_settings.brightness * 255 / 100;
+        for (uint8_t i = 0; i < target; i += 5)
         {
             set_rm69a10_brightness(Screen_Mipi_Dpi_Panel, i);
             vTaskDelay(pdMS_TO_TICKS(10));
         }
+        set_rm69a10_brightness(Screen_Mipi_Dpi_Panel, target);
     }
 #endif
 
@@ -3687,34 +3888,49 @@ extern "C" void app_main(void)
     // ADS-B aircraft display is now handled by the on-device ADS-B app
     // (init_win_adsb in lvgl_ui.cpp). The old home-screen table is removed.
 
-    // ── Task stack allocation strategy ──
-    // INTERNAL RAM stacks: Only for tasks that interact with SPI DMA or USB host,
-    // where ESP-IDF checks buffer pointer capability.
-    //   - usb_host, class_driver, usb_quit (USB subsystem)
-    //   - meshy_rx, meshy_tx (SX1262 SPI via cpp_bus_driver — DMA pre-alloc buffers)
+    // ── Task stack placement strategy ──
+    // All application task stacks are in PSRAM. ESP-IDF peripheral drivers
+    // (I2S, I2C, SPI, UART) manage their own DMA buffers internally — the
+    // task stack is never passed directly to DMA hardware.
     //
-    // PSRAM stacks: Everything else. These tasks use I2C (FIFO, no DMA from stack),
-    // UART (GPS), I2S (driver-managed DMA), or just read data and update LVGL.
-    // Moving them frees ~56KB of internal RAM for DMA, AES, and heap headroom.
+    // Only usb_host_lib_task remains on internal RAM (ESP-IDF USB host
+    // requirement). class_driver_task was migrated to PSRAM since USB
+    // bulk transfers use a separately allocated DMA buffer (g_usb_dma_reservation).
+    //
+    // Internal RAM budget: ~100KB available at task creation. With all app
+    // stacks in PSRAM, ~70KB+ remains free for fopen(), mutexes, runtime allocs.
 
-    xTaskCreateWithCaps(device_vibration_task,   "vibration",   4 * 1024, NULL, 2, &Vibration_Task_Handle, MALLOC_CAP_SPIRAM);
-    xTaskCreateWithCaps(device_speaker_task,     "speaker",     4 * 1024, NULL, 3, &Speaker_Task_Handle, MALLOC_CAP_SPIRAM);
-    xTaskCreateWithCaps(device_microphone_task,  "microphone",  4 * 1024, NULL, 3, &Microphone_Task_Handle, MALLOC_CAP_SPIRAM);
-    xTaskCreateWithCaps(device_imu_task,         "imu",         4 * 1024, NULL, 3, &Imu_Task_Handle, MALLOC_CAP_SPIRAM);
-    xTaskCreateWithCaps(device_battery_health_task, "battery",  8 * 1024, NULL, 3, NULL, MALLOC_CAP_SPIRAM);
-    xTaskCreateWithCaps(device_gps_task,         "gps",         8 * 1024, NULL, 3, &Gps_Task_Handle, MALLOC_CAP_SPIRAM);
-    xTaskCreateWithCaps(device_ethernet_task,    "ethernet",    4 * 1024, NULL, 3, &Ethernet_Task_Handle, MALLOC_CAP_SPIRAM);
-    xTaskCreateWithCaps(device_rtc_task,         "rtc",         4 * 1024, NULL, 3, NULL, MALLOC_CAP_SPIRAM);
-    xTaskCreateWithCaps(device_at_task,          "at_status",   4 * 1024, NULL, 3, &At_Task_Handle, MALLOC_CAP_SPIRAM);
-    // device_rf_task removed — SX1262 is now managed by Meshy (Meshtastic)
-    // App tasks: read data + update LVGL labels/canvas. No SPI/DMA — safe for PSRAM stacks.
-    xTaskCreateWithCaps(device_adsb_app_task,    "adsb_app",    8 * 1024, NULL, 3, &Adsb_App_Task_Handle, MALLOC_CAP_SPIRAM);
-    xTaskCreateWithCaps(device_meshy_app_task,   "meshy_app",   8 * 1024, NULL, 3, &Meshy_App_Task_Handle, MALLOC_CAP_SPIRAM);
-    xTaskCreateWithCaps(device_scope_app_task,   "scope_app",  16 * 1024, NULL, 3, &Scope_App_Task_Handle, MALLOC_CAP_SPIRAM);
-    xTaskCreateWithCaps(iis_transmission_data_stream_task, "iis_stream", 4 * 1024, NULL, 4, &Iis_Transmission_Data_Stream_Task, MALLOC_CAP_SPIRAM);
+    // ── PSRAM stacks (audio/network — drivers manage DMA internally) ──
+    xTaskCreateWithCaps(device_speaker_task,     "device_speaker_task",     32 * 1024, NULL, 3, &Speaker_Task_Handle, MALLOC_CAP_SPIRAM);
+    xTaskCreateWithCaps(device_microphone_task,  "device_microphone_task",  4 * 1024, NULL, 3, &Microphone_Task_Handle, MALLOC_CAP_SPIRAM);
+    xTaskCreateWithCaps(device_ethernet_task,    "device_ethernet_task",    4 * 1024, NULL, 3, &Ethernet_Task_Handle, MALLOC_CAP_SPIRAM);
+    xTaskCreateWithCaps(iis_transmission_data_stream_task, "iis_tx_task",  4 * 1024, NULL, 4, &Iis_Transmission_Data_Stream_Task, MALLOC_CAP_SPIRAM);
+
+    // ── PSRAM stacks (I2C — driver manages DMA internally) ──
+    xTaskCreateWithCaps(device_vibration_task,      "vibration_task",      4 * 1024, NULL, 2, &Vibration_Task_Handle, MALLOC_CAP_SPIRAM);
+    xTaskCreateWithCaps(device_imu_task,            "imu_task",            4 * 1024, NULL, 3, &Imu_Task_Handle, MALLOC_CAP_SPIRAM);
+    xTaskCreateWithCaps(device_battery_health_task, "battery_health_task", 8 * 1024, NULL, 3, NULL, MALLOC_CAP_SPIRAM);
+    xTaskCreateWithCaps(device_rtc_task,            "rtc_task",            4 * 1024, NULL, 3, NULL, MALLOC_CAP_SPIRAM);
+
+    // ── PSRAM stacks (UART / no hardware) ──
+    xTaskCreateWithCaps(device_gps_task,  "gps_task",  8 * 1024, NULL, 3, &Gps_Task_Handle, MALLOC_CAP_SPIRAM);
+    xTaskCreateWithCaps(device_at_task,   "at_task",   4 * 1024, NULL, 3, &At_Task_Handle, MALLOC_CAP_SPIRAM);
+
+    // ── PSRAM stacks (app/UI display tasks — no DMA from stack) ──
+    xTaskCreateWithCaps(device_adsb_app_task,    "adsb_app_task",    8 * 1024, NULL, 3, &Adsb_App_Task_Handle, MALLOC_CAP_SPIRAM);
+    xTaskCreateWithCaps(device_meshy_app_task,   "meshy_app_task",   8 * 1024, NULL, 3, &Meshy_App_Task_Handle, MALLOC_CAP_SPIRAM);
+    xTaskCreateWithCaps(device_scope_app_task,   "scope_app_task",  16 * 1024, NULL, 3, &Scope_App_Task_Handle, MALLOC_CAP_SPIRAM);
+
+    // Apply manual receiver position if configured (GPS will override when it gets a fix)
+    if (g_settings.adsb_manual_pos &&
+        (fabs(g_settings.adsb_manual_lat) > 0.1 || fabs(g_settings.adsb_manual_lon) > 0.1)) {
+        adsb_set_receiver_pos(g_settings.adsb_manual_lat, g_settings.adsb_manual_lon, 0.0, 0, 99.9, 0);
+        printf("[SETTINGS] Manual receiver position: %.4f, %.4f\n",
+               g_settings.adsb_manual_lat, g_settings.adsb_manual_lon);
+    }
 
 #if defined CONFIG_BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
-    xTaskCreateWithCaps(device_nfc_task, "nfc", 8 * 1024, NULL, 3, &Nfc_Task_Handle, MALLOC_CAP_SPIRAM);
+    xTaskCreateWithCaps(device_nfc_task, "device_nfc_task", 8 * 1024, NULL, 3, &Nfc_Task_Handle, MALLOC_CAP_SPIRAM);
 #endif
 
     while (lv_display_flush_is_last(lv_display_get_default()) == false)
@@ -3725,6 +3941,10 @@ extern "C" void app_main(void)
     // Start persistent trail recording — 1Hz esp_timer, runs in background from boot
     // so trails are available when user opens Scope later
     scope_trail_init();
+
+    // Scan SD card for music tracks
+    music_player_init();
+    music_player_scan();
 
     // Apply saved brightness and init screen timeout
     g_last_touch_ms = esp_log_timestamp();

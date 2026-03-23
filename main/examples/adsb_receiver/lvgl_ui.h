@@ -324,6 +324,8 @@ namespace Lvgl_Ui
                     void     *msg_canvas_buf;
                     int32_t   msg_canvas_w;
                     int32_t   msg_canvas_max_h;
+                    uint32_t  msg_canvas_stride;
+                    lv_obj_t *tx_textarea;      // text input for sending messages
                 } meshy;
 
                 struct
@@ -496,9 +498,13 @@ namespace Lvgl_Ui
                     {
                         lv_obj_t *current_time;
                         lv_obj_t *total_time;
+                        lv_obj_t *song_name;
+                        lv_obj_t *artist;
                     } label;
 
                     lv_obj_t *slider;
+
+                    lv_obj_t *album_art;       // album art image widget (dynamic)
 
                 } music;
 
@@ -688,6 +694,8 @@ namespace Lvgl_Ui
         bool _edge_touch_flag = false;
 
         void (*_device_vibration_callback)(uint8_t vibration_count) = nullptr;
+        void (*_device_brightness_callback)(uint8_t percent) = nullptr;
+        void (*_device_volume_callback)(uint8_t percent) = nullptr;
 
         void (*_win_cit_speaker_test_callback)(void) = nullptr;
 

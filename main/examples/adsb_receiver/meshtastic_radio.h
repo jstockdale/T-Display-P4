@@ -19,7 +19,6 @@
 #include "meshtastic_channel.h"
 #include "meshtastic_crypto.h"
 #include "meshtastic_pb.h"
-#include "meshtastic_pki.h"
 
 #include <stdint.h>
 #include <stdlib.h>  // for rand()
@@ -260,9 +259,9 @@ struct MeshPacketIdGen {
 struct MeshRxResult {
     MeshRxPacket packet;      // parsed header + raw/decrypted payload
     MeshData     data;        // decoded Data envelope
-    int8_t       channel_idx; // which channel matched (-1 if none/PKI)
+    int8_t       channel_idx; // which channel matched (-1 if none / PKI)
     bool         decrypted;   // true if decryption succeeded
-    bool         pki_encrypted; // true if decrypted via PKI (DM)
+    bool         is_pki;      // true if decrypted via PKI (not channel)
 };
 
 struct MeshSession {
@@ -274,10 +273,6 @@ struct MeshSession {
     MeshChannelTable  channels;
     MeshPacketIdGen   id_gen;
 
-    // PKI state
-    MeshPkiIdentity   pki;          // our x25519 keypair
-    MeshNodeKeyStore  node_keys;    // known remote node public keys
-
     void init(MeshRegion r, MeshModemPreset p, MeshRole rl, uint32_t node,
               int32_t slot = -1) {
         region    = r;
@@ -287,8 +282,6 @@ struct MeshSession {
         freq_slot = slot;
         channels.init(p);
         id_gen.init();
-        pki.init();
-        node_keys.init();
     }
 
     /**
@@ -301,10 +294,6 @@ struct MeshSession {
 
     /**
      * Process a received raw LoRa frame.
-     * Mirrors Router.cpp:440-518 — attempts PKI decryption first for unicast
-     * DMs addressed to us, then falls back to channel PSK decryption.
-     * Auto-learns public keys from NODEINFO_APP broadcasts.
-     *
      * Returns true if the packet was successfully parsed and decrypted.
      */
     bool processRx(const uint8_t *raw, size_t raw_len,
@@ -320,166 +309,133 @@ struct MeshSession {
         result->packet.rssi = rssi;
         result->packet.snr  = snr;
 
-        // Static buffers — processRx is only called from one task at a time.
-        // Saves ~275 bytes of stack per call on the tight 6KB RX task stack.
-        static uint8_t plaintext[240];
-        bool decrypted = false;
+        // Try decrypt against all channels
+        uint8_t plaintext[240];
+        MeshCryptoKey matched_key;
 
-        // ── Step 1: Try PKI decryption first (Router.cpp:451-481) ──
-        // Conditions: channel_hash==0, unicast to us, sender key known,
-        //             payload > 12 bytes overhead
-        if (pki.initialized && meshIsPkiCandidate(&result->packet, node_num)) {
-            size_t pt_len = meshTryPkiDecrypt(&result->packet, &pki,
-                                                &node_keys, plaintext);
-            if (pt_len > 0) {
-                // Validate protobuf decode
-                if (meshDecodeData(plaintext, pt_len, &result->data) &&
-                    result->data.portnum != PORT_UNKNOWN)
-                {
-                    decrypted = true;
-                    result->pki_encrypted = true;
-                    result->channel_idx = -1; // not a channel-based message
-                }
-            }
+        int ch_idx = channels.tryDecrypt(
+            result->packet.payload, result->packet.payload_len,
+            result->packet.channel_hash,
+            result->packet.from, result->packet.id,
+            plaintext, &matched_key,
+            meshValidateData);
+
+        if (ch_idx < 0) {
+            result->channel_idx = -1;
+            result->decrypted = false;
+            return false; // no channel matched
         }
 
-        // ── Step 2: Fall back to channel PSK decryption (Router.cpp:485-517) ──
-        if (!decrypted) {
-            static MeshCryptoKey matched_key;  // 33 bytes → BSS
-            int ch_idx = channels.tryDecrypt(
-                result->packet.payload, result->packet.payload_len,
-                result->packet.channel_hash,
-                result->packet.from, result->packet.id,
-                plaintext, &matched_key,
-                meshValidateData);
+        result->channel_idx = ch_idx;
+        result->decrypted = true;
+        result->packet.channel_index = ch_idx;
 
-            if (ch_idx >= 0) {
-                if (meshDecodeData(plaintext, result->packet.payload_len, &result->data)) {
-                    decrypted = true;
-                    result->channel_idx = ch_idx;
-                    result->packet.channel_index = ch_idx;
-                }
-            }
-        }
-
-        if (!decrypted) {
+        // Decode the Data envelope
+        if (!meshDecodeData(plaintext, result->packet.payload_len, &result->data)) {
             result->decrypted = false;
             return false;
         }
-
-        result->decrypted = true;
-
-        // ── Auto-learn public keys from NODEINFO broadcasts ──
-        meshLearnNodeKey(&result->packet, &result->data, &node_keys);
 
         return true;
     }
 
     /**
-     * Build a channel-encrypted TX frame (broadcast or group message).
+     * Build an encrypted TX frame for a given channel.
      * Returns total frame length, or 0 on failure.
+     *
+     * `channel_idx`: which channel to encrypt for
+     * `to`: destination NodeNum (MESH_ADDR_BROADCAST for broadcast)
+     * `portnum`: application port
+     * `payload`: inner payload bytes (text, position protobuf, etc.)
+     * `payload_len`: length of inner payload
+     * `ok_to_mqtt`: set ok_to_mqtt in Data protobuf bitfield (signals MQTT gateways to forward)
+     * `out`: output buffer, must be at least MESH_MAX_PAYLOAD bytes
+     * `tx_hop_limit`: hop count for mesh propagation (1-7, default 3)
      */
     size_t buildTx(uint8_t channel_idx,
                     uint32_t to,
                     MeshPortNum portnum,
                     const uint8_t *payload, size_t payload_len,
-                    bool want_ack,
-                    uint8_t *out)
+                    bool want_ack, bool ok_to_mqtt,
+                    uint8_t *out,
+                    uint8_t tx_hop_limit = MESH_HOP_RELIABLE)
     {
-        if (role == ROLE_CLIENT_MUTE) return 0;
-        if (channel_idx >= channels.count) return 0;
+        // Note: ROLE_CLIENT_MUTE only suppresses rebroadcasting others' packets,
+        // not originating our own. Relay filtering happens in the RX path.
+        if (channel_idx >= channels.count) {
+            printf("[MESH] buildTx FAIL: ch_idx=%d >= count=%d\n", channel_idx, channels.count);
+            return 0;
+        }
 
-        // Encode Data protobuf
+        // Encode Data protobuf — ok_to_mqtt goes in Data.bitfield (field 9, bit 0)
         uint8_t data_buf[240];
         size_t data_len = meshEncodeData(data_buf, sizeof(data_buf),
-                                          portnum, payload, payload_len);
-        if (data_len == 0) return 0;
+                                          portnum, payload, payload_len,
+                                          false, ok_to_mqtt);
+        if (data_len == 0) {
+            printf("[MESH] buildTx FAIL: meshEncodeData returned 0 (port=%d payload_len=%zu)\n",
+                   portnum, payload_len);
+            return 0;
+        }
 
-        // Encrypt with channel PSK
+        // Encrypt
         uint32_t pkt_id = id_gen.next();
         const MeshChannel *ch = &channels.channels[channel_idx];
 
         if (ch->key.length > 0) {
-            if (!meshEncrypt(&ch->key, node_num, pkt_id, data_buf, data_len))
+            if (!meshEncrypt(&ch->key, node_num, pkt_id, data_buf, data_len)) {
+                printf("[MESH] buildTx FAIL: meshEncrypt failed (key_len=%d)\n", ch->key.length);
                 return 0;
+            }
         }
 
-        uint8_t hop_limit = MESH_HOP_RELIABLE;
+        // Build frame — hop_start always equals hop_limit for originating packets
+        // via_mqtt=false: we never originate from MQTT (via_mqtt means "came from MQTT")
+        uint8_t hop_limit = tx_hop_limit & 0x07;  // clamp to 3-bit field
+        uint8_t hop_start = hop_limit;
+
         return meshBuildPacket(out,
                                 to, node_num, pkt_id,
-                                hop_limit, hop_limit,
-                                want_ack, false,
+                                hop_limit, hop_start,
+                                want_ack, false,  // via_mqtt=false always
                                 ch->hash,
-                                0, 0,
+                                0, 0,  // next_hop, relay_node
                                 data_buf, data_len);
     }
 
     /**
-     * Build a PKI-encrypted DM frame (direct message to specific node).
-     * Uses x25519 DH + AES-256-CCM. Requires recipient's public key
-     * in node_keys.
-     *
-     * Returns total frame length, or 0 on failure.
-     */
-    size_t buildDmTx(uint32_t to_node,
-                      MeshPortNum portnum,
-                      const uint8_t *payload, size_t payload_len,
-                      bool want_ack,
-                      uint8_t *out,
-                      uint32_t (*rand_fn)(void))
-    {
-        if (role == ROLE_CLIENT_MUTE) return 0;
-        if (!pki.initialized) return 0;
-
-        // Look up recipient's public key
-        const uint8_t *their_key = node_keys.getKey(to_node);
-        if (!their_key) return 0;
-
-        // Encode Data protobuf
-        uint8_t data_buf[240];
-        size_t data_len = meshEncodeData(data_buf, sizeof(data_buf),
-                                          portnum, payload, payload_len);
-        if (data_len == 0) return 0;
-
-        // PKI encrypt (produces ciphertext + 12 bytes overhead)
-        uint8_t encrypted[256];
-        uint32_t pkt_id = id_gen.next();
-        size_t enc_len = meshPkiEncrypt(pki.private_key, their_key,
-                                         node_num, pkt_id,
-                                         data_buf, data_len,
-                                         encrypted, rand_fn);
-        if (enc_len == 0) return 0;
-
-        // PKI DMs use channel_hash=0 (Router.cpp:453)
-        uint8_t hop_limit = MESH_HOP_RELIABLE;
-        return meshBuildPacket(out,
-                                to_node, node_num, pkt_id,
-                                hop_limit, hop_limit,
-                                want_ack, false,
-                                0,  // channel_hash = 0 for PKI DMs
-                                0, 0,
-                                encrypted, enc_len);
-    }
-
-    /**
-     * Convenience: send a text DM via PKI.
-     */
-    size_t buildTextDm(uint32_t to_node, const char *text, bool want_ack,
-                        uint8_t *out, uint32_t (*rand_fn)(void))
-    {
-        return buildDmTx(to_node, PORT_TEXT_MESSAGE,
-                          (const uint8_t *)text, strlen(text),
-                          want_ack, out, rand_fn);
-    }
-
-    /**
-     * Convenience: build a text broadcast on a channel.
+     * Convenience: build a text message TX frame.
      */
     size_t buildTextTx(uint8_t channel_idx, uint32_t to,
-                        const char *text, bool want_ack,
-                        uint8_t *out)
+                        const char *text, bool want_ack, bool ok_to_mqtt,
+                        uint8_t *out,
+                        uint8_t tx_hop_limit = MESH_HOP_RELIABLE)
     {
         return buildTx(channel_idx, to, PORT_TEXT_MESSAGE,
-                        (const uint8_t *)text, strlen(text), want_ack, out);
+                        (const uint8_t *)text, strlen(text), want_ack, ok_to_mqtt, out,
+                        tx_hop_limit);
+    }
+
+    /**
+     * Convenience: build a NODEINFO TX frame.
+     * Encodes a User protobuf with the given identity fields.
+     */
+    size_t buildNodeInfoTx(uint8_t channel_idx, uint32_t to,
+                            const char *id, const char *long_name,
+                            const char *short_name, uint16_t hw_model,
+                            bool want_ack, bool ok_to_mqtt,
+                            uint8_t *out,
+                            const uint8_t *public_key = nullptr,
+                            uint8_t public_key_len = 0,
+                            uint8_t tx_hop_limit = MESH_HOP_RELIABLE)
+    {
+        uint8_t user_buf[160];  // 128 + 32 for public key
+        size_t user_len = meshEncodeUser(user_buf, sizeof(user_buf),
+                                          id, long_name, short_name, hw_model,
+                                          public_key, public_key_len);
+        if (user_len == 0) return 0;
+        return buildTx(channel_idx, to, PORT_NODEINFO,
+                        user_buf, user_len, want_ack, ok_to_mqtt, out,
+                        tx_hop_limit);
     }
 };

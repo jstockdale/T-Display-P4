@@ -5,6 +5,7 @@
 
 #include "class_driver.h"
 #include "serial_console.h"
+#include "device_settings.h"
 #include <math.h>
 #include <stdio.h>
 #include <time.h>
@@ -15,6 +16,10 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lvgl.h"
+
+// GPS fix epoch — set in GPS task on first quality fix.
+// Used to gate log line timestamps ([boot+X] vs ISO) and SD log renames.
+extern volatile time_t g_gps_fix_epoch;
 
 #define RTLSDR_BUF_LEN        (16384 + 512)
 #define CLIENT_NUM_EVENT_MSG  5
@@ -237,6 +242,13 @@ receiver_pos_t adsb_get_receiver_pos(void) {
     p = s_rx_pos;
     xSemaphoreGive(s_rx_pos_mutex);
     return p;
+}
+
+void adsb_set_bias_tee(bool on) {
+    if (rtldev) {
+        rtlsdr_set_bias_tee(rtldev, on ? 1 : 0);
+        ESP_LOGI(TAG, "Bias-T: %s", on ? "ON" : "OFF");
+    }
 }
 
 // Forward declaration — defined below
@@ -547,15 +559,14 @@ void sd_log_print_status(void) {
 void sd_log_rename_with_time(void) {
     if (!sd_log_initialized) return;
     if (strstr(sd_log_filename, "adsb_boot") == NULL) return;
-
-    time_t now;
-    struct tm timeinfo;
-    time(&now);
-    gmtime_r(&now, &timeinfo);
-    if (now < 1704067200LL) return;
+    if (g_gps_fix_epoch == 0) return;  // wait for GPS fix
 
     // Flush any buffered data to the old filename first
     sd_log_flush();
+
+    struct tm timeinfo;
+    time_t fix_time = g_gps_fix_epoch;
+    gmtime_r(&fix_time, &timeinfo);
 
     char new_filename[64];
     strftime(new_filename, sizeof(new_filename),
@@ -576,13 +587,12 @@ static void sd_log_buf_timestamp(void) {
     int avail = SD_LOG_BUFSIZE - sd_log_buf_pos;
     if (avail < 40) return;  // need room for timestamp
 
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    struct tm tm_info;
-    gmtime_r(&tv.tv_sec, &tm_info);
-
     int n;
-    if (tm_info.tm_year + 1900 >= 2024) {
+    if (g_gps_fix_epoch > 0) {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        struct tm tm_info;
+        gmtime_r(&tv.tv_sec, &tm_info);
         n = snprintf(sd_log_buf + sd_log_buf_pos, avail,
             "%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ",
             tm_info.tm_year + 1900, tm_info.tm_mon + 1, tm_info.tm_mday,
@@ -793,12 +803,12 @@ void on_msg(mode_s_t *self, struct mode_s_msg *mm)
     char line[384];
     int pos = 0, avail = sizeof(line);
 
-    // Timestamp
+    // Timestamp — use ISO format only after GPS fix, boot+ before
     struct timeval tv;
     gettimeofday(&tv, NULL);
-    struct tm tm_info;
-    gmtime_r(&tv.tv_sec, &tm_info);
-    if (tm_info.tm_year + 1900 >= 2024) {
+    if (g_gps_fix_epoch > 0) {
+        struct tm tm_info;
+        gmtime_r(&tv.tv_sec, &tm_info);
         int n = snprintf(line + pos, avail, "[%04d-%02d-%02d %02d:%02d:%02d.%03ldZ] ",
             tm_info.tm_year + 1900, tm_info.tm_mon + 1, tm_info.tm_mday,
             tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec,
@@ -925,6 +935,10 @@ static void adsb_reader_task(void *arg)
     r = rtlsdr_set_tuner_gain_mode(rtldev, 0);  // 0 = automatic gain
     if (r != 0) fprintf(stderr, "WARNING: Failed to set tuner gain.\n");
     else        fprintf(stderr, "Tuner gain set to automatic.\n");
+
+    // Apply bias-T setting from NVS (default: off)
+    r = rtlsdr_set_bias_tee(rtldev, g_settings.adsb_bias_tee ? 1 : 0);
+    if (r == 0) ESP_LOGI(TAG, "Bias-T: %s", g_settings.adsb_bias_tee ? "ON" : "OFF");
 
     r = rtlsdr_reset_buffer(rtldev);
     if (r < 0) fprintf(stderr, "WARNING: Failed to reset buffers.\n");

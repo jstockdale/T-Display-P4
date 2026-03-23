@@ -69,6 +69,11 @@ idf_component_register(SRC_DIRS ${project_path}
                         INCLUDE_DIRS ${project_path}
                         )
 
+# Embed webapp if it exists (only in lvgl_9_ui / adsb_receiver)
+if(EXISTS "${COMPONENT_DIR}/${project_path}/adsb_scope.htm")
+    target_add_binary_data(${COMPONENT_LIB} "${COMPONENT_DIR}/${project_path}/adsb_scope.htm" TEXT)
+endif()
+
 set_source_files_properties(tuner_r82xx.c "class_driver.c"
     PROPERTIES COMPILE_FLAGS
     "-Wno-unused-function -Wno-unused-variable -Wno-incompatible-pointer-types"

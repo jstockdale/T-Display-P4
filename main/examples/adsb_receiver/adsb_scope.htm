@@ -33,7 +33,7 @@
   #ac-map-btn,#mesh-map-btn{background:transparent;color:var(--text-dim);border:1px solid var(--panel-border);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:10px;cursor:pointer;font-weight:600;white-space:nowrap;min-height:28px;touch-action:manipulation}
   #ac-map-btn:hover,#mesh-map-btn:hover{border-color:var(--text-dim)}#ac-map-btn.active{border-color:var(--accent);color:var(--accent)}#mesh-map-btn.active{border-color:var(--blue);color:var(--blue)}
   #panel{position:absolute;bottom:0;left:0;right:0;z-index:1000;background:linear-gradient(0deg,rgba(10,14,20,0.97),rgba(10,14,20,0.85));backdrop-filter:blur(10px);border-top:1px solid var(--panel-border);height:35vh;overflow:hidden;display:flex;flex-direction:column}
-  #panel.collapsed{height:32px}
+  #panel.collapsed{height:44px}
   #panel-drag{height:12px;cursor:ns-resize;flex-shrink:0;display:flex;align-items:center;justify-content:center;touch-action:none}
   #panel-drag::after{content:'';width:40px;height:3px;background:var(--panel-border);border-radius:2px}
   #panel-drag:hover::after{background:var(--text-dim)}
@@ -94,11 +94,20 @@
   #meshy-output{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:4px 10px;font-size:10px;line-height:1.4;color:var(--text)}
   .meshy-msg{padding:1px 0;cursor:pointer}.meshy-msg:hover{background:rgba(0,229,160,0.05)}
   .meshy-msg.selected{background:rgba(77,171,247,0.12);border-left:2px solid var(--blue);padding-left:4px}
-  .meshy-msg .mn{color:var(--accent);font-weight:600}.meshy-msg .mt{color:var(--text)}.meshy-msg .mp{color:var(--text-dim)}.meshy-msg .mj{color:var(--blue);font-style:italic}
+  .meshy-msg .mn{color:var(--blue);font-weight:600}.meshy-msg .mt{color:var(--text)}.meshy-msg .mp{color:var(--text-dim)}.meshy-msg .mj{color:var(--blue);font-style:italic}
   .meshy-msg .mr{color:var(--text-dim);font-size:9px;opacity:0.5}.meshy-msg .mx{color:var(--accent);font-size:9px;font-weight:600;cursor:pointer;padding:2px 4px;border-radius:3px}.meshy-msg .mx:hover{background:rgba(0,229,160,0.2)}
   .meshy-msg .ml{color:var(--blue);font-size:9px;opacity:0.6;margin-right:2px}
   .meshy-msg .md{display:none;padding:2px 0 2px 12px;font-size:9px;color:var(--text-dim);line-height:1.3;border-left:1px solid var(--panel-border);margin:1px 0 1px 4px}
   .meshy-msg.expanded .md{display:block}
+  .meshy-msg.tx-out{opacity:0.8}.meshy-msg.tx-out .mn{color:var(--accent)}
+  .meshy-msg .mk{color:#e5c07b;font-size:9px;font-weight:600;margin-right:2px}
+  #meshy-tx-bar{display:flex;gap:6px;padding:6px 10px;border-top:1px solid var(--panel-border);flex-shrink:0}
+  #meshy-tx-input{flex:1;background:rgba(20,30,40,0.9);border:1px solid var(--panel-border);border-radius:4px;padding:6px 8px;color:var(--text);font-family:inherit;font-size:11px;outline:none;min-height:28px}
+  #meshy-tx-input:focus{border-color:var(--accent)}
+  #meshy-tx-input::placeholder{color:var(--text-dim);opacity:0.5}
+  #meshy-tx-btn{background:var(--accent);color:#0a0e14;border:none;border-radius:4px;padding:6px 14px;font-family:inherit;font-size:11px;font-weight:700;cursor:pointer;white-space:nowrap;min-height:28px;touch-action:manipulation}
+  #meshy-tx-btn:hover{filter:brightness(1.15)}
+  #meshy-tx-btn:disabled{opacity:0.4;cursor:default}
   .ac-label{display:inline-block;background:rgba(10,14,20,0.8);border:1px solid rgba(255,255,255,0.08);border-radius:3px;padding:2px 5px;font-family:'JetBrains Mono',monospace;font-size:10px;white-space:nowrap;cursor:pointer;pointer-events:auto;text-shadow:0 0 3px rgba(0,0,0,0.9),0 0 6px rgba(0,0,0,0.7)}
   .ac-label.sel{outline:1.5px solid currentColor;outline-offset:1px;background:rgba(10,14,20,0.85);text-shadow:0 0 6px currentColor,0 0 2px rgba(0,0,0,0.9)}
   .mesh-label{display:inline-block;font-family:'JetBrains Mono',monospace;font-size:9px;color:#4dabf7;white-space:nowrap;text-shadow:0 0 3px rgba(0,0,0,0.9),0 0 6px rgba(0,0,0,0.7);pointer-events:none}
@@ -200,7 +209,7 @@
 </head>
 <body>
 <div id="topbar">
-  <div class="logo">ADS-B SCOPE <span>/ Off by One <span class="scope-ver">v1.0.4</span></span></div>
+  <div class="logo">ADS-B SCOPE <span>/ Off by One <span class="scope-ver">v1.0.5</span></span></div>
   <div id="stats-bar">
     <div class="stat"><span>AC</span><span class="val live" id="ac-count">0</span></div>
     <div class="stat hm"><span>MSG</span><span class="val" id="msg-count">0</span></div>
@@ -224,7 +233,7 @@
     <button class="topbtn" id="files-btn" onclick="toggleFiles()">Files</button>
     <button class="topbtn" id="meshy-btn" onclick="toggleMeshy()">Meshy</button>
     <button id="csv-btn" onclick="document.getElementById('csv-file').click()">Load CSV</button>
-    <input type="file" id="csv-file" accept=".csv" style="display:none" onchange="loadCSV(this)">
+    <input type="file" id="csv-file" accept=".csv" multiple style="display:none" onchange="loadCSV(this)">
     <button class="topbtn" id="flash-btn" onclick="toggleFlash()">Flash<span id="flash-badge"></span></button>
     <button id="connect-btn" onclick="toggleSerial()">Connect Serial</button>
   </div>
@@ -264,6 +273,10 @@
     <label><input type="checkbox" id="mf-telem" checked onchange="refilterMeshy()"> Telemetry</label>
   </div>
   <div id="meshy-output"></div>
+  <div id="meshy-tx-bar">
+    <input type="text" id="meshy-tx-input" placeholder="Send message..." maxlength="230" autocomplete="off" onkeydown="if(event.key==='Enter')meshyTxSend()">
+    <button id="meshy-tx-btn" onclick="meshyTxSend()">Send</button>
+  </div>
 </div>
 <div id="legend">
   <div class="ltitle" id="leg-title">Altitude</div>
@@ -288,7 +301,7 @@
 </div>
 <div id="flash-overlay" onclick="toggleFlash()"></div>
 <div id="flash-panel">
-  <div id="flash-header"><span>Firmware Update</span><div style="display:flex;align-items:center;gap:8px"><span style="font-size:10px;color:var(--text-dim);font-weight:400;text-transform:none;letter-spacing:0">ADS-B Scope v1.0.4</span><button onclick="toggleFlash()">✕</button></div></div>
+  <div id="flash-header"><span>Firmware Update</span><div style="display:flex;align-items:center;gap:8px"><span style="font-size:10px;color:var(--text-dim);font-weight:400;text-transform:none;letter-spacing:0">ADS-B Scope v1.0.5</span><button onclick="toggleFlash()">✕</button></div></div>
   <div id="flash-body">
     <div class="flash-row"><span class="fl">Device Version</span><span class="fv" id="flash-dev-ver">–</span></div>
     <div class="flash-row"><span class="fl">Latest Version</span><span class="fv" id="flash-latest-ver">–</span></div>
@@ -315,7 +328,7 @@
   </div>
 </div>
 <script>
-const SCOPE_VERSION='1.0.4';
+const SCOPE_VERSION='1.0.5';
 const A=new Map();let rxP=null,map,rxM,rxR=[],rxRL=[],meshyR=[],meshyRL=[],port,reader,conn=false,totM=0,mTs=[],logN=0,selSet=new Set(),cMode='mono',lMode='alt';
 let sessStart=null,sessEnd=null; // session timestamps
 let consoleReady=false; // set when firmware prints "Serial console ready"
@@ -336,6 +349,12 @@ function acCol(ic,ac){
   if(cMode==='alt'){const a=Math.min(Math.max(ac.alt||0,0),45000);return`hsl(${240-(a/45000)*240},85%,55%)`}
   if(cMode==='speed'){const s=Math.min(Math.max(ac.speed||0,0),500);return`hsl(${120-(s/500)*120},85%,55%)`}
   return'#00e5a0';
+}
+// Per-segment trail color from recorded alt/speed (returns null for modes with uniform trail color)
+function ptCol(alt,speed){
+  if(cMode==='alt'){const a=Math.min(Math.max(alt||0,0),45000);return`hsl(${240-(a/45000)*240},85%,55%)`}
+  if(cMode==='speed'){const s=Math.min(Math.max(speed||0,0),500);return`hsl(${120-(s/500)*120},85%,55%)`}
+  return null;
 }
 // Z-index: selected=10000, others sorted by color mode key
 function acZ(ic,ac){
@@ -412,15 +431,17 @@ function nowTime(){
   if(!conn&&sessEnd)return sessEnd.getTime();
   return Date.now();
 }
-function acStale(ac){
+function acStale(ac,sel){
   const age=nowTime()-ac.ls;
   if(age<30000)return{opacity:1,gray:false};      // fresh
   if(age<60000)return{opacity:0.5,gray:false};     // dimming
+  // Selected stale aircraft stay more visible
+  if(sel)return{opacity:0.55,gray:true};
   return{opacity:0.35,gray:true};                   // stale/gray
 }
 function mkIcon(h,c,sel,st){
   const s=sel?24:18;
-  const col=st?.gray?'#667':c;
+  const col=st?.gray?(sel?'#99a':'#667'):c;
   const op=st?st.opacity:1;
   const g=sel?`filter:drop-shadow(0 0 8px ${col})drop-shadow(0 0 3px #fff);`:`filter:drop-shadow(0 0 4px ${col}55);`;
   if(h==null){
@@ -431,7 +452,7 @@ function mkIcon(h,c,sel,st){
 }
 function mkLbl(ic,ac,c,st){
   const sel=selSet.has(ic)?'sel':'';
-  const col=st?.gray?'#667':c;
+  const col=st?.gray?(sel?'#99a':'#667'):c;
   const op=st?st.opacity:1;
   const info=lMode==='dist'?(ac.dist!=null?ac.dist.toFixed(1)+'nm':''):(ac.alt?ac.alt+'ft':'');
   const name=ac.cs||ic;
@@ -439,9 +460,8 @@ function mkLbl(ic,ac,c,st){
 }
 // Compute heading from last two trail points when ADS-B heading is unavailable
 function trailHdg(ac){
-  if(!ac.tr)return null;
-  const pts=ac.tr.getLatLngs();
-  if(pts.length<2)return null;
+  if(!ac.trPts||ac.trPts.length<2)return null;
+  const pts=ac.trPts;
   const a=pts[pts.length-2],b=pts[pts.length-1];
   const dLon=(b.lng-a.lng)*Math.PI/180;
   const lat1=a.lat*Math.PI/180,lat2=b.lat*Math.PI/180;
@@ -451,35 +471,79 @@ function trailHdg(ac){
   return Math.round(brg);
 }
 
+// Rebuild trail as per-segment polylines colored by recorded alt/speed
+function rebuildTrail(ic,ac,sel,st,tw,to){
+  if(!ac.tr)return;
+  ac.tr.clearLayers();
+  const pts=ac.trPts;
+  if(!pts||pts.length<2)return;
+  const grayCol=sel?'#889':'#556';
+  const baseCol=st.gray?grayCol:acCol(ic,ac);
+  const perSeg=!st.gray&&(cMode==='alt'||cMode==='speed');
+  for(let i=1;i<pts.length;i++){
+    const p=pts[i-1],q=pts[i];
+    const segC=perSeg?(ptCol(q.alt,q.speed)||baseCol):baseCol;
+    ac.tr.addLayer(L.polyline([[p.lat,p.lng],[q.lat,q.lng]],{color:segC,weight:tw,opacity:to,interactive:false}));
+  }
+  ac._trCM=cMode;ac._trGray=st.gray;ac._trSel=sel;ac._trTw=tw;ac._trTo=to;ac._trLen=pts.length;
+}
+
+function appendTrailSeg(ic,ac,sel,st,tw,to){
+  const pts=ac.trPts;
+  if(!pts||pts.length<2)return;
+  const grayCol=sel?'#889':'#556';
+  const baseCol=st.gray?grayCol:acCol(ic,ac);
+  const perSeg=!st.gray&&(cMode==='alt'||cMode==='speed');
+  const p=pts[pts.length-2],q=pts[pts.length-1];
+  const segC=perSeg?(ptCol(q.alt,q.speed)||baseCol):baseCol;
+  ac.tr.addLayer(L.polyline([[p.lat,p.lng],[q.lat,q.lng]],{color:segC,weight:tw,opacity:to,interactive:false}));
+  ac._trLen=pts.length;
+}
+
 function updAc(ic,ac){
-  if(!acMapVisible||!ac.hasPos||ac.expired)return;
-  const st=acStale(ac);
-  const c=acCol(ic,ac),sel=selSet.has(ic),tw=sel?2.5:1.5;
+  const sel=selSet.has(ic);
+  if(!acMapVisible||!ac.hasPos||(ac.expired&&!sel))return;
+  const st=acStale(ac,sel);
+  const c=acCol(ic,ac),tw=sel?2.5:1.5;
   const to=sel?Math.max(st.opacity,0.8):(st.gray?0.2:st.opacity*0.6);
-  const trailCol=st.gray?'#556':c;
-  // Use ADS-B heading if available, otherwise compute from trail
   const hdg=ac.hdg!=null?ac.hdg:trailHdg(ac);
   if(!ac.mk){
     ac.mk=L.marker([ac.lat,ac.lon],{icon:mkIcon(hdg,c,sel,st)}).addTo(map);
-    ac.tr=L.polyline([],{color:trailCol,weight:tw,opacity:to}).addTo(map);
+    ac.tr=L.layerGroup().addTo(map);
+    if(!ac.trPts)ac.trPts=[];
     ac.lb=L.marker([ac.lat,ac.lon],{icon:mkLbl(ic,ac,c,st),interactive:true}).addTo(map);
     ac.lb.on('click',(e)=>sel0(ic,e.originalEvent));
     ac.mk.on('click',(e)=>sel0(ic,e.originalEvent));
   }else{
     ac.mk.setLatLng([ac.lat,ac.lon]).setIcon(mkIcon(hdg,c,sel,st));
     ac.lb.setLatLng([ac.lat,ac.lon]).setIcon(mkLbl(ic,ac,c,st));
-    ac.tr.setStyle({color:trailCol,weight:tw,opacity:to});
   }
-  // Z-order: selected on top, others sorted by color mode key
   const z=acZ(ic,ac);
   ac.mk.setZIndexOffset(z);
   ac.lb.setZIndexOffset(z);
-  const p=ac.tr.getLatLngs(),la=p.length?p[p.length-1]:null;
-  if(!la||la.lat!==ac.lat||la.lng!==ac.lon){p.push([ac.lat,ac.lon]);if(p.length>TMAX)p.shift();ac.tr.setLatLngs(p)}
+  if(!ac.trPts)ac.trPts=[];
+  const pts=ac.trPts,la=pts.length?pts[pts.length-1]:null;
+  let added=false,shifted=false;
+  if(!la||la.lat!==ac.lat||la.lng!==ac.lon){
+    pts.push({lat:ac.lat,lng:ac.lon,alt:ac.alt,speed:ac.speed});
+    added=true;
+    if(pts.length>TMAX){pts.shift();shifted=true}
+  }
+  const prevLen=added?pts.length-1:pts.length;
+  const needRebuild=!ac._trCM||ac._trCM!==cMode||ac._trGray!==st.gray
+    ||ac._trSel!==sel||ac._trTw!==tw||ac._trTo!==to||shifted
+    ||ac._trLen!==prevLen;
+  if(needRebuild){
+    rebuildTrail(ic,ac,sel,st,tw,to);
+  }else if(added&&pts.length>=2){
+    appendTrailSeg(ic,ac,sel,st,tw,to);
+  }
 }
 function rmAc(ac){if(ac.mk)map.removeLayer(ac.mk);if(ac.lb)map.removeLayer(ac.lb);if(ac.tr)map.removeLayer(ac.tr)}
 
 // --- Selection ---
+// Remove map layers for expired aircraft that lost selection
+function cleanExpired(){for(const[ic,ac]of A){if(ac.expired&&!selSet.has(ic)&&ac.mk){rmAc(ac);ac.mk=null;ac.lb=null;ac.tr=null}}}
 function sel0(ic,ev){
   const multi=ev&&(ev.metaKey||ev.shiftKey||ev.ctrlKey);
   if(multi){
@@ -487,16 +551,17 @@ function sel0(ic,ev){
   }else{
     selSet.clear();selSet.add(ic);
   }
+  cleanExpired();
   for(const[i,a]of A)updAc(i,a);
   updDet();
 }
-function deselOne(ic){selSet.delete(ic);for(const[i,a]of A)updAc(i,a);updDet()}
-function desel(){selSet.clear();updDet();for(const[i,a]of A)updAc(i,a)}
+function deselOne(ic){selSet.delete(ic);cleanExpired();for(const[i,a]of A)updAc(i,a);updDet()}
+function desel(){selSet.clear();cleanExpired();updDet();for(const[i,a]of A)updAc(i,a)}
 function dismissAc(ic,ev){
   ev.stopPropagation();
   selSet.delete(ic);
   const ac=A.get(ic);
-  if(ac){ac.pinned=false;rmAc(ac)}
+  if(ac){ac.pinned=false;rmAc(ac);ac.mk=null;ac.lb=null;ac.tr=null}
   for(const[i,a]of A)updAc(i,a);
   updDet();
 }
@@ -539,6 +604,7 @@ function parse(l){
     selSet.clear();
     deviceVersion='';updFlashVer();
     consoleReady=false;
+    meshyConfig={};
   }
   // Parse device version from boot log
   const verM=/App version:\s+(\S+)/.exec(l);
@@ -577,15 +643,15 @@ function parse(l){
     updSD('mounted',null);
   }
   const gm=GR.exec(l);
-  if(gm){const la=parseFloat(gm[2]),lo=parseFloat(gm[3]);if(gm[1]==='A'&&la&&lo){rxP={lat:la,lon:lo,sats:parseInt(gm[4]),hdop:parseFloat(gm[5]),fix:true};updRx();if(!map._p&&!map._userMoved){map.setView([la,lo],11);map._p=true}}updGnss();return}
+  if(gm){const la=parseFloat(gm[2]),lo=parseFloat(gm[3]);if(gm[1]==='A'&&la&&lo){rxP={lat:la,lon:lo,sats:parseInt(gm[4]),hdop:parseFloat(gm[5]),fix:true};updRx();if(!map._p&&!map._userMoved){map.setView([la,lo],11);map._p=true}if(meshyConfig.node)updateNodePosition(meshyConfig.node,la,lo,0)}updGnss();return}
   const mm=MR.exec(l);if(!mm)return;
   const ic=mm[1],af=l.substring(mm[0].length),cm=af.match(/^([\w]{2,8})\s/),cs=(cm&&/[A-Z]/.test(cm[1]))?cm[1]:null;
   totM++;
   let ac=A.get(ic);
-  if(!ac){ac={cs:null,alt:null,speed:null,hdg:null,vr:null,lat:null,lon:null,hasPos:false,expired:false,dist:null,brg:null,ls:Date.now(),mk:null,lb:null,tr:null};A.set(ic,ac)}
+  if(!ac){ac={cs:null,alt:null,speed:null,hdg:null,vr:null,lat:null,lon:null,hasPos:false,expired:false,dist:null,brg:null,ls:Date.now(),mk:null,lb:null,tr:null,trPts:[]};A.set(ic,ac)}
   ac.ls=Date.now();if(cs)ac.cs=cs;
   // Revive if expired – new message means it's back
-  if(ac.expired){ac.expired=false;ac.mk=null;ac.lb=null;ac.tr=null;}
+  if(ac.expired){ac.expired=false;ac.mk=null;ac.lb=null;ac.tr=null;ac.trPts=[];}
   let m;
   if(m=AR.exec(l))ac.alt=parseInt(m[1]);
   if(m=SR.exec(l)){ac.speed=parseInt(m[1]);ac.hdg=parseInt(m[2])}
@@ -837,17 +903,67 @@ let meshyCount=0;
 const MESHY_MAX=5000;
 const meshyDedup={};  // dedupKey -> {el, receptions:[], count}
 const MESHY_DEDUP_WINDOW=120000; // 2min – same message within this window merges
+let meshyConfig={};   // parsed from MESHY boot log: region, preset, role, freq, node, txPwr, channel
 function toggleMeshy(){
-  if(csvRows.length){alert('Meshy is disabled during CSV replay.');return}
+  if(csvRows.length&&!hasMeshyCSV){alert('Load a meshy CSV alongside the ADS-B CSV to see Meshtastic messages in replay.');return}
   const p=document.getElementById('meshy-panel');
   p.classList.toggle('visible');
   document.getElementById('meshy-btn').classList.toggle('active');
 }
 function clearMeshy(){document.getElementById('meshy-output').innerHTML='';meshyCount=0;Object.keys(meshyDedup).forEach(k=>delete meshyDedup[k])}
+async function meshyTxSend(){
+  const input=document.getElementById('meshy-tx-input');
+  const text=input.value.trim();
+  if(!text)return;
+  if(!conn){alert('Connect serial first');return}
+  const btn=document.getElementById('meshy-tx-btn');
+  btn.disabled=true;
+  try{
+    await sendCmdResume('meshy_tx '+text,3000);
+  }catch(e){addLog('[scope] TX error: '+e.message)}
+  btn.disabled=false;
+  input.value='';
+  input.focus();
+}
+async function meshyDlWebapp(){
+  if(!conn){alert('Connect serial first');return}
+  const st=document.getElementById('files-status');
+  st.innerHTML='Downloading webapp...';
+  try{
+    const raw=await sendCmdResume('webapp',15000);
+    const blob=new Blob([raw],{type:'text/html'});const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');a.href=url;a.download='adsb_scope.htm';document.body.appendChild(a);a.click();
+    document.body.removeChild(a);URL.revokeObjectURL(url);
+    st.innerHTML='Webapp downloaded ('+(raw.length/1024).toFixed(0)+' KB)';
+  }catch(e){st.innerHTML='Failed: '+e.message}
+}
+function handleMeshyTx(l){
+  // Parse: MESHY: [TX] "message text"
+  const m=/MESHY:\s+\[TX\]\s+"(.+)"/.exec(l);
+  if(!m)return;
+  const text=m[1];
+  const nodeId=meshyConfig.node||'self';
+  const displayName=(meshyNodes[nodeId]?.short)||'You';
+  // Associate our receiver position with our node (backfills older messages too)
+  if(rxP&&rxP.fix)updateNodePosition(nodeId,rxP.lat,rxP.lon,0);
+  addMeshyMsg({from:displayName,node:nodeId,rssi:0,snr:0,hop:0,hopStart:0,kind:'text',text:text,_tx:true});
+}
+function handleMeshyConfig(l){
+  // Parse: MESHY: Session initialized: node=!XXXXXXXX region=XX preset=XX role=XX tx=XXdBm hop=N slot=auto/manual +Nch
+  const sm=/MESHY:\s+Session initialized:\s+node=!(\w+)\s+region=(\w+)\s+preset=(\w+)\s+role=([\w ]+)\s+tx=(\d+)dBm(?:\s+hop=(\d+))?\s+slot=(\w+)\s+\+(\d+)ch/.exec(l);
+  if(sm){meshyConfig={node:sm[1],region:sm[2],preset:sm[3],role:sm[4],txPwr:sm[5],hop:sm[6]||'3',slot:sm[7],extraCh:parseInt(sm[8]),freq:meshyConfig.freq||null};learnNodeName(sm[1],'You','ADS-B Scope');if(rxP&&rxP.fix)updateNodePosition(sm[1],rxP.lat,rxP.lon,0);updateMeshyStats();return}
+  // Parse: MESHY: Radio configured, listening on 913.125 MHz
+  const fm=/MESHY:\s+Radio configured.*?([\d.]+)\s+MHz/.exec(l);
+  if(fm){meshyConfig.freq=fm[1];updateMeshyStats();return}
+  // Parse: MESHY: Meshy stopped
+  if(/MESHY:\s+Meshy stopped/.test(l)){meshyConfig.stopped=true;updateMeshyStats();return}
+  // Parse: MESHY: Meshy started
+  if(/MESHY:\s+Meshy started/.test(l)){meshyConfig.stopped=false;updateMeshyStats()}
+}
 function parseMeshyLine(l){
-  const m=/MESHY:\s+\[(\w+)\]\s+!([0-9a-fA-F]{8})\s+\(([^)]*)\)\s+RSSI:([\-\d.]+)\s+SNR:([\-\d.]+)\s+hop:(\d+)\/(\d+)/.exec(l);
+  const m=/MESHY:\s+\[(\w+)\]\s+!([0-9a-fA-F]{8})\s+\(([^)]*)\)\s+RSSI:([\-\d.]+)\s+SNR:([\-\d.]+)\s+hop:(\d+)\/(\d+)(?:\s+ch:(\w+))?/.exec(l);
   if(!m)return null;
-  return{type:m[1],node:m[2],name:m[3]!=='?'?m[3]:'',rssi:parseFloat(m[4]),snr:parseFloat(m[5]),hop:parseInt(m[6]),hopStart:parseInt(m[7])};
+  return{type:m[1],node:m[2],name:m[3]!=='?'?m[3]:'',rssi:parseFloat(m[4]),snr:parseFloat(m[5]),hop:parseInt(m[6]),hopStart:parseInt(m[7]),pki:m[8]==='PKI'};
 }
 let meshyPendingText=null;
 let meshyPendingNode=null;
@@ -882,7 +998,7 @@ function handleMeshyLine(l){
   if(!p)return;
   if(p.name)learnNodeName(p.node,p.name);
   const displayName=p.name||(meshyNodes[p.node]?.short)||p.node;
-  const base={from:displayName,node:p.node,rssi:p.rssi,snr:p.snr,hop:p.hop,hopStart:p.hopStart};
+  const base={from:displayName,node:p.node,rssi:p.rssi,snr:p.snr,hop:p.hop,hopStart:p.hopStart,pki:p.pki};
   if(p.type==='TEXT'){meshyPendingText={...base,kind:'text',text:''};return;}
   if(p.type==='NODE'){addMeshyMsg({...base,kind:'join'});return;}
   if(p.type==='POS'){meshyPendingNode=p.node;addMeshyMsg({...base,kind:'pos'});return;}
@@ -930,16 +1046,16 @@ function toggleAcMap(){
   acMapVisible=!acMapVisible;
   document.getElementById('ac-map-btn').classList.toggle('active',acMapVisible);
   if(!acMapVisible){
-    // Remove all aircraft from map
-    for(const[,ac]of A){if(!ac.expired)rmAc(ac)}
+    for(const[,ac]of A){if(ac.mk)rmAc(ac)}
   }else{
-    // Re-add all aircraft
-    for(const[ic,ac]of A){if(!ac.expired&&ac.hasPos){ac.mk=null;ac.lb=null;ac.tr=null;updAc(ic,ac)}}
+    for(const[ic,ac]of A){
+      if(ac.hasPos&&(!ac.expired||selSet.has(ic))){ac.mk=null;ac.lb=null;ac.tr=null;updAc(ic,ac)}
+    }
   }
   updRxRings();
 }
 function toggleMeshyMap(){
-  if(csvRows.length){alert('Mesh map is disabled during CSV replay.');return}
+  if(csvRows.length&&!hasMeshyCSV){alert('Load a meshy CSV alongside the ADS-B CSV to see mesh nodes on the map.');return}
   meshyMapVisible=!meshyMapVisible;
   document.getElementById('mesh-map-btn').classList.toggle('active',meshyMapVisible);
   if(meshyMapVisible){
@@ -1191,8 +1307,9 @@ function renderMeshyLine(entry){
   const pin=hasPos?'<span class="ml">\u2299</span>':'';
   const cx=c>1?` <span class="mx" data-expand="1">x${c}</span>`:'';
   let html='';
+  const dm=m.pki?'<span class="mk">DM</span>':'';
   switch(m.kind){
-    case'text':html=`${pin}<span class="mn">${esc(m.from)}</span> <span class="mt">${esc(m.text)}</span>${cx} <span class="mr">${meta}</span>`;break;
+    case'text':html=`${pin}${dm}<span class="mn">${esc(m.from)}</span> <span class="mt">${esc(m.text)}</span>${cx} <span class="mr">${meta}</span>`;break;
     case'join':html=`${pin}<span class="mj">${esc(m.from)} joined</span>${cx} <span class="mr">${meta}</span>`;break;
     case'pos':html=`${pin}<span class="mp">${esc(m.from)} position</span>${cx} <span class="mr">${meta}</span>`;break;
     case'telem':{
@@ -1207,7 +1324,7 @@ function renderMeshyLine(entry){
 }
 function addMeshyMsg(m){
   const el=document.getElementById('meshy-output');
-  const now=Date.now();
+  const now=csvRows.length?nowTime():Date.now();
   const key=meshyDedupKey(m);
   const rx={rssi:m.rssi,snr:m.snr,hop:m.hop,hopStart:m.hopStart};
   // Check for existing dedup entry within time window
@@ -1226,7 +1343,7 @@ function addMeshyMsg(m){
   }
   // New entry
   const d=document.createElement('div');
-  d.className='meshy-msg';
+  d.className='meshy-msg'+(m._tx?' tx-out':'');
   d.dataset.mk=m.kind;
   d.dataset.node=m.node;
   d.style.display=isMeshyKindVisible(m.kind)?'':'none';
@@ -1259,7 +1376,23 @@ function addMeshyMsg(m){
 function updateMeshyStats(){
   const st=document.getElementById('meshy-stats');
   const nodeCount=Object.keys(meshyNodes).length;
-  st.textContent=`Nodes: ${nodeCount}  Messages: ${meshyCount}`;
+  let parts=[];
+  const c=meshyConfig;
+  if(c.region||c.preset){
+    let cfg=[];
+    if(c.region)cfg.push(c.region);
+    if(c.preset)cfg.push(c.preset);
+    if(c.role)cfg.push(c.role);
+    if(c.freq)cfg.push(c.freq+' MHz');
+    if(c.txPwr)cfg.push(c.txPwr+'dBm');
+    if(c.hop)cfg.push('hop:'+c.hop);
+    if(c.slot&&c.slot!=='auto')cfg.push('slot:'+c.slot);
+    if(c.extraCh>0)cfg.push('+'+c.extraCh+'ch');
+    if(c.stopped)cfg.push('STOPPED');
+    parts.push(cfg.join(' · '));
+  }
+  parts.push('Nodes: '+nodeCount+'  Messages: '+meshyCount);
+  st.innerHTML=parts.join('<br>');
 }
 function esc(s){const d=document.createElement('span');d.textContent=s;return d.innerHTML}
 function isMeshyKindVisible(k){
@@ -1332,16 +1465,18 @@ function tick(){
     for(const[ic,ac]of A){
       const age=n-ac.ls;
       if(age>EXP&&!ac.expired){
-        rmAc(ac);
         ac.expired=true;
-        // Keep selected aircraft in selection – they get an X dismiss in the table
-        if(selSet.has(ic))ac.pinned=true;
-        else selSet.delete(ic);
+        if(selSet.has(ic)){
+          ac.pinned=true;  // keep on map — updAc renders selected expired
+        }else{
+          rmAc(ac);
+          selSet.delete(ic);
+        }
       }
     }
   }
-  // Refresh map visuals for staleness transitions (only non-expired)
-  for(const[ic,ac]of A){if(!ac.expired)updAc(ic,ac)}
+  // Refresh map visuals for staleness transitions (include selected expired)
+  for(const[ic,ac]of A){if(!ac.expired||selSet.has(ic))updAc(ic,ac)}
   updRxRings();
   const liveCount=[...A.values()].filter(ac=>!ac.expired).length;
   document.getElementById('ac-count').textContent=liveCount;
@@ -1370,19 +1505,22 @@ function tick(){
   tb.innerHTML=so.map(([ic,ac])=>{
     const age=Math.round((n-ac.ls)/1000);
     const vc=ac.vr>0?'climbing':ac.vr<0?'descending':'';
-    const sel=selSet.has(ic)?' selected':'';
+    const isSel=selSet.has(ic);
+    const sel=isSel?' selected':'';
     const c=acCol(ic,ac);
     if(ac.expired){
+      const expOp=isSel?'opacity:0.5':'opacity:0.25';
+      const expCol=isSel?'#99a':'#556';
       const dismiss=ac.pinned?`<span style="cursor:pointer;color:#ff6b6b;margin-left:4px" onclick="dismissAc('${ic}',event)">✕</span>`:'';
-      return`<tr style="opacity:0.25" onclick="sel0('${ic}',event)"><td class="col-icao" style="color:#556">${ic}${dismiss}</td><td class="col-cs" style="color:#556">${ac.cs||'---'}</td><td style="color:#556">${ac.alt!=null?ac.alt.toLocaleString():'---'}</td><td style="color:#556">${ac.speed||'---'}</td><td style="color:#556">${ac.hdg!=null?ac.hdg+'°':'---'}</td><td style="color:#556">${ac.vr?(ac.vr>0?'+':'')+ac.vr:'---'}</td><td style="color:#556">${ac.dist!=null?ac.dist.toFixed(1)+'nm':'---'}</td><td style="color:#556">${ac.brg!=null?ac.brg+'°':'---'}</td><td style="color:#556">${age}s</td></tr>`;
+      return`<tr class="${sel}" style="${expOp}" onclick="sel0('${ic}',event)"><td class="col-icao" style="color:${expCol}">${ic}${dismiss}</td><td class="col-cs" style="color:${expCol}">${ac.cs||'---'}</td><td style="color:${expCol}">${ac.alt!=null?ac.alt.toLocaleString():'---'}</td><td style="color:${expCol}">${ac.speed||'---'}</td><td style="color:${expCol}">${ac.hdg!=null?ac.hdg+'°':'---'}</td><td style="color:${expCol}">${ac.vr?(ac.vr>0?'+':'')+ac.vr:'---'}</td><td style="color:${expCol}">${ac.dist!=null?ac.dist.toFixed(1)+'nm':'---'}</td><td style="color:${expCol}">${ac.brg!=null?ac.brg+'°':'---'}</td><td style="color:${expCol}">${age}s</td></tr>`;
     }
-    const st=acStale(ac);
-    const rowOp=st.gray?'opacity:0.35':st.opacity<1?'opacity:0.5':'';
-    const icCol=st.gray?'#667':c;
+    const st=acStale(ac,isSel);
+    const rowOp=st.gray?(isSel?'opacity:0.5':'opacity:0.35'):st.opacity<1?'opacity:0.5':'';
+    const icCol=st.gray?(isSel?'#99a':'#667'):c;
     return`<tr class="${sel}" style="${rowOp}" onclick="sel0('${ic}',event)"><td class="col-icao" style="color:${icCol}">${ic}</td><td class="col-cs">${ac.cs||'---'}</td><td class="col-alt">${ac.alt!=null?ac.alt.toLocaleString():'---'}</td><td>${ac.speed||'---'}</td><td>${ac.hdg!=null?ac.hdg+'°':'---'}</td><td class="col-vr ${vc}">${ac.vr?(ac.vr>0?'+':'')+ac.vr:'---'}</td><td class="col-dist">${ac.dist!=null?ac.dist.toFixed(1)+'nm':'---'}</td><td class="col-dist">${ac.brg!=null?ac.brg+'°':'---'}</td><td class="col-dist">${age}s</td></tr>`;
   }).join('');
 }
-function togglePanel(){const p=document.getElementById('panel');if(p.classList.contains('collapsed')){p.classList.remove('collapsed');p.style.height=panelH+'px'}else{p.classList.add('collapsed')}}
+function togglePanel(){const p=document.getElementById('panel');const b=document.getElementById('panel-toggle');if(p.classList.contains('collapsed')){p.classList.remove('collapsed');p.style.height=panelH+'px';b.textContent='\u25B2 Aircraft \u25B2'}else{p.classList.add('collapsed');p.style.height='';b.textContent='\u25BC Aircraft \u25BC'}}
 
 // --- Panel drag resize ---
 let panelH=Math.round(window.innerHeight*0.35);
@@ -1390,9 +1528,9 @@ let panelH=Math.round(window.innerHeight*0.35);
   const panel=document.getElementById('panel');
   const drag=document.getElementById('panel-drag');
   let dragging=false,startY,startH;
-  function onStart(y){dragging=true;startY=y;startH=panel.offsetHeight;panel.style.transition='none';document.body.style.cursor='ns-resize';document.body.style.userSelect='none'}
-  function onMove(y){if(!dragging)return;const h=Math.max(60,Math.min(window.innerHeight-60,startH+(startY-y)));panel.style.height=h+'px';panelH=h}
-  function onEnd(){if(!dragging)return;dragging=false;panel.style.transition='';document.body.style.cursor='';document.body.style.userSelect=''}
+  function onStart(y){dragging=true;startY=y;startH=panel.offsetHeight;if(panel.classList.contains('collapsed')){panel.classList.remove('collapsed');panel.style.height=startH+'px'}panel.style.transition='none';document.body.style.cursor='ns-resize';document.body.style.userSelect='none'}
+  function onMove(y){if(!dragging)return;const h=Math.max(44,Math.min(window.innerHeight-60,startH+(startY-y)));panel.style.height=h+'px';panelH=h}
+  function onEnd(){if(!dragging)return;dragging=false;panel.style.transition='';document.body.style.cursor='';document.body.style.userSelect='';if(panelH<=60){panel.classList.add('collapsed');panel.style.height='';document.getElementById('panel-toggle').textContent='\u25BC Aircraft \u25BC'}else{panel.classList.remove('collapsed');document.getElementById('panel-toggle').textContent='\u25B2 Aircraft \u25B2'}}
   drag.addEventListener('mousedown',e=>{e.preventDefault();onStart(e.clientY)});
   window.addEventListener('mousemove',e=>onMove(e.clientY));
   window.addEventListener('mouseup',onEnd);
@@ -1542,7 +1680,7 @@ function handleLine(l){
     return;
   }
   parse(l);addLog(l);
-  if(l.includes('MESHY')){handleMeshyLine(l);handleMeshyNodeInfo(l);}
+  if(l.includes('MESHY')){handleMeshyConfig(l);handleMeshyTx(l);handleMeshyLine(l);handleMeshyNodeInfo(l);}
 }
 async function serialWrite(t){if(!conn||!port?.writable)return;const w=port.writable.getWriter();try{await w.write(new TextEncoder().encode(t))}finally{w.releaseLock()}}
 async function sendCmd(cmd,inactMs){
@@ -1635,13 +1773,13 @@ function renderFiles(files,path,suffix){
   for(const f of files){
     const ic=f.isDir?'\uD83D\uDCC1':'\uD83D\uDCC4';
     const cls=f.isDir?'dir':'';
-    const isAdsbCsv=f.name.endsWith('.csv')&&!f.name.startsWith('meshy_');
+    const isCsv=f.name.endsWith('.csv');
     const isActive=(!f.isDir&&sdActiveFile&&f.name===sdActiveFile)?'active-log':'';
     const n=f.name.replace(/'/g,"\\'");
     let acts='';
     if(!f.isDir){
       acts='<div class="file-actions">';
-      if(isAdsbCsv)acts+='<button onclick="event.stopPropagation();fileReplay(\''+n+'\',\''+f.size+'\')">Replay</button>';
+      if(isCsv)acts+='<button onclick="event.stopPropagation();fileReplay(\''+n+'\',\''+f.size+'\')">Replay</button>';
       acts+='<button onclick="event.stopPropagation();fileDL(\''+n+'\',\''+f.size+'\')">DL</button>';
       acts+='<button onclick="event.stopPropagation();fileDel(\''+n+'\')">Del</button>';
       acts+='</div>';
@@ -1753,29 +1891,34 @@ async function discon(){
 let csvRows=[], csvPlaying=false, csvIdx=0, csvTimer=null, csvSpeedIdx=3;
 const csvSpeeds=[0.25,0.5,0.75,1,2,4,8,16,32];
 let csvStartReal=0, csvStartData=0, csvNow=0;
+let hasMeshyCSV=false;
 
-function loadCSV(input){
-  const file=input.files[0];if(!file)return;
-  const reader=new FileReader();
-  reader.onload=async function(e){
-    if(conn)await discon();
-    parseCSVText(e.target.result,file.name);
-  };
-  reader.readAsText(file);
-  input.value='';
+// CSV field splitter handling quoted fields (meshy text can contain commas)
+function csvSplitRow(line){
+  const fields=[];let i=0,field='',inQ=false;
+  while(i<line.length){
+    const c=line[i];
+    if(inQ){
+      if(c==='"'){if(i+1<line.length&&line[i+1]==='"'){field+='"';i+=2}else{inQ=false;i++}}
+      else{field+=c;i++}
+    }else{
+      if(c==='"'){inQ=true;i++}else if(c===','){fields.push(field);field='';i++}else{field+=c;i++}
+    }
+  }
+  fields.push(field);return fields;
 }
 
-function parseCSVText(text,filename){
+function parseAdsbCSVRows(text){
   const lines=text.split('\n');
   const hdr=lines[0].split(',');
   const cols={};hdr.forEach((h,i)=>cols[h.trim()]=i);
-  csvRows=[];
+  const rows=[];
   for(let i=1;i<lines.length;i++){
     const f=lines[i].split(',');if(f.length<10)continue;
     const ts=f[cols.timestamp_utc]||'';
     const t=new Date(ts).getTime();
     if(isNaN(t))continue;
-    csvRows.push({t,icao:f[cols.icao]||'',cs:f[cols.callsign]||'',
+    rows.push({type:'adsb',t,icao:f[cols.icao]||'',cs:f[cols.callsign]||'',
       alt:parseInt(f[cols.altitude_ft])||null,speed:parseInt(f[cols.speed_kt])||null,
       hdg:parseInt(f[cols.heading_deg])||null,vr:parseInt(f[cols.vrate_fpm])||null,
       lat:parseFloat(f[cols.lat])||null,lon:parseFloat(f[cols.lon])||null,
@@ -1784,37 +1927,134 @@ function parseCSVText(text,filename){
       sats:parseInt(f[cols.rx_sats])||0,hdop:parseFloat(f[cols.rx_hdop])||0
     });
   }
-  csvRows.sort((a,b)=>a.t-b.t);
-  if(!csvRows.length){alert('No valid rows in CSV');return}
+  return rows;
+}
+
+function parseMeshyCSVRows(text){
+  const lines=text.split('\n');
+  const hdr=lines[0].split(',');
+  const cols={};hdr.forEach((h,i)=>cols[h.trim()]=i);
+  const rows=[];
+  for(let i=1;i<lines.length;i++){
+    const f=csvSplitRow(lines[i]);if(f.length<15)continue;
+    const ts=f[cols.timestamp_utc]||'';
+    const t=new Date(ts).getTime();
+    if(isNaN(t))continue;
+    const lat=parseFloat(f[cols.lat])||0,lon=parseFloat(f[cols.lon])||0;
+    rows.push({type:'meshy',t,
+      from:f[cols.from_hex]||'',  // keep full 8-char hex to match live nodeId format
+      to:f[cols.to_hex]||'',packetId:f[cols.packet_id]||'',
+      channel:parseInt(f[cols.channel])||0,
+      rssi:parseFloat(f[cols.rssi])||0,snr:parseFloat(f[cols.snr])||0,
+      hopLimit:parseInt(f[cols.hop_limit])||0,hopStart:parseInt(f[cols.hop_start])||0,
+      portnum:parseInt(f[cols.portnum])||0,portName:f[cols.port_name]||'',
+      text:f[cols.text]||'',
+      lat:(Math.abs(lat)>0.001)?lat:null,lon:(Math.abs(lon)>0.001)?lon:null,
+      alt:parseInt(f[cols.altitude_m])||0,
+      longName:f[cols.long_name]||'',shortName:f[cols.short_name]||'',
+      bat:parseInt(f[cols.battery_pct])||0,voltage:parseFloat(f[cols.voltage])||0,
+      chUtil:parseFloat(f[cols.ch_util_pct])||0,airUtil:parseFloat(f[cols.air_util_pct])||0,
+      rxCount:parseInt(f[cols.rx_count])||0,
+      pki:parseInt(f[cols.is_pki])||0
+    });
+  }
+  return rows;
+}
+
+function loadCSV(input){
+  const files=Array.from(input.files);if(!files.length)return;
+  const readers=files.map(f=>new Promise(resolve=>{
+    const r=new FileReader();
+    r.onload=e=>resolve({name:f.name,text:e.target.result});
+    r.readAsText(f);
+  }));
+  Promise.all(readers).then(async results=>{
+    if(conn)await discon();
+    startReplay(results);
+  });
+  input.value='';
+}
+
+// Single-file entry point (used by file browser Replay button)
+function parseCSVText(text,filename){
+  startReplay([{name:filename,text}]);
+}
+
+function clearMeshyState(){
+  Object.keys(meshyNodes).forEach(k=>delete meshyNodes[k]);
+  Object.keys(meshyDedup).forEach(k=>delete meshyDedup[k]);
+  document.getElementById('meshy-output').innerHTML='';
+  meshyCount=0;
+  for(const id in meshyMarkers){
+    if(meshyMarkers[id].mk)map.removeLayer(meshyMarkers[id].mk);
+    if(meshyMarkers[id].lb)map.removeLayer(meshyMarkers[id].lb);
+  }
+  Object.keys(meshyMarkers).forEach(k=>delete meshyMarkers[k]);
+  hideAllPeeks();
+  meshySelected.clear();
+  meshyLastClickedEl=null;
+  Object.keys(meshyMsgBubbles).forEach(k=>delete meshyMsgBubbles[k]);
+  meshyConfig={};
+}
+
+function startReplay(files){
+  let allRows=[],names=[],hasMeshy=false;
+  for(const f of files){
+    const hdr=f.text.split('\n')[0]||'';
+    if(hdr.includes('from_hex')){
+      allRows.push(...parseMeshyCSVRows(f.text));hasMeshy=true;
+    }else{
+      allRows.push(...parseAdsbCSVRows(f.text));
+    }
+    names.push(f.name);
+  }
+  allRows.sort((a,b)=>a.t-b.t);
+  if(!allRows.length){alert('No valid rows in CSV');return}
+
+  // Clear all state
   for(const[ic,ac]of A){rmAc(ac)}
-  A.clear();selSet.clear();
+  A.clear();selSet.clear();totM=0;
+  clearMeshyState();
+
+  csvRows=allRows;
+  hasMeshyCSV=hasMeshy;
   csvIdx=0;csvSpeedIdx=3;
   document.getElementById('timeline').classList.add('visible');
   document.getElementById('tl-scrub').max=csvRows.length-1;
   document.getElementById('tl-scrub').value=0;
   posTopbar();
-  const rxRow=csvRows.find(r=>r.rxLat&&r.rxLon&&Math.abs(r.rxLat)>0.1);
+
+  // RX position from first adsb row with GPS fix
+  const rxRow=csvRows.find(r=>r.type==='adsb'&&r.rxLat&&r.rxLon&&Math.abs(r.rxLat)>0.1);
   if(rxRow){rxP={lat:rxRow.rxLat,lon:rxRow.rxLon,sats:rxRow.sats,hdop:rxRow.hdop,fix:true};updRx();updGnss();map.setView([rxRow.rxLat,rxRow.rxLon],11)}
+
   updTlTime();
-  addLog('[scope] CSV loaded: '+csvRows.length+' rows, '+filename);
-  // Disable meshy during replay
-  if(meshyMapVisible){meshyMapVisible=false;document.getElementById('mesh-map-btn').classList.remove('active');
-    for(const id in meshyMarkers){if(meshyMarkers[id].mk)map.removeLayer(meshyMarkers[id].mk);if(meshyMarkers[id].lb)map.removeLayer(meshyMarkers[id].lb)}
-    Object.keys(meshyMarkers).forEach(k=>delete meshyMarkers[k]);updRxRings();
+  addLog('[scope] CSV loaded: '+allRows.length+' rows, '+names.join(' + '));
+
+  // Meshy button state during replay
+  if(hasMeshy){
+    document.getElementById('meshy-btn').style.opacity='';
+    document.getElementById('mesh-map-btn').style.opacity='';
+  }else{
+    if(meshyMapVisible){meshyMapVisible=false;document.getElementById('mesh-map-btn').classList.remove('active');
+      for(const id in meshyMarkers){if(meshyMarkers[id].mk)map.removeLayer(meshyMarkers[id].mk);if(meshyMarkers[id].lb)map.removeLayer(meshyMarkers[id].lb)}
+      Object.keys(meshyMarkers).forEach(k=>delete meshyMarkers[k]);updRxRings();
+    }
+    document.getElementById('meshy-panel').classList.remove('visible');
+    document.getElementById('meshy-btn').classList.remove('active');
+    document.getElementById('meshy-btn').style.opacity='0.4';
+    document.getElementById('mesh-map-btn').style.opacity='0.4';
   }
-  document.getElementById('meshy-panel').classList.remove('visible');
-  document.getElementById('meshy-btn').classList.remove('active');
-  document.getElementById('meshy-btn').style.opacity='0.4';
-  document.getElementById('mesh-map-btn').style.opacity='0.4';
   tlPlay();
 }
 
 function feedCSVRow(row){
+  if(row.type==='meshy'){feedMeshyCSVRow(row);return}
   const ic=row.icao;if(!ic||ic==='000000')return;
   let ac=A.get(ic);
-  if(!ac){ac={cs:null,alt:null,speed:null,hdg:null,vr:null,lat:null,lon:null,hasPos:false,expired:false,dist:null,brg:null,ls:row.t,mk:null,lb:null,tr:null};A.set(ic,ac)}
+  if(!ac){ac={cs:null,alt:null,speed:null,hdg:null,vr:null,lat:null,lon:null,hasPos:false,expired:false,dist:null,brg:null,ls:row.t,mk:null,lb:null,tr:null,trPts:[]};A.set(ic,ac)}
   ac.ls=row.t;
-  if(ac.expired){ac.expired=false;ac.mk=null;ac.lb=null;ac.tr=null;}
+  if(ac.expired){ac.expired=false;ac.mk=null;ac.lb=null;ac.tr=null;ac.trPts=[];}
   if(row.cs)ac.cs=row.cs;
   if(row.alt!=null)ac.alt=row.alt;
   if(row.speed!=null)ac.speed=row.speed;
@@ -1827,6 +2067,29 @@ function feedCSVRow(row){
   if(row.brg!=null)ac.brg=Math.round(row.brg);
   updAc(ic,ac);
   totM++;
+}
+
+function feedMeshyCSVRow(row){
+  const nodeId=row.from;
+  // Learn node names
+  if(row.shortName||row.longName)learnNodeName(nodeId,row.shortName||'',row.longName||'');
+  // Update position for POS packets
+  if(row.portName==='POS'&&row.lat!=null&&row.lon!=null){
+    updateNodePosition(nodeId,row.lat,row.lon,row.alt);
+  }
+  // Build display name
+  const displayName=(meshyNodes[nodeId]?.short)||nodeId;
+  const base={from:displayName,node:nodeId,rssi:row.rssi,snr:row.snr,hop:row.hopLimit,hopStart:row.hopStart,pki:!!row.pki};
+  switch(row.portName){
+    case'TEXT':
+      addMeshyMsg({...base,kind:'text',text:row.text||''});
+      // Auto-peek text messages on map during replay so bubbles appear spatially
+      if(!meshyMapVisible&&nodeHasPosition(nodeId)&&!meshyPeeks[nodeId])showMeshyPeek(nodeId);
+      break;
+    case'NODE':addMeshyMsg({...base,kind:'join'});break;
+    case'POS':addMeshyMsg({...base,kind:'pos'});break;
+    case'TELEM':addMeshyMsg({...base,kind:'telem',bat:row.bat,volt:row.voltage,chUtil:row.chUtil,airTx:row.airUtil});break;
+  }
 }
 
 function tlPlay(){
@@ -1860,12 +2123,22 @@ function tlScrub(val){
   csvIdx=parseInt(val);
   if(csvIdx>=csvRows.length)csvIdx=csvRows.length-1;
   csvNow=csvRows[csvIdx].t;
-  // Clear and replay up to this point to build trails
+  // Clear and replay up to this point to build trails + meshy state
   for(const[ic,ac]of A){rmAc(ac)}
   A.clear();selSet.clear();
-  // Feed last ~60s of data for trail context
+  clearMeshyState();
   const targetT=csvRows[csvIdx].t;
   const trailStart=csvRows.findIndex(r=>r.t>=targetT-60000);
+  // Pre-scan meshy rows before the 60s window for node names + positions
+  // (lightweight — only name/position, no message UI)
+  if(hasMeshyCSV){
+    for(let i=0;i<Math.max(0,trailStart);i++){
+      const r=csvRows[i];if(r.type!=='meshy')continue;
+      if(r.shortName||r.longName)learnNodeName(r.from,r.shortName||'',r.longName||'');
+      if(r.portName==='POS'&&r.lat!=null&&r.lon!=null)updateNodePosition(r.from,r.lat,r.lon,r.alt);
+    }
+  }
+  // Feed last ~60s of data for trail and meshy message context
   for(let i=Math.max(0,trailStart);i<=csvIdx;i++){
     feedCSVRow(csvRows[i]);
   }
@@ -1900,12 +2173,13 @@ function updTlTime(){
 
 function tlClose(){
   tlPause();
-  csvRows=[];csvIdx=0;csvNow=0;
+  csvRows=[];csvIdx=0;csvNow=0;hasMeshyCSV=false;
   document.getElementById('timeline').classList.remove('visible');
   posTopbar();
-  // Clear replay aircraft
+  // Clear all replay state
   for(const[ic,ac]of A){rmAc(ac)}
   A.clear();selSet.clear();totM=0;
+  clearMeshyState();
   addLog('[scope] CSV replay closed');
   // Re-enable meshy buttons
   document.getElementById('meshy-btn').style.opacity='';
@@ -2258,6 +2532,14 @@ new ResizeObserver(posTopbar).observe(document.getElementById('topbar'));
 new ResizeObserver(posTopbar).observe(document.getElementById('gnss-info'));
 window.addEventListener('resize',posTopbar);
 if(!('serial' in navigator)){const b=document.getElementById('connect-btn');b.textContent='No WebSerial';b.disabled=true;b.style.opacity=0.4}
+</script>
+<!-- Google Analytics — loaded last so offline/DNS failure can't affect app -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-T71ZHWG166"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+  gtag('config', 'G-T71ZHWG166');
 </script>
 </body>
 </html>

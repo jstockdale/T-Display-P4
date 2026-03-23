@@ -82,6 +82,8 @@ typedef struct {
     int32_t  altitude;
     uint32_t battery_level;           // 0-100, from telemetry
     uint16_t hw_model;
+    uint8_t  public_key[32];          // X25519 public key (from NODEINFO)
+    uint8_t  public_key_len;          // 0 = not known, 32 = valid
 } meshy_node_t;
 
 // ─── Stats ───────────────────────────────────────────────────────────────────
@@ -111,9 +113,15 @@ void meshy_set_hw(void *sx1262_ptr, void *xl9535_ptr);
 bool meshy_start(void);
 
 /**
- * Stop Meshtastic tasks. Returns SX1262 to idle.
+ * Stop Meshtastic tasks. Returns SX1262 to standby.
  */
 void meshy_stop(void);
+
+/**
+ * Restart Meshtastic — stop, re-read g_settings, re-init session, start.
+ * Call when radio settings (region/preset/power/channel/role) change.
+ */
+void meshy_restart(void);
 
 /**
  * Queue a broadcast text message on channel 0 (default).
