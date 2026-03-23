@@ -37,10 +37,9 @@ This project turns a LILYGO T-Display-P4 development board into a portable ADS-B
 
 ### Known limitations
 
-- **WiFi disabled** – ESP-Hosted SDIO DMA corrupts internal RAM heap metadata (Espressif Issue #17889); WiFi/NTP unavailable until resolved or AT firmware is deployed on the C6
+- **WiFi disabled** – ESP-Hosted SDIO DMA corrupts internal RAM heap metadata (Espressif Issue #17889); WiFi/NTP unavailable until resolved. Proposed fix migrate ESP-Hosted to SPI over SDIO mode or make custom AT firmware for the C6
 - **WebSerial triggers device reboot** – USB-JTAG auto-reset circuit fires on DTR toggle during port open; handled gracefully (scope reconnects, boot log is parsed)
-- **No SD card in AMOLED unit** – AMOLED variant tested without SD card; logging unavailable on that unit (hardware limitation, not software)
-- **Meshtastic identity shows as "Unknown"** – MQTT gateways display our node as "UNK" until they receive our NODEINFO broadcast. Resolves automatically after the first NODEINFO propagation cycle.
+- **Meshy still under heavy development** – PKI DMs are not yet supported. Private channel support implemented but not enabled yet, still testing. Meshy role setting is mostly cosmetic. Device does not yet broadcast telemetry, nor rebroadcast any traffic. Operates similar to CLIENT_MUTE role.
 
 ## ADS-B Scope
 
