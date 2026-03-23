@@ -129,7 +129,7 @@ Because every open-source SIGINT platform deserves a soundtrack 🎧🛩️
 
 The firmware includes an SD card mp3 player using the onboard ES8311 DAC and NS4150B amplifier. Drop `.mp3` files in `/sdcard/music/` and they show up in the on-device player.
 
-Prepare your mp3 files with prepare_music.py which resizes embedded album art, replaces UTF-16 characters, and accueately populates the TLEN field in the ID3 tag.
+Prepare your mp3 files with `prepare_music.py` which resizes embedded album art, replaces UTF-16 characters, and accurately populates the TLEN field in the ID3 tag.
 
 ### Features
 
