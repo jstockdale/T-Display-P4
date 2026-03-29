@@ -123,6 +123,10 @@ bool music_player_track_changed(void);
 // Clear track-changed flag
 void music_player_ack_track_change(void);
 
+// Close all SD file handles (waits for in-flight reads to finish).
+// Call before unmounting SD card to avoid SPI bus spinlock crash.
+void music_player_sd_close(void);
+
 #ifdef __cplusplus
 }
 #endif

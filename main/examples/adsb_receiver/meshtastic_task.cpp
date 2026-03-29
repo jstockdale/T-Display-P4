@@ -32,8 +32,13 @@
 
 // GPS fix epoch — set in GPS task on first quality fix.
 extern volatile time_t g_gps_fix_epoch;
+extern "C" bool sd_msc_is_active_fn(void);
+extern "C" bool sd_is_mounted(void);
+extern "C" void sd_safe_shutdown(void);
+extern "C" bool sd_remount(void);
 #include "meshy_channels.h"
 #include "serial_console.h"
+#include "sd_config.h"
 
 // Cpp_Bus_Driver includes
 #include "cpp_bus_driver_library.h"
@@ -46,7 +51,10 @@ extern volatile time_t g_gps_fix_epoch;
 static const char *TAG = "MESHY";
 
 // Cyan info log — matches ESP_LOG format but routes through serial_console_print
-#define MESHY_LOGI(fmt, ...) serial_console_print("\033[0;36mI (%lu) %s: " fmt "\033[0m\n", (unsigned long)esp_log_timestamp(), TAG, ##__VA_ARGS__)
+#define MESHY_LOGI(fmt, ...) do { \
+    char _ts[32]; log_format_timestamp(_ts, sizeof(_ts)); \
+    serial_console_print("\033[0;36m%s%s: " fmt "\033[0m\n", _ts, TAG, ##__VA_ARGS__); \
+} while(0)
 
 // ─── Hardware References (set by meshy_init_hw) ─────────────────────────────
 
@@ -116,11 +124,10 @@ static void meshy_sd_pick_filename(void) {
     gmtime_r(&now, &timeinfo);
     if (now < 1704067200LL) {
         snprintf(meshy_sd_filename, sizeof(meshy_sd_filename),
-            "/sdcard/meshy_boot%llu.csv",
-            (unsigned long long)(esp_timer_get_time() / 1000));
+            "/sdcard/mesh_boot%s.csv", sd_config_boot_id());
     } else {
         strftime(meshy_sd_filename, sizeof(meshy_sd_filename),
-            "/sdcard/meshy_%Y-%m-%dT%H%M%SZ.csv", &timeinfo);
+            "/sdcard/mesh_%Y-%m-%dT%H%M%SZ.csv", &timeinfo);
     }
 }
 
@@ -136,7 +143,7 @@ static void meshy_sd_create(void) {
                "text,lat,lon,altitude_m,"
                "long_name,short_name,"
                "battery_pct,voltage,ch_util_pct,air_util_pct,"
-               "rx_count\n");
+               "rx_count,is_pki\n");
     fflush(f);
     fsync(fileno(f));
     fclose(f);
@@ -149,11 +156,29 @@ static void meshy_sd_create(void) {
 
 static void meshy_sd_flush(void) {
     if (!meshy_sd_initialized || meshy_sd_buf_pos == 0) return;
+
+    static int s_meshy_flush_fail_count = 0;
+
     FILE *f = fopen(meshy_sd_filename, "a");
     if (!f) {
-        ESP_LOGW(TAG, "Meshy SD flush: cannot open %s", meshy_sd_filename);
+        s_meshy_flush_fail_count++;
+        ESP_LOGW(TAG, "Meshy SD flush: cannot open %s (%d consecutive)", meshy_sd_filename, s_meshy_flush_fail_count);
+        if (s_meshy_flush_fail_count >= 5) {
+            // SD card likely removed — mark log uninitialized and unmount.
+            // Set uninitialized FIRST to prevent recursion:
+            // sd_safe_shutdown → meshy_sd_close → meshy_sd_flush → returns immediately
+            ESP_LOGW(TAG, "SD card unresponsive — closing meshy log and unmounting");
+            meshy_sd_initialized = false;
+            meshy_sd_filename[0] = '\0';
+            meshy_sd_buf_pos = 0;
+            s_meshy_flush_fail_count = 0;
+            if (sd_is_mounted()) {
+                sd_safe_shutdown();  // unmounts card, sets sd_card_handle = NULL
+            }
+        }
         return;
     }
+    s_meshy_flush_fail_count = 0;  // reset on success
     size_t written = fwrite(meshy_sd_buf, 1, meshy_sd_buf_pos, f);
     fflush(f);
     fsync(fileno(f));
@@ -167,6 +192,21 @@ static void meshy_sd_flush(void) {
     }
     meshy_sd_last_sync = esp_timer_get_time();
     meshy_sd_writes = 0;
+}
+
+// Close the meshy log permanently (for MSC mode / shutdown).
+extern "C" void meshy_sd_close(void) {
+    if (!meshy_sd_initialized) return;  // already closed or never opened
+    meshy_sd_flush();
+    meshy_sd_initialized = false;
+    MESHY_LOGI("Meshy SD log closed: %s", meshy_sd_filename);
+    meshy_sd_filename[0] = '\0';
+}
+
+// Close current log and create a fresh one with a new timestamp.
+extern "C" void meshy_sd_create_new(void) {
+    if (meshy_sd_initialized) meshy_sd_close();
+    meshy_sd_create();
 }
 
 // Escape commas and quotes in text for CSV
@@ -190,6 +230,9 @@ static int meshy_csv_escape(char *dst, int dst_size, const char *src) {
 static void meshy_sd_log_msg(const meshy_msg_t *msg) {
     if (!g_settings.meshy_sd_logging) return;
 
+    // Don't write to SD while USB MSC owns the card
+    if (sd_msc_is_active_fn()) return;
+
     // Lazy init — allocate buffer and create file on first message
     if (!meshy_sd_buf) {
         meshy_sd_buf = (char *)heap_caps_malloc(MESHY_SD_BUFSIZE, MALLOC_CAP_SPIRAM);
@@ -200,7 +243,15 @@ static void meshy_sd_log_msg(const meshy_msg_t *msg) {
         meshy_sd_buf_pos = 0;
     }
     if (!meshy_sd_initialized) {
+        static int64_t last_meshy_mount_retry = 0;
+        int64_t now_us = esp_timer_get_time();
         meshy_sd_create();
+        if (!meshy_sd_initialized && (now_us - last_meshy_mount_retry > 30000000LL)) {
+            last_meshy_mount_retry = now_us;
+            if (sd_remount()) {
+                meshy_sd_create();
+            }
+        }
         if (!meshy_sd_initialized) return;
     }
 
@@ -214,9 +265,9 @@ static void meshy_sd_log_msg(const meshy_msg_t *msg) {
         time_t fix_time = g_gps_fix_epoch;
         gmtime_r(&fix_time, &timeinfo);
         strftime(meshy_sd_filename, sizeof(meshy_sd_filename),
-            "/sdcard/meshy_%Y-%m-%dT%H%M%SZ.csv", &timeinfo);
+            "/sdcard/mesh_%Y-%m-%dT%H%M%SZ.csv", &timeinfo);
         rename(old_name, meshy_sd_filename);
-        MESHY_LOGI("Meshy SD renamed: %s", meshy_sd_filename);
+        MESHY_LOGI("Meshy SD log renamed: %s → %s", old_name, meshy_sd_filename);
     }
 
     // Format timestamp (static to keep off 4KB stack)
@@ -261,7 +312,7 @@ static void meshy_sd_log_msg(const meshy_msg_t *msg) {
         "%.6f,%.6f,%ld,"                                // lat,lon,alt
         "%s,%s,"                                        // long_name,short_name
         "%lu,%.2f,%.1f,%.1f,"                           // battery,voltage,ch_util,air_util
-        "%d\n",
+        "%d,%d\n",
         ts,
         (unsigned long)msg->from, (unsigned long)msg->to,
         (unsigned long)msg->id, msg->channel_idx,
@@ -278,7 +329,8 @@ static void meshy_sd_log_msg(const meshy_msg_t *msg) {
         msg->has_telemetry ? msg->voltage : 0.0f,
         msg->has_telemetry ? msg->channel_util : 0.0f,
         msg->has_telemetry ? msg->air_util_tx : 0.0f,
-        msg->rx_count);
+        msg->rx_count,
+        msg->is_pki ? 1 : 0);
 
     // Append to buffer
     if (meshy_sd_buf_pos + n < MESHY_SD_BUFSIZE) {
@@ -461,6 +513,7 @@ static void build_msg(const MeshRxResult *result, meshy_msg_t *msg) {
     msg->portnum     = result->data.portnum;
     msg->rx_time_ms  = esp_log_timestamp();
     msg->rx_count    = 1;
+    msg->is_pki      = result->is_pki;
 
     switch (result->data.portnum) {
         case PORT_TEXT_MESSAGE: {
@@ -726,17 +779,25 @@ static void meshy_rx_task(void *arg) {
                 }
                 xSemaphoreGive(s_node_mutex);
 
-                ESP_LOGI(TAG, "[%s] !%08lx (%s) RSSI:%.0f SNR:%.1f hop:%d/%d ch:%d",
-                         port_name, (unsigned long)result.packet.from, sender,
-                         rssi, snr, result.packet.hop_limit, result.packet.hop_start,
-                         result.channel_idx);
+                if (result.is_pki) {
+                    MESHY_LOGI("[%s] !%08lx (%s) id:%08lx RSSI:%.0f SNR:%.1f hop:%d/%d ch:PKI",
+                             port_name, (unsigned long)result.packet.from, sender,
+                             (unsigned long)result.packet.id,
+                             rssi, snr, result.packet.hop_limit, result.packet.hop_start);
+                } else {
+                    MESHY_LOGI("[%s] !%08lx (%s) id:%08lx RSSI:%.0f SNR:%.1f hop:%d/%d ch:%d",
+                             port_name, (unsigned long)result.packet.from, sender,
+                             (unsigned long)result.packet.id,
+                             rssi, snr, result.packet.hop_limit, result.packet.hop_start,
+                             result.channel_idx);
+                }
 
                 if (result.data.portnum == PORT_TEXT_MESSAGE) {
-                    ESP_LOGI(TAG, "  \"%.*s\"", (int)msg.text_len, msg.text);
+                    MESHY_LOGI("  \"%.*s\"", (int)msg.text_len, msg.text);
                 } else if (result.data.portnum == PORT_POSITION && msg.has_position) {
-                    ESP_LOGI(TAG, "  pos:%.6f,%.6f alt:%d", msg.lat, msg.lon, (int)msg.altitude);
+                    MESHY_LOGI("  pos:%.6f,%.6f alt:%d", msg.lat, msg.lon, (int)msg.altitude);
                 } else if (result.data.portnum == PORT_TELEMETRY && msg.has_telemetry) {
-                    ESP_LOGI(TAG, "  bat:%lu%% %.2fV chUtil:%.1f%% airTx:%.1f%%",
+                    MESHY_LOGI("  bat:%lu%% %.2fV chUtil:%.1f%% airTx:%.1f%%",
                              (unsigned long)msg.battery_level, msg.voltage,
                              msg.channel_util, msg.air_util_tx);
                 }
@@ -886,6 +947,10 @@ static void meshy_tx_task(void *arg) {
             // ── Text message TX ──
             bool ok_to_mqtt = g_settings.meshy_ok_to_mqtt;
 
+            ESP_LOGI(TAG, "TX build: ch=%d to=0x%08lx text_len=%d hop=%d mqtt=%d",
+                     req.channel_idx, (unsigned long)req.to,
+                     (int)strlen(req.text), g_settings.meshy_hop_limit, ok_to_mqtt);
+
             static uint8_t frame[256];
             size_t frame_len = s_session.buildTextTx(
                 req.channel_idx, req.to, req.text, false, ok_to_mqtt, frame,
@@ -900,7 +965,30 @@ static void meshy_tx_task(void *arg) {
 
             if (transmit_frame(frame, frame_len)) {
                 s_stats.tx_packets++;
-                MESHY_LOGI("[TX] \"%s\"", req.text);
+                MESHY_LOGI("[TX] !%08lx id:%08lx \"%s\"",
+                          (unsigned long)s_session.node_num,
+                          (unsigned long)s_session.last_tx_id, req.text);
+
+                // Echo sent message into history so it appears on screen
+                if (s_msg_history) {
+                    meshy_msg_t echo;
+                    memset(&echo, 0, sizeof(echo));
+                    echo.from = s_session.node_num;
+                    echo.to = req.to;
+                    echo.id = s_session.last_tx_id;  // match actual TX packet ID
+                    echo.portnum = PORT_TEXT_MESSAGE;
+                    strncpy(echo.text, req.text, MESHY_MAX_TEXT - 1);
+                    echo.text_len = strlen(req.text);
+                    echo.rx_time_ms = esp_log_timestamp();
+                    echo.rx_count = 1;
+
+                    s_msg_history[s_msg_write_idx] = echo;
+                    s_msg_write_idx = (s_msg_write_idx + 1) % MESHY_MSG_HISTORY;
+                    if (s_msg_count < MESHY_MSG_HISTORY) s_msg_count++;
+
+                    // Also log to SD
+                    meshy_sd_log_msg(&echo);
+                }
             }
         } else {
             // ── Queue timeout (200ms) — check periodic NODEINFO ──
@@ -1174,6 +1262,12 @@ extern "C" int meshy_format_messages(char *buf, int bufsize) {
         return 0;
     }
 
+    // Compute wall-clock offset: current epoch minus boot ms
+    time_t now_epoch;
+    time(&now_epoch);
+    uint32_t now_ms = esp_log_timestamp();
+    bool have_time = (now_epoch > 1700000000);  // sanity: after ~2023
+
     // Walk ring buffer from oldest to newest
     int start = (s_msg_count < MESHY_MSG_HISTORY)
               ? 0
@@ -1183,9 +1277,20 @@ extern "C" int meshy_format_messages(char *buf, int bufsize) {
         int idx = (start + i) % MESHY_MSG_HISTORY;
         meshy_msg_t *m = &s_msg_history[idx];
 
-        // Look up sender name
+        // Compute message timestamp
+        char ts[8] = "";
+        if (have_time) {
+            time_t msg_epoch = now_epoch - (int32_t)(now_ms - m->rx_time_ms) / 1000;
+            struct tm t;
+            gmtime_r(&msg_epoch, &t);
+            snprintf(ts, sizeof(ts), "%02d:%02d ", t.tm_hour, t.tm_min);
+        }
+
+        // Look up sender name — show "You" for our own TX echoes
         const char *name = "???";
-        if (s_node_mutex) {
+        if (m->from == s_session.node_num) {
+            name = "You";
+        } else if (s_node_mutex) {
             xSemaphoreTake(s_node_mutex, portMAX_DELAY);
             for (int j = 0; j < s_node_count; j++) {
                 if (s_nodes[j].node_num == m->from && s_nodes[j].short_name[0]) {
@@ -1207,29 +1312,29 @@ extern "C" int meshy_format_messages(char *buf, int bufsize) {
         switch (m->portnum) {
             case PORT_TEXT_MESSAGE:
                 pos += snprintf(buf + pos, bufsize - pos,
-                    "[%s] %s%s\n", name, m->text, rx_suffix);
+                    "%s[%s] %s%s\n", ts, name, m->text, rx_suffix);
                 count++;
                 break;
             case PORT_POSITION:
                 if (m->has_position) {
                     pos += snprintf(buf + pos, bufsize - pos,
-                        "[%s] @ %.4f,%.4f %dm%s\n",
-                        name, m->lat, m->lon, (int)m->altitude, rx_suffix);
+                        "%s[%s] @ %.4f,%.4f %dm%s\n",
+                        ts, name, m->lat, m->lon, (int)m->altitude, rx_suffix);
                     count++;
                 }
                 break;
             case PORT_NODEINFO:
                 if (m->has_nodeinfo) {
                     pos += snprintf(buf + pos, bufsize - pos,
-                        "[%s] joined: %s%s\n", m->short_name, m->long_name, rx_suffix);
+                        "%s[%s] joined: %s%s\n", ts, m->short_name, m->long_name, rx_suffix);
                     count++;
                 }
                 break;
             case PORT_TELEMETRY:
                 if (m->has_telemetry) {
                     pos += snprintf(buf + pos, bufsize - pos,
-                        "[%s] bat:%lu%% %.1fV ch:%.0f%% air:%.0f%%%s\n",
-                        name, (unsigned long)m->battery_level, m->voltage,
+                        "%s[%s] bat:%lu%% %.1fV ch:%.0f%% air:%.0f%%%s\n",
+                        ts, name, (unsigned long)m->battery_level, m->voltage,
                         m->channel_util, m->air_util_tx, rx_suffix);
                     count++;
                 }

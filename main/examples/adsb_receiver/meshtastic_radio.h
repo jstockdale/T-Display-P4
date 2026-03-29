@@ -272,6 +272,7 @@ struct MeshSession {
     int32_t           freq_slot;    // -1 = hash-based, >= 0 = explicit slot override
     MeshChannelTable  channels;
     MeshPacketIdGen   id_gen;
+    uint32_t          last_tx_id = 0;  // packet ID from most recent buildTx
 
     void init(MeshRegion r, MeshModemPreset p, MeshRole rl, uint32_t node,
               int32_t slot = -1) {
@@ -380,6 +381,7 @@ struct MeshSession {
 
         // Encrypt
         uint32_t pkt_id = id_gen.next();
+        last_tx_id = pkt_id;
         const MeshChannel *ch = &channels.channels[channel_idx];
 
         if (ch->key.length > 0) {

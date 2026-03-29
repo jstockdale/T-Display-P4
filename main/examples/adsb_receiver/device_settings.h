@@ -26,7 +26,7 @@ extern "C" {
 #endif
 
 #define SETTINGS_NVS_NAMESPACE "device_settings"
-#define SETTINGS_VERSION       8    // bump when struct changes
+#define SETTINGS_VERSION       9    // bump when struct changes
 
 // ─── Settings structure ──────────────────────────────────────────────────────
 
@@ -81,10 +81,17 @@ typedef struct {
     bool     heartbeat_enabled;    // serial console heartbeat, default true
     uint8_t  heartbeat_period_s;   // heartbeat period in seconds (5-255), default 30
 
+    // ── WiFi ──
+    bool     wifi_enabled;         // enable WiFi via ESP-Hosted (C6), default false
+    char     wifi_ssid[33];        // SSID, null-terminated, default ""
+    char     wifi_pass[65];        // password, null-terminated, default ""
+    char     ntp_server[64];       // NTP server, default "pool.ntp.org"
+    uint16_t ntp_poll_s;           // NTP poll interval in seconds (300-3600), default 300
+
     // ── ADD NEW FIELDS HERE — consume _pad bytes, bump SETTINGS_VERSION ──
 
     // ── Reserved for future fields ──
-    uint8_t  _pad[955];
+    uint8_t  _pad[790];
 } device_settings_t;
 
 // Struct must be exactly 1024 bytes — adjust _pad if this fires
@@ -129,6 +136,11 @@ static inline void settings_apply_defaults(device_settings_t *s) {
     s->scope_max_aircraft = 0;   // unlimited
     s->heartbeat_enabled = true;
     s->heartbeat_period_s = 30;
+    s->wifi_enabled     = false;   // offline-first: WiFi off by default
+    s->wifi_ssid[0]     = '\0';
+    s->wifi_pass[0]     = '\0';
+    strncpy(s->ntp_server, "pool.ntp.org", sizeof(s->ntp_server));
+    s->ntp_poll_s       = 300;     // 5 minutes
 }
 
 // Legacy wrapper for any code that calls settings_defaults()
@@ -156,6 +168,12 @@ static inline void settings_validate(device_settings_t *s) {
     if (s->scope_fps_cap > 30) s->scope_fps_cap = 0;
     if (s->scope_max_aircraft > 64) s->scope_max_aircraft = 0;
     if (s->heartbeat_period_s < 5) s->heartbeat_period_s = 30;
+    // WiFi: ensure null-termination and valid poll interval
+    s->wifi_ssid[32] = '\0';
+    s->wifi_pass[64] = '\0';
+    s->ntp_server[63] = '\0';
+    if (s->ntp_server[0] == '\0') strncpy(s->ntp_server, "pool.ntp.org", sizeof(s->ntp_server));
+    if (s->ntp_poll_s < 300 || s->ntp_poll_s > 3600) s->ntp_poll_s = 300;
 }
 
 // ─── Global settings instance (defined in main.cpp) ──────────────────────────

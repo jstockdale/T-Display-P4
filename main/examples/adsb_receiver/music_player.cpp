@@ -742,6 +742,23 @@ void music_player_stop(void) {
     s_pause_requested = false;
 }
 
+void music_player_sd_close(void) {
+    music_player_stop();  // request stop (non-blocking)
+
+    // Wait for the play loop to actually exit (up to 2s)
+    // The play loop checks s_stop_requested each iteration (~10-50ms)
+    for (int i = 0; i < 200 && s_state != MUSIC_STATE_STOPPED; i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (s_state != MUSIC_STATE_STOPPED) {
+        ESP_LOGW("MUSIC", "Player did not stop within timeout — forcing readahead close");
+    }
+
+    // Close file handle (waits for any in-flight fread, then fclose).
+    // Safe to double-close: readahead_close checks s_readahead_fp before fclose.
+    readahead_close();
+}
+
 void music_player_pause(void) {
     if (s_state == MUSIC_STATE_PLAYING)
         s_pause_requested = true;
@@ -958,6 +975,19 @@ static void play_mp3(const char *path) {
 
             // Write decoded PCM to I2S
             size_t pcm_bytes = samples * channels * sizeof(int16_t);
+
+            // ES8311 is a mono codec — it only uses one I2S slot (left).
+            // Downmix stereo L+R into both slots so no content is lost.
+            if (channels == 2) {
+                for (int i = 0; i < samples; i++) {
+                    int32_t L = pcm[i * 2];
+                    int32_t R = pcm[i * 2 + 1];
+                    int16_t mono = (int16_t)((L + R) / 2);
+                    pcm[i * 2]     = mono;
+                    pcm[i * 2 + 1] = mono;
+                }
+            }
+
             ES8311->write_data(pcm, pcm_bytes);
         }
 
@@ -1081,6 +1111,19 @@ static void play_wav(const char *path) {
 
         size_t got = readahead_read(buf, to_read);
         if (got == 0) break;
+
+        // ES8311 is a mono codec — downmix stereo WAV to mono in-place
+        if (hdr.num_channels == 2) {
+            int16_t *samples = (int16_t *)buf;
+            size_t n_frames = got / (2 * sizeof(int16_t));  // stereo frames
+            for (size_t i = 0; i < n_frames; i++) {
+                int32_t L = samples[i * 2];
+                int32_t R = samples[i * 2 + 1];
+                int16_t mono = (int16_t)((L + R) / 2);
+                samples[i * 2]     = mono;
+                samples[i * 2 + 1] = mono;
+            }
+        }
 
         ES8311->write_data(buf, got);
         bytes_remaining -= got;

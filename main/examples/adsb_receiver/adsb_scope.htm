@@ -38,15 +38,17 @@
   #panel-drag::after{content:'';width:40px;height:3px;background:var(--panel-border);border-radius:2px}
   #panel-drag:hover::after{background:var(--text-dim)}
   #panel-toggle{width:100%;padding:4px 8px;background:none;border:none;color:var(--text-dim);font-family:inherit;font-size:11px;cursor:pointer;text-align:center;letter-spacing:1px;text-transform:uppercase;flex-shrink:0;min-height:32px;touch-action:manipulation}
-  #panel-scroll{flex:1;overflow:auto;-webkit-overflow-scrolling:touch}
+  #panel-scroll{flex:1;overflow:auto;-webkit-overflow-scrolling:touch;outline:none}
   #ac-table{width:100%;border-collapse:collapse;font-size:11px;min-width:700px}
   #ac-table th{position:sticky;top:0;background:var(--panel);color:var(--text-dim);text-align:left;padding:6px 10px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;font-size:10px;border-bottom:1px solid var(--panel-border)}
   #ac-table td{padding:5px 10px;border-bottom:1px solid rgba(30,42,54,0.4);white-space:nowrap}
   #ac-table tr:hover td{background:var(--accent-dim);cursor:pointer}
-  #ac-table tr.selected td{background:rgba(77,171,247,0.15)}
+  #ac-table tr.selected td{background:rgba(77,171,247,0.15);border-bottom-color:rgba(77,171,247,0.08)}
+  #ac-table tr.kb-focus{outline:1px solid var(--accent);outline-offset:-1px;position:relative;z-index:1}
+  #ac-table tr.kb-focus td{border-bottom-color:transparent}
   .col-icao{font-weight:600}.col-cs{color:var(--text);font-weight:600}.col-alt{color:var(--accent)}
   #ac-table th{cursor:pointer;user-select:none;white-space:nowrap}#ac-table th:hover{color:var(--accent)}
-  #ac-table th span{font-size:9px;opacity:0.6}
+  #ac-table th span{font-size:9px;opacity:0.6;display:inline-block;width:10px;text-align:center}
   .col-vr.climbing{color:var(--accent)}.col-vr.descending{color:var(--warning)}.col-dist{color:var(--text-dim)}
   .leaflet-div-icon{background:none!important;border:none!important}
   .leaflet-control-zoom{display:none!important}
@@ -60,12 +62,14 @@
   #legend .lrange{display:flex;justify-content:space-between;font-size:9px}
   #gnss-info{position:absolute;top:66px;left:12px;z-index:999;background:rgba(17,24,32,0.9);border:1px solid var(--panel-border);border-radius:6px;padding:8px 12px;font-size:11px;color:var(--text-dim);line-height:1.6}
   #gnss-info .fix{color:var(--accent);font-weight:600}#gnss-info .nofix{color:var(--warning);font-weight:600}
+  #gnss-info .utc-none{color:var(--text-dim)}#gnss-info .utc-live{color:var(--accent);font-weight:600}#gnss-info .utc-stale{color:#ff6b6b;font-weight:600}
   #session-panel{position:absolute;top:52px;right:12px;z-index:999;font-size:10px;font-family:'JetBrains Mono',monospace;line-height:1.5;display:none;grid-template-columns:auto auto;gap:0 6px;background:rgba(17,24,32,0.85);border:1px solid var(--panel-border);border-radius:4px;padding:4px 8px}
   #session-panel.visible{display:grid}
   #session-panel .sess-on{color:var(--accent)}#session-panel .sess-off{color:#ff6b6b}
   #sd-info{color:var(--text-dim);font-size:10px;margin-top:4px;padding-top:4px;border-top:1px solid var(--panel-border)}
-  #sd-info .sd-ok{color:var(--accent)}#sd-info .sd-err{color:var(--warning)}#sd-info .sd-wait{color:var(--text-dim)}
-  #detail-wrap{position:absolute;top:66px;right:12px;bottom:40vh;z-index:1000;overflow-y:auto;overflow-x:hidden;display:none;flex-direction:column;gap:8px;width:240px;padding-bottom:8px;-webkit-overflow-scrolling:touch}
+  #sd-info #sd-logs{display:inline-block;vertical-align:top}
+  #sd-info .sd-ok{color:var(--accent)}#sd-info .sd-meshy{color:var(--blue)}#sd-info .sd-err{color:var(--warning)}#sd-info .sd-wait{color:var(--text-dim)}
+  #detail-wrap{position:absolute;top:66px;right:12px;bottom:calc(var(--panel-h, 35vh) + 8px);z-index:1000;overflow-y:auto;overflow-x:hidden;display:none;flex-direction:column;gap:8px;width:240px;padding-bottom:8px;-webkit-overflow-scrolling:touch}
   #detail-wrap.visible{display:flex}
   .det-card{background:rgba(17,24,32,0.95);border:1px solid var(--panel-border);border-radius:6px;padding:10px 14px;font-size:12px;color:var(--text);line-height:1.7;flex-shrink:0}
   .det-card .dh{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;border-bottom:1px solid var(--panel-border);padding-bottom:4px}
@@ -95,6 +99,7 @@
   .meshy-msg{padding:1px 0;cursor:pointer}.meshy-msg:hover{background:rgba(0,229,160,0.05)}
   .meshy-msg.selected{background:rgba(77,171,247,0.12);border-left:2px solid var(--blue);padding-left:4px}
   .meshy-msg .mn{color:var(--blue);font-weight:600}.meshy-msg .mt{color:var(--text)}.meshy-msg .mp{color:var(--text-dim)}.meshy-msg .mj{color:var(--blue);font-style:italic}
+  .meshy-msg .mts{color:var(--text-dim);font-size:9px;opacity:0.5;margin-right:3px;font-variant-numeric:tabular-nums}
   .meshy-msg .mr{color:var(--text-dim);font-size:9px;opacity:0.5}.meshy-msg .mx{color:var(--accent);font-size:9px;font-weight:600;cursor:pointer;padding:2px 4px;border-radius:3px}.meshy-msg .mx:hover{background:rgba(0,229,160,0.2)}
   .meshy-msg .ml{color:var(--blue);font-size:9px;opacity:0.6;margin-right:2px}
   .meshy-msg .md{display:none;padding:2px 0 2px 12px;font-size:9px;color:var(--text-dim);line-height:1.3;border-left:1px solid var(--panel-border);margin:1px 0 1px 4px}
@@ -209,7 +214,7 @@
 </head>
 <body>
 <div id="topbar">
-  <div class="logo">ADS-B SCOPE <span>/ Off by One <span class="scope-ver">v1.0.5</span></span></div>
+  <div class="logo">ADS-B SCOPE <span>/ Off by One <span class="scope-ver">v1.0.6</span></span></div>
   <div id="stats-bar">
     <div class="stat"><span>AC</span><span class="val live" id="ac-count">0</span></div>
     <div class="stat hm"><span>MSG</span><span class="val" id="msg-count">0</span></div>
@@ -229,31 +234,32 @@
   <button id="mesh-map-btn" onclick="toggleMeshyMap()" title="Show Meshtastic nodes on map">⬡ MESH</button>
   <div id="topbar-spacer"></div>
   <div id="topbar-right">
-    <button class="topbtn" id="log-btn" onclick="toggleLog()">Log</button>
-    <button class="topbtn" id="files-btn" onclick="toggleFiles()">Files</button>
-    <button class="topbtn" id="meshy-btn" onclick="toggleMeshy()">Meshy</button>
-    <button id="csv-btn" onclick="document.getElementById('csv-file').click()">Load CSV</button>
+    <button class="topbtn" id="log-btn" onclick="toggleLog()" title="Toggle serial log panel">Log</button>
+    <button class="topbtn" id="files-btn" onclick="toggleFiles()" title="Browse SD card files">Files</button>
+    <button class="topbtn" id="meshy-btn" onclick="toggleMeshy()" title="Meshtastic messages and nodes">Meshy</button>
+    <button id="csv-btn" onclick="document.getElementById('csv-file').click()" title="Load ADS-B CSV log from file">Load CSV</button>
     <input type="file" id="csv-file" accept=".csv" multiple style="display:none" onchange="loadCSV(this)">
-    <button class="topbtn" id="flash-btn" onclick="toggleFlash()">Flash<span id="flash-badge"></span></button>
-    <button id="connect-btn" onclick="toggleSerial()">Connect Serial</button>
+    <button class="topbtn" id="flash-btn" onclick="toggleFlash()" title="Flash firmware to device">Flash<span id="flash-badge"></span></button>
+    <button class="topbtn" id="screenshot-btn" onclick="takeScreenshot()" title="Save device screenshot">📸</button>
+    <button id="connect-btn" onclick="toggleSerial()" title="Connect to device via WebSerial">Connect Serial</button>
   </div>
 </div>
 <div id="timeline">
-  <button id="tl-play" onclick="tlToggle()">▶</button>
-  <button onclick="tlSpeed(-1)">−</button>
+  <button id="tl-play" onclick="tlToggle()" title="Play/pause CSV timeline">▶</button>
+  <button onclick="tlSpeed(-1)" title="Slow down playback">−</button>
   <span class="tl-speed" id="tl-speed">1×</span>
-  <button onclick="tlSpeed(1)">+</button>
+  <button onclick="tlSpeed(1)" title="Speed up playback">+</button>
   <input type="range" id="tl-scrub" min="0" max="1000" value="0" oninput="tlScrub(this.value)">
   <span class="tl-time" id="tl-time">--:--:--</span>
-  <button onclick="tlClose()">✕</button>
+  <button onclick="tlClose()" title="Close timeline">✕</button>
 </div>
-<div id="gnss-info">RX: <span id="gnss-status" class="nofix">No fix</span><br><span id="gnss-detail"></span>
-<div id="sd-info">SD: <span id="sd-status" class="sd-wait">waiting</span></div>
+<div id="gnss-info"><span style="color:var(--text-dim)">Last: </span><span id="gnss-utc" title="Device UTC clock" class="utc-none">--:--:-- UTC</span><br><span title="GPS receiver status and satellite count">RX: <span id="gnss-status" class="nofix">No fix</span></span><br><span id="gnss-detail" title="Horizontal dilution of precision and receiver coordinates"></span>
+<div id="sd-info">SD: <div id="sd-logs"></div></div>
 </div>
 <div id="detail-wrap"></div>
 <div id="session-panel"></div>
 <div id="log-panel">
-  <div id="log-header"><span>Serial Log</span><div style="display:flex;gap:4px"><button onclick="clearLog()">⌫</button><button onclick="toggleLog()">✕</button></div></div>
+  <div id="log-header"><span>Serial Log</span><div style="display:flex;gap:4px"><button onclick="clearLog()" title="Clear log">⌫</button><button onclick="toggleLog()" title="Close log panel">✕</button></div></div>
   <div id="log-controls">
     <label><input type="checkbox" id="f-a" checked onchange="refilterLog()"> ADS-B</label>
     <label><input type="checkbox" id="f-g" checked onchange="refilterLog()"> GNSS</label>
@@ -264,7 +270,7 @@
   <div id="log-output"></div>
 </div>
 <div id="meshy-panel">
-  <div id="meshy-header"><span>Meshy</span><div style="display:flex;gap:4px"><button onclick="clearMeshy()">⌫</button><button onclick="toggleMeshy()">✕</button></div></div>
+  <div id="meshy-header"><span>Meshy</span><div style="display:flex;gap:4px"><button onclick="clearMeshy()" title="Clear messages">⌫</button><button onclick="toggleMeshy()" title="Close Meshy panel">✕</button></div></div>
   <div id="meshy-stats">Waiting for data...</div>
   <div id="meshy-controls">
     <label><input type="checkbox" id="mf-text" checked onchange="refilterMeshy()"> Text</label>
@@ -275,7 +281,7 @@
   <div id="meshy-output"></div>
   <div id="meshy-tx-bar">
     <input type="text" id="meshy-tx-input" placeholder="Send message..." maxlength="230" autocomplete="off" onkeydown="if(event.key==='Enter')meshyTxSend()">
-    <button id="meshy-tx-btn" onclick="meshyTxSend()">Send</button>
+    <button id="meshy-tx-btn" onclick="meshyTxSend()" title="Send Meshtastic broadcast message">Send</button>
   </div>
 </div>
 <div id="legend">
@@ -301,7 +307,7 @@
 </div>
 <div id="flash-overlay" onclick="toggleFlash()"></div>
 <div id="flash-panel">
-  <div id="flash-header"><span>Firmware Update</span><div style="display:flex;align-items:center;gap:8px"><span style="font-size:10px;color:var(--text-dim);font-weight:400;text-transform:none;letter-spacing:0">ADS-B Scope v1.0.5</span><button onclick="toggleFlash()">✕</button></div></div>
+  <div id="flash-header"><span>Firmware Update</span><div style="display:flex;align-items:center;gap:8px"><span style="font-size:10px;color:var(--text-dim);font-weight:400;text-transform:none;letter-spacing:0">ADS-B Scope v1.0.6</span><button onclick="toggleFlash()" title="Close firmware panel">✕</button></div></div>
   <div id="flash-body">
     <div class="flash-row"><span class="fl">Device Version</span><span class="fv" id="flash-dev-ver">–</span></div>
     <div class="flash-row"><span class="fl">Latest Version</span><span class="fv" id="flash-latest-ver">–</span></div>
@@ -313,18 +319,18 @@
     </div>
     <div id="flash-log"></div>
     <div id="flash-actions">
-      <button class="flash-btn secondary" onclick="document.getElementById('flash-file').click()">Local .bin</button>
+      <button class="flash-btn secondary" onclick="document.getElementById('flash-file').click()" title="Select a local firmware binary">Local .bin</button>
       <input type="file" id="flash-file" accept=".bin" style="display:none" onchange="flashLocalFile(this)">
-      <button class="flash-btn primary" id="flash-go-btn" onclick="startFlash()">Flash Latest</button>
+      <button class="flash-btn primary" id="flash-go-btn" onclick="startFlash()" title="Download and flash latest firmware">Flash Latest</button>
     </div>
   </div>
 </div>
 <div id="map"></div>
 <div id="panel">
   <div id="panel-drag"></div>
-  <button id="panel-toggle" onclick="togglePanel()">▲ Aircraft ▲</button>
-  <div id="panel-scroll">
-  <table id="ac-table"><thead><tr><th onclick="tblSort('icao')">ICAO <span id="sh-icao"></span></th><th onclick="tblSort('cs')">Callsign <span id="sh-cs"></span></th><th onclick="tblSort('alt')">Alt <span id="sh-alt"></span></th><th onclick="tblSort('spd')">Spd <span id="sh-spd"></span></th><th onclick="tblSort('hdg')">Hdg <span id="sh-hdg"></span></th><th onclick="tblSort('vr')">V/S <span id="sh-vr"></span></th><th onclick="tblSort('dist')">Dist <span id="sh-dist"></span></th><th onclick="tblSort('brg')">Brg <span id="sh-brg"></span></th><th onclick="tblSort('age')">Age <span id="sh-age"></span></th></tr></thead><tbody id="ac-tbody"></tbody></table>
+  <button id="panel-toggle" onclick="togglePanel()" title="Show/hide aircraft table">▲ Aircraft ▲</button>
+  <div id="panel-scroll" tabindex="0">
+  <table id="ac-table"><thead><tr><th onclick="tblSort('icao')">ICAO <span id="sh-icao"></span></th><th onclick="tblSort('cs')">Callsign <span id="sh-cs"></span></th><th onclick="tblSort('alt')">Alt <span id="sh-alt"></span></th><th onclick="tblSort('spd')">Spd <span id="sh-spd"></span></th><th onclick="tblSort('hdg')">Hdg <span id="sh-hdg"></span></th><th onclick="tblSort('vr')">V/S <span id="sh-vr"></span></th><th onclick="tblSort('dist')">Dist <span id="sh-dist"></span></th><th onclick="tblSort('brg')">Brg <span id="sh-brg"></span></th><th onclick="tblSort('age')">Age <span id="sh-age"></span></th><th onclick="tblSort('msgs')">Msgs <span id="sh-msgs"></span></th></tr></thead><tbody id="ac-tbody"></tbody></table>
   </div>
 </div>
 <script>
@@ -332,7 +338,11 @@ const SCOPE_VERSION='1.0.5';
 const A=new Map();let rxP=null,map,rxM,rxR=[],rxRL=[],meshyR=[],meshyRL=[],port,reader,conn=false,totM=0,mTs=[],logN=0,selSet=new Set(),cMode='mono',lMode='alt';
 let sessStart=null,sessEnd=null; // session timestamps
 let consoleReady=false; // set when firmware prints "Serial console ready"
-const EXP=180000,TMAX=60,LMAX=1000;
+let rxTrail=[],rxTrailLine=null; // receiver position history [{lat,lon,ts}]
+let deviceUtcMs=null; // latest UTC from device serial timestamps
+let lastSerialMs=0;  // browser time of last serial line received
+const icaoDb=new Map(); // aircraft DB cache: icao → {reg,tc,mfr,model,owner,op}
+const EXP=180000,LMAX=1000;
 
 // Haversine distance in nm between two lat/lon points
 function distNm(lat1,lon1,lat2,lon2){
@@ -439,14 +449,22 @@ function acStale(ac,sel){
   if(sel)return{opacity:0.55,gray:true};
   return{opacity:0.35,gray:true};                   // stale/gray
 }
-function mkIcon(h,c,sel,st){
+function mkIcon(h,c,sel,st,ic){
   const s=sel?24:18;
   const col=st?.gray?(sel?'#99a':'#667'):c;
   const op=st?st.opacity:1;
   const g=sel?`filter:drop-shadow(0 0 8px ${col})drop-shadow(0 0 3px #fff);`:`filter:drop-shadow(0 0 4px ${col}55);`;
+  const db=ic?icaoDb.get(ic):null;
+  const isHeli=db&&db.cls==='H';
   if(h==null){
-    // No heading data – show a dot instead of a misleading arrow
+    // No heading data – show a dot
     return L.divIcon({html:`<div style="display:flex;align-items:center;justify-content:center;width:${s}px;height:${s}px;font-size:${Math.round(s*0.5)}px;color:${col};opacity:${op};${g}">●</div>`,iconSize:[s,s],iconAnchor:[s/2,s/2],className:''});
+  }
+  if(isHeli){
+    // Helicopter top-down silhouette (facing east like ✈, rotated by heading)
+    // Body/nose at right, tail boom extends left, rotor blades cross through body
+    const r=h-90;
+    return L.divIcon({html:`<div style="display:flex;align-items:center;justify-content:center;width:${s}px;height:${s}px;opacity:${op};${g}"><svg width="${s}" height="${s}" viewBox="0 0 24 24" style="transform:rotate(${r}deg)"><g fill="none" stroke="${col}" stroke-width="1.3" stroke-linecap="round"><ellipse cx="14" cy="12" rx="5" ry="2.2" fill="${col}" stroke="none"/><line x1="9" y1="12" x2="3" y2="12"/><line x1="3" y1="9" x2="3" y2="15"/><line x1="20" y1="5.5" x2="8" y2="18.5" opacity="0.7"/><line x1="20" y1="18.5" x2="8" y2="5.5" opacity="0.7"/></g></svg></div>`,iconSize:[s,s],iconAnchor:[s/2,s/2],className:''});
   }
   return L.divIcon({html:`<div style="display:flex;align-items:center;justify-content:center;width:${s}px;height:${s}px;font-size:${s}px;color:${col};opacity:${op};${g}"><div style="transform:rotate(${h-90}deg);line-height:1">✈</div></div>`,iconSize:[s,s],iconAnchor:[s/2,s/2],className:''});
 }
@@ -508,14 +526,14 @@ function updAc(ic,ac){
   const to=sel?Math.max(st.opacity,0.8):(st.gray?0.2:st.opacity*0.6);
   const hdg=ac.hdg!=null?ac.hdg:trailHdg(ac);
   if(!ac.mk){
-    ac.mk=L.marker([ac.lat,ac.lon],{icon:mkIcon(hdg,c,sel,st)}).addTo(map);
+    ac.mk=L.marker([ac.lat,ac.lon],{icon:mkIcon(hdg,c,sel,st,ic)}).addTo(map);
     ac.tr=L.layerGroup().addTo(map);
     if(!ac.trPts)ac.trPts=[];
     ac.lb=L.marker([ac.lat,ac.lon],{icon:mkLbl(ic,ac,c,st),interactive:true}).addTo(map);
     ac.lb.on('click',(e)=>sel0(ic,e.originalEvent));
     ac.mk.on('click',(e)=>sel0(ic,e.originalEvent));
   }else{
-    ac.mk.setLatLng([ac.lat,ac.lon]).setIcon(mkIcon(hdg,c,sel,st));
+    ac.mk.setLatLng([ac.lat,ac.lon]).setIcon(mkIcon(hdg,c,sel,st,ic));
     ac.lb.setLatLng([ac.lat,ac.lon]).setIcon(mkLbl(ic,ac,c,st));
   }
   const z=acZ(ic,ac);
@@ -523,15 +541,14 @@ function updAc(ic,ac){
   ac.lb.setZIndexOffset(z);
   if(!ac.trPts)ac.trPts=[];
   const pts=ac.trPts,la=pts.length?pts[pts.length-1]:null;
-  let added=false,shifted=false;
+  let added=false;
   if(!la||la.lat!==ac.lat||la.lng!==ac.lon){
     pts.push({lat:ac.lat,lng:ac.lon,alt:ac.alt,speed:ac.speed});
     added=true;
-    if(pts.length>TMAX){pts.shift();shifted=true}
   }
   const prevLen=added?pts.length-1:pts.length;
   const needRebuild=!ac._trCM||ac._trCM!==cMode||ac._trGray!==st.gray
-    ||ac._trSel!==sel||ac._trTw!==tw||ac._trTo!==to||shifted
+    ||ac._trSel!==sel||ac._trTw!==tw||ac._trTo!==to
     ||ac._trLen!==prevLen;
   if(needRebuild){
     rebuildTrail(ic,ac,sel,st,tw,to);
@@ -554,6 +571,11 @@ function sel0(ic,ev){
   cleanExpired();
   for(const[i,a]of A)updAc(i,a);
   updDet();
+  // Sync keyboard focus to clicked row and focus container for arrow keys
+  const rows=document.querySelectorAll('#ac-tbody tr');
+  for(let j=0;j<rows.length;j++){if(rows[j].dataset.ic===ic){kbFocusIdx=j;break}}
+  kbApplyFocus();
+  document.getElementById('panel-scroll').focus({preventScroll:true});
 }
 function deselOne(ic){selSet.delete(ic);cleanExpired();for(const[i,a]of A)updAc(i,a);updDet()}
 function desel(){selSet.clear();cleanExpired();updDet();for(const[i,a]of A)updAc(i,a)}
@@ -576,8 +598,13 @@ function updDet(){
     const vrText=ac.vr?(ac.vr>0?'+':'')+ac.vr+' fpm':'---';
     const vrCls=ac.vr>0?'up':ac.vr<0?'dn':'';
     const pos=ac.hasPos?`${Math.abs(ac.lat).toFixed(4)}°${ac.lat>=0?'N':'S'} ${Math.abs(ac.lon).toFixed(4)}°${ac.lon>=0?'E':'W'}`:'---';
+    const db=icaoDb.get(ic);
     return`<div class="det-card">
-      <div class="dh"><div><span class="dcs" style="color:${c}">${ac.cs||'---'}</span> <span class="dicao">${ic}</span></div><button class="dx" onclick="deselOne('${ic}')">✕</button></div>
+      <div class="dh"><div><span class="dcs" style="color:${c}">${ac.cs||'---'}</span> <span class="dicao">${ic}</span></div><button class="dx" title="Deselect aircraft" onclick="deselOne('${ic}')">✕</button></div>
+      ${db?`<div class="dr"><span class="dl">Reg</span><span class="dv">${db.reg||'---'}</span></div>
+      <div class="dr"><span class="dl">Type</span><span class="dv">${db.tc?db.tc+(db.model?' – '+db.model:''):'---'}</span></div>
+      ${db.owner?`<div class="dr"><span class="dl">Owner</span><span class="dv">${db.owner}</span></div>`:''}
+      ${db.op?`<div class="dr"><span class="dl">Operator</span><span class="dv">${db.op}</span></div>`:''}`:''}
       <div class="dr"><span class="dl">Altitude</span><span class="dv">${ac.alt!=null?ac.alt.toLocaleString()+' ft':'---'}</span></div>
       <div class="dr"><span class="dl">Speed</span><span class="dv">${ac.speed?ac.speed+' kt':'---'}</span></div>
       <div class="dr"><span class="dl">Heading</span><span class="dv">${ac.hdg!=null?ac.hdg+'°':'---'}</span></div>
@@ -590,7 +617,7 @@ function updDet(){
 }
 
 // --- Parse ---
-const GR=/\[GNSS\] fix=(\w+) lat=([\d.-]+) lon=([\d.-]+) sats=(\d+) hdop=([\d.]+) q=(-?\d+)/;
+const GR=/GNSS: fix=(\w+) lat=([\d.-]+) lon=([\d.-]+) sats=(\d+) hdop=([\d.]+) q=(-?\d+)/;
 const MR=/^[\[(].+?[\])] ([0-9A-F]{6})\s*/;
 const AR=/\s(-?\d+)ft/,SR=/\s(\d+)kt\s+(\d+)°/,VR=/\s([+-]\d+)fpm/;
 const PR=/\((\d+\.\d+)([NS]),(\d+\.\d+)([EW])\)/,DR=/(\d+\.\d+)nm@(\d+)°/;
@@ -598,8 +625,11 @@ const PR=/\((\d+\.\d+)([NS]),(\d+\.\d+)([EW])\)/,DR=/(\d+\.\d+)nm@(\d+)°/;
 function parse(l){
   // Detect device reboot – reset all status indicators, expire all aircraft
   if(/^ESP-ROM:|^rst:0x/.test(l)){
-    updSD('wait',null);
-    rxP=null;updGnss();
+    updSD('card','wait',null);
+    rxP=null;deviceUtcMs=null;
+    if(rxTrailLine){map.removeLayer(rxTrailLine);rxTrailLine=null;}
+    rxTrail=[];
+    updGnss();
     for(const[ic,ac]of A){if(!ac.expired){rmAc(ac);ac.expired=true}}
     selSet.clear();
     deviceVersion='';updFlashVer();
@@ -620,38 +650,48 @@ function parse(l){
     const el=document.getElementById('flash-dev-ver');
     if(el&&deviceVersion)el.textContent=deviceVersion+' ('+ctM[1].trim()+')';
   }
-  // SD card status – check failures first (some contain substrings of success patterns)
+  // SD card status – distinguish ADS-B vs Meshy log events
   if(/Failed to reopen/.test(l)){
-    // Had a log, lost it (e.g. card removed mid-write)
+    const isMeshy=/meshy/i.test(l);
     const fn=l.match(/(\/\S+\.csv)/);
-    updSD('lost',fn?fn[1]:null);
+    updSD(isMeshy?'meshy':'adsb','lost',fn?fn[1]:null);
+  }else if(/Failed.*open meshy SD log/.test(l)){
+    updSD('meshy','fail',null);
   }else if(/Failed.*open SD log/.test(l)){
-    // Never opened – card not mounted or filesystem issue
-    updSD('no-card',null);
+    updSD('adsb','fail',null);
   }else if(/failed to mount filesystem|sdmmc_card_init failed|Sdmmc_Init fail/.test(l)){
-    updSD('no-card',null);
+    updSD('card','no-card',null);
   }else if(/SD mount attempt (\d+) failed/.test(l)){
     const m=l.match(/attempt (\d+)/);
-    updSD('retrying',m?m[1]:null);
+    updSD('card','retrying',m?m[1]:null);
+  }else if(/Meshy SD log renamed:/.test(l)){
+    const fn=l.match(/→ (\/\S+)/);
+    updSD('meshy',true,fn?fn[1]:null);
   }else if(/SD log renamed:/.test(l)){
     const fn=l.match(/→ (\/\S+)/);
-    updSD(true,fn?fn[1]:null);
+    updSD('adsb',true,fn?fn[1]:null);
+  }else if(/Meshy SD log: \//.test(l)){
+    const fn=l.match(/Meshy SD log: (\/\S+)/);
+    updSD('meshy',true,fn?fn[1]:null);
   }else if(/SD log: \//.test(l)){
     const fn=l.match(/SD log: (\/\S+)/);
-    updSD(true,fn?fn[1]:null);
+    updSD('adsb',true,fn?fn[1]:null);
   }else if(/filesystem mounted/.test(l)){
-    updSD('mounted',null);
+    updSD('card','mounted',null);
   }
   const gm=GR.exec(l);
-  if(gm){const la=parseFloat(gm[2]),lo=parseFloat(gm[3]);if(gm[1]==='A'&&la&&lo){rxP={lat:la,lon:lo,sats:parseInt(gm[4]),hdop:parseFloat(gm[5]),fix:true};updRx();if(!map._p&&!map._userMoved){map.setView([la,lo],11);map._p=true}if(meshyConfig.node)updateNodePosition(meshyConfig.node,la,lo,0)}updGnss();return}
+  if(gm){const la=parseFloat(gm[2]),lo=parseFloat(gm[3]);if(gm[1]==='A'&&la&&lo){const dts=parseDeviceTs(l)||Date.now();rxP={lat:la,lon:lo,sats:parseInt(gm[4]),hdop:parseFloat(gm[5]),fix:true,ts:dts};const prev=rxTrail.length?rxTrail[rxTrail.length-1]:null;if(!prev||prev.lat!==la||prev.lon!==lo){rxTrail.push({lat:la,lon:lo,ts:dts})}updRx();if(!map._p&&!map._userMoved){map.setView([la,lo],11);map._p=true}if(meshyConfig.node)updateNodePosition(meshyConfig.node,la,lo,0)}updGnss();return}
+  // Aircraft DB cache — parse ICAO: lines from firmware
+  const icaoM=/ICAO: ([0-9A-F]{6})\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)(?:\|([^|]*))?/.exec(l);
+  if(icaoM){icaoDb.set(icaoM[1],{reg:icaoM[2],tc:icaoM[3],mfr:icaoM[4],model:icaoM[5],owner:icaoM[6],op:icaoM[7],cls:icaoM[8]||'?'});if(selSet.has(icaoM[1]))updDet();return}
   const mm=MR.exec(l);if(!mm)return;
   const ic=mm[1],af=l.substring(mm[0].length),cm=af.match(/^([\w]{2,8})\s/),cs=(cm&&/[A-Z]/.test(cm[1]))?cm[1]:null;
   totM++;
   let ac=A.get(ic);
-  if(!ac){ac={cs:null,alt:null,speed:null,hdg:null,vr:null,lat:null,lon:null,hasPos:false,expired:false,dist:null,brg:null,ls:Date.now(),mk:null,lb:null,tr:null,trPts:[]};A.set(ic,ac)}
-  ac.ls=Date.now();if(cs)ac.cs=cs;
+  if(!ac){ac={cs:null,alt:null,speed:null,hdg:null,vr:null,lat:null,lon:null,hasPos:false,expired:false,dist:null,brg:null,ls:Date.now(),msgs:0,mk:null,lb:null,tr:null,trPts:[]};A.set(ic,ac)}
+  ac.ls=Date.now();ac.msgs++;if(cs)ac.cs=cs;
   // Revive if expired – new message means it's back
-  if(ac.expired){ac.expired=false;ac.mk=null;ac.lb=null;ac.tr=null;ac.trPts=[];}
+  if(ac.expired){ac.expired=false;ac.mk=null;ac.lb=null;ac.tr=null;}
   let m;
   if(m=AR.exec(l))ac.alt=parseInt(m[1]);
   if(m=SR.exec(l)){ac.speed=parseInt(m[1]);ac.hdg=parseInt(m[2])}
@@ -703,6 +743,15 @@ function updRx(){
       rxRL[i].setLatLng([rxP.lat+latOffset,rxP.lon]);
       meshyRL[i].setLatLng([rxP.lat+latOffset,rxP.lon]);
     });
+  }
+  // Receiver trail — shows movement history
+  if(rxTrail.length>=2){
+    const latlngs=rxTrail.map(p=>[p.lat,p.lon]);
+    if(!rxTrailLine){
+      rxTrailLine=L.polyline(latlngs,{color:'#00e5a0',weight:2.5,opacity:0.6,dashArray:'1 6',lineCap:'round',interactive:false}).addTo(map);
+    }else{
+      rxTrailLine.setLatLngs(latlngs);
+    }
   }
 }
 // Show rings only up to the first ring that covers all targets.
@@ -817,32 +866,69 @@ function updRxRings(){
   });
 }
 function updGnss(){
-  const s=document.getElementById('gnss-status'),d=document.getElementById('gnss-detail');
-  if(rxP?.fix){s.textContent=`Fix (${rxP.sats} sats)`;s.className='fix';d.textContent=`HDOP ${rxP.hdop} | ${rxP.lat.toFixed(4)}°, ${rxP.lon.toFixed(4)}°`}
-  else{s.textContent='No fix';s.className='nofix';d.textContent='Acquiring...'}
+  const s=document.getElementById('gnss-status'),d=document.getElementById('gnss-detail'),u=document.getElementById('gnss-utc');
+  if(rxP?.fix){
+    s.textContent=`Fix (${rxP.sats} sats)`;s.className='fix';
+    const latD=Math.abs(rxP.lat).toFixed(4);
+    const latH=rxP.lat>=0?'N':'S';
+    const lonD=Math.abs(rxP.lon).toFixed(4);
+    const lonH=rxP.lon>=0?'E':'W';
+    d.textContent=`HDOP ${rxP.hdop} | ${latD}°${latH}, ${lonD}°${lonH}`;
+    d.title=`Horizontal dilution of precision: ${rxP.hdop}\nReceiver: ${latD}°${latH}, ${lonD}°${lonH}`;
+  }
+  else{s.textContent='No fix';s.className='nofix';d.textContent='Acquiring...';d.title='Waiting for GPS satellite fix'}
+  // UTC clock: gray=no time, green=live, red=stale (>5s no data or disconnected)
+  if(!deviceUtcMs){
+    u.textContent='--:--:-- UTC';u.className='utc-none';
+    u.title='No UTC time received yet';
+  }else{
+    const dt=new Date(deviceUtcMs);
+    const hh=String(dt.getUTCHours()).padStart(2,'0');
+    const mm=String(dt.getUTCMinutes()).padStart(2,'0');
+    const ss=String(dt.getUTCSeconds()).padStart(2,'0');
+    const age=Date.now()-lastSerialMs;
+    const stale=!conn||age>5000;
+    u.textContent=`${hh}:${mm}:${ss} UTC`;
+    u.className=stale?'utc-stale':'utc-live';
+    u.title=stale?`Last device time (stale — ${conn?'no data for '+(age/1000|0)+'s':'disconnected'})`:'Device clock (UTC) from serial data';
+  }
 }
 
-let sdActiveFile='';
-function updSD(ok,path){
-  const el=document.getElementById('sd-status');
-  if(ok===true){
-    const short=path?path.replace('/sdcard/',''):'logging';
-    el.textContent='● '+short;el.className='sd-ok';
-    sdActiveFile=short;
-  }else if(ok==='wait'){
-    el.textContent='waiting';el.className='sd-wait';sdActiveFile='';
-  }else if(ok==='mounted'){
-    el.textContent='mounted, waiting for log';el.className='sd-wait';
-  }else if(ok==='retrying'){
-    el.textContent='✕ mount retry #'+path;el.className='sd-err';
-  }else if(ok==='no-card'){
-    el.textContent='✕ no card / mount failed';el.className='sd-err';sdActiveFile='';
-  }else if(ok==='lost'){
-    const short=path?path.replace('/sdcard/',''):'log lost';
-    el.textContent='✕ '+short+' (lost)';el.className='sd-err';sdActiveFile='';
+let sdAdsb={ok:false,file:'',err:''};
+let sdMeshy={ok:false,file:'',err:''};
+let sdMounted=false;
+function updSD(which,ok,path){
+  // which: 'adsb', 'meshy', or 'card' (card-level events affect both)
+  if(which==='card'){
+    if(ok==='mounted'){sdMounted=true;}
+    else if(ok==='no-card'||ok==='wait'){sdMounted=false;sdAdsb={ok:false,file:'',err:ok};sdMeshy={ok:false,file:'',err:ok};}
+    else if(ok==='retrying'){sdMounted=false;sdAdsb={ok:false,file:'',err:'retry #'+path};sdMeshy={ok:false,file:'',err:'retry #'+path};}
   }else{
-    el.textContent='✕ write failed';el.className='sd-err';sdActiveFile='';
+    const s=(which==='meshy')?sdMeshy:sdAdsb;
+    if(ok===true){s.ok=true;s.file=path?path.replace('/sdcard/',''):'';s.err='';sdMounted=true;}
+    else if(ok==='lost'){s.ok=false;s.file='';s.err='lost';}
+    else if(ok==='fail'){s.ok=false;s.file='';s.err='fail';}
   }
+  renderSD();
+}
+function renderSD(){
+  const el=document.getElementById('sd-logs');
+  if(!sdMounted&&!sdAdsb.ok&&!sdMeshy.ok){
+    const err=sdAdsb.err||'waiting';
+    if(err==='no-card'){el.innerHTML='<span class="sd-err" title="No SD card detected">✕ no card</span>';return;}
+    if(err.startsWith('retry')){el.innerHTML='<span class="sd-err" title="SD card mount failed, retrying">✕ mount '+err+'</span>';return;}
+    el.innerHTML='<span class="sd-wait" title="Waiting for SD card to initialize">waiting</span>';
+    return;
+  }
+  let lines=[];
+  if(sdAdsb.ok)lines.push('<span class="sd-ok" title="ADS-B flight log recording to SD card">● '+esc(sdAdsb.file)+'</span>');
+  else if(sdAdsb.err&&sdAdsb.err!=='wait')lines.push('<span class="sd-err" title="Failed to open ADS-B log file on SD card">✕ adsb log failed</span>');
+  else if(sdMounted)lines.push('<span class="sd-wait" title="SD card mounted, waiting for first ADS-B data">○ adsb log pending</span>');
+  if(sdMeshy.ok)lines.push('<span class="sd-meshy" title="Meshtastic message log recording to SD card">● '+esc(sdMeshy.file)+'</span>');
+  else if(sdMeshy.err&&sdMeshy.err!=='wait')lines.push('<span class="sd-err" title="Failed to open Meshtastic log file on SD card">✕ mesh log failed</span>');
+  else if(sdMounted)lines.push('<span class="sd-wait" title="SD card mounted, waiting for first Meshtastic packet">○ mesh log pending</span>');
+  if(lines.length===0){el.innerHTML='<span class="sd-wait" title="SD card mounted, no logs yet">mounted</span>';return;}
+  el.innerHTML=lines.join('<br>');
 }
 
 // --- Log ---
@@ -850,7 +936,7 @@ let logPaused=[];  // buffer lines while paused
 function logType(l){
   if(/^\[scope\]/.test(l))return 'scope';
   if(/\[CONSOLE\]|CONSOLE:|Command mode|Entering log mode|buffered lines replayed/.test(l))return 'console';
-  if(/\[GNSS\]/.test(l))return 'gnss';
+  if(/GNSS:/.test(l))return 'gnss';
   if(/MESHY|meshy_|Meshy/.test(l))return 'meshy';
   if(MR.test(l))return 'adsb';
   if(/error|fail/i.test(l))return 'error';
@@ -937,16 +1023,74 @@ async function meshyDlWebapp(){
     st.innerHTML='Webapp downloaded ('+(raw.length/1024).toFixed(0)+' KB)';
   }catch(e){st.innerHTML='Failed: '+e.message}
 }
+async function takeScreenshot(){
+  if(!conn){alert('Connect serial first');return}
+  const btn=document.getElementById('screenshot-btn');
+  if(btn)btn.textContent='⏳';
+  try{
+    // Step 1: Capture screenshot to SD card
+    const saveResult=await sendCmd('screenshot',10000);
+    if(!saveResult||/failed/i.test(saveResult)){
+      addLog('[scope] Screenshot capture failed');
+      if(btn)btn.textContent='📸';
+      return;
+    }
+    addLog('[scope] '+saveResult.trim());
+    // Step 2: Send base64 over serial (in command mode — no interleaving)
+    const raw=await sendCmd('screenshot send',30000);
+    if(!raw||!raw.includes('SCREENSHOT_BEGIN')){
+      addLog('[scope] Screenshot send failed');
+      if(btn)btn.textContent='📸';
+      return;
+    }
+    // Parse: find SCREENSHOT_BEGIN line, collect base64, stop at SCREENSHOT_END
+    const lines=raw.split('\n');
+    let fname='screenshot.png',b64='',capture=false;
+    for(const line of lines){
+      const clean=line.trim();
+      if(clean.startsWith('SCREENSHOT_BEGIN')){
+        const parts=clean.split(/\s+/);
+        fname=parts[1]||'screenshot.png';
+        capture=true;continue;
+      }
+      if(clean.startsWith('SCREENSHOT_END')){capture=false;continue;}
+      if(capture&&clean.length>0&&/^[A-Za-z0-9+/=]+$/.test(clean))b64+=clean;
+    }
+    if(b64.length===0){
+      addLog('[scope] Screenshot: no base64 data received');
+      if(btn)btn.textContent='📸';
+      return;
+    }
+    const bin=Uint8Array.from(atob(b64),c=>c.charCodeAt(0));
+    const blob=new Blob([bin],{type:'image/png'});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url;a.download=fname;a.click();
+    URL.revokeObjectURL(url);
+    addLog('[scope] Screenshot downloaded: '+fname+' ('+bin.length+' bytes)');
+  }catch(e){
+    addLog('[scope] Screenshot error: '+e.message);
+  }finally{
+    if(btn)btn.textContent='📸';
+    // Return to log mode — sendCmd leaves device in command mode
+    try{
+      cmdWaiting=false;cmdBuf=[];
+      await serialWrite('log\n');
+    }catch(e){}
+  }
+}
 function handleMeshyTx(l){
-  // Parse: MESHY: [TX] "message text"
-  const m=/MESHY:\s+\[TX\]\s+"(.+)"/.exec(l);
+  // Parse: MESHY: [TX] !NODEID id:PACKETID "text"
+  const m=/MESHY:\s+\[TX\]\s+!([0-9a-fA-F]{8})\s+id:([0-9a-fA-F]{8})\s+"(.+)"/.exec(l);
   if(!m)return;
-  const text=m[1];
-  const nodeId=meshyConfig.node||'self';
+  const nodeId=m[1];
+  const pktId=m[2];
+  const text=m[3];
   const displayName=(meshyNodes[nodeId]?.short)||'You';
+  const dts=parseDeviceTs(l);
   // Associate our receiver position with our node (backfills older messages too)
   if(rxP&&rxP.fix)updateNodePosition(nodeId,rxP.lat,rxP.lon,0);
-  addMeshyMsg({from:displayName,node:nodeId,rssi:0,snr:0,hop:0,hopStart:0,kind:'text',text:text,_tx:true});
+  addMeshyMsg({from:displayName,node:nodeId,pktId:pktId,rssi:0,snr:0,hop:0,hopStart:0,kind:'text',text:text,_tx:true,_deviceTs:dts});
 }
 function handleMeshyConfig(l){
   // Parse: MESHY: Session initialized: node=!XXXXXXXX region=XX preset=XX role=XX tx=XXdBm hop=N slot=auto/manual +Nch
@@ -961,9 +1105,9 @@ function handleMeshyConfig(l){
   if(/MESHY:\s+Meshy started/.test(l)){meshyConfig.stopped=false;updateMeshyStats()}
 }
 function parseMeshyLine(l){
-  const m=/MESHY:\s+\[(\w+)\]\s+!([0-9a-fA-F]{8})\s+\(([^)]*)\)\s+RSSI:([\-\d.]+)\s+SNR:([\-\d.]+)\s+hop:(\d+)\/(\d+)(?:\s+ch:(\w+))?/.exec(l);
+  const m=/MESHY:\s+\[(\w+)\]\s+!([0-9a-fA-F]{8})\s+\(([^)]*)\)\s+id:([0-9a-fA-F]{8})\s+RSSI:([\-\d.]+)\s+SNR:([\-\d.]+)\s+hop:(\d+)\/(\d+)(?:\s+ch:(\w+))?/.exec(l);
   if(!m)return null;
-  return{type:m[1],node:m[2],name:m[3]!=='?'?m[3]:'',rssi:parseFloat(m[4]),snr:parseFloat(m[5]),hop:parseInt(m[6]),hopStart:parseInt(m[7]),pki:m[8]==='PKI'};
+  return{type:m[1],node:m[2],name:m[3]!=='?'?m[3]:'',pktId:m[4],rssi:parseFloat(m[5]),snr:parseFloat(m[6]),hop:parseInt(m[7]),hopStart:parseInt(m[8]),pki:m[9]==='PKI'};
 }
 let meshyPendingText=null;
 let meshyPendingNode=null;
@@ -998,7 +1142,8 @@ function handleMeshyLine(l){
   if(!p)return;
   if(p.name)learnNodeName(p.node,p.name);
   const displayName=p.name||(meshyNodes[p.node]?.short)||p.node;
-  const base={from:displayName,node:p.node,rssi:p.rssi,snr:p.snr,hop:p.hop,hopStart:p.hopStart,pki:p.pki};
+  const dts=parseDeviceTs(l);
+  const base={from:displayName,node:p.node,pktId:p.pktId,rssi:p.rssi,snr:p.snr,hop:p.hop,hopStart:p.hopStart,pki:p.pki,_deviceTs:dts};
   if(p.type==='TEXT'){meshyPendingText={...base,kind:'text',text:''};return;}
   if(p.type==='NODE'){addMeshyMsg({...base,kind:'join'});return;}
   if(p.type==='POS'){meshyPendingNode=p.node;addMeshyMsg({...base,kind:'pos'});return;}
@@ -1296,7 +1441,24 @@ function fmtRx(r){
   const hops=r.hopStart>0?(r.hopStart-r.hop):0;
   return `RSSI:${r.rssi} SNR:${r.snr}${hops>0?' +'+hops+'hop':''}${r.hop>0?' relay':' direct'}`;
 }
+function parseDeviceTs(l){
+  // Extract device timestamp from serial line: [2026-03-28 20:45:36.127Z]
+  const m=/^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+Z)\]/.exec(l);
+  if(m)return new Date(m[1].replace(' ','T')).getTime();
+  // Boot-relative: [boot+818.793] — no real UTC available
+  return null;
+}
+function fmtMeshyTime(ts){
+  const d=new Date(ts);
+  const h=String(d.getHours()).padStart(2,'0');
+  const m=String(d.getMinutes()).padStart(2,'0');
+  const s=String(d.getSeconds()).padStart(2,'0');
+  return h+':'+m+':'+s;
+}
 function meshyDedupKey(m){
+  // Packet-ID-based dedup: matches TX echoes with relay receptions
+  if(m.pktId)return m.node+':id:'+m.pktId;
+  // Fallback for CSV replay or old logs without packet IDs
   if(m.kind==='text')return m.node+':text:'+m.text;
   return m.node+':'+m.kind;
 }
@@ -1306,33 +1468,38 @@ function renderMeshyLine(entry){
   const hasPos=entry.has_pos;
   const pin=hasPos?'<span class="ml">\u2299</span>':'';
   const cx=c>1?` <span class="mx" data-expand="1">x${c}</span>`:'';
+  const ts=entry.firstTs?`<span class="mts">${fmtMeshyTime(entry.firstTs)}</span>`:'';
   let html='';
   const dm=m.pki?'<span class="mk">DM</span>':'';
   switch(m.kind){
-    case'text':html=`${pin}${dm}<span class="mn">${esc(m.from)}</span> <span class="mt">${esc(m.text)}</span>${cx} <span class="mr">${meta}</span>`;break;
-    case'join':html=`${pin}<span class="mj">${esc(m.from)} joined</span>${cx} <span class="mr">${meta}</span>`;break;
-    case'pos':html=`${pin}<span class="mp">${esc(m.from)} position</span>${cx} <span class="mr">${meta}</span>`;break;
+    case'text':html=`${ts}${pin}${dm}<span class="mn">${esc(m.from)}</span> <span class="mt">${esc(m.text)}</span>${cx} <span class="mr">${meta}</span>`;break;
+    case'join':html=`${ts}${pin}<span class="mj">${esc(m.from)} joined</span>${cx} <span class="mr">${meta}</span>`;break;
+    case'pos':html=`${ts}${pin}<span class="mp">${esc(m.from)} position</span>${cx} <span class="mr">${meta}</span>`;break;
     case'telem':{
       const tv=m.bat?` ${m.bat}% ${m.volt.toFixed(1)}V ch:${m.chUtil.toFixed(0)}% air:${m.airTx.toFixed(0)}%`:'';
-      html=`${pin}<span class="mp">${esc(m.from)}${tv}</span>${cx} <span class="mr">${meta}</span>`;break;
+      html=`${ts}${pin}<span class="mp">${esc(m.from)}${tv}</span>${cx} <span class="mr">${meta}</span>`;break;
     }
   }
   if(c>1){
-    html+=`<div class="md">${entry.receptions.map((r,i)=>`${i+1}. ${fmtRx(r)}`).join('<br>')}</div>`;
+    html+=`<div class="md">${entry.receptions.map((r,i)=>{
+      const rt=r.ts?fmtMeshyTime(r.ts)+' ':'';
+      return `${i+1}. ${rt}${fmtRx(r)}`;
+    }).join('<br>')}</div>`;
   }
   entry.el.innerHTML=html;
 }
 function addMeshyMsg(m){
   const el=document.getElementById('meshy-output');
   const now=csvRows.length?nowTime():Date.now();
+  const devTs=m._deviceTs||now;  // prefer device time, fall back for CSV replay
   const key=meshyDedupKey(m);
-  const rx={rssi:m.rssi,snr:m.snr,hop:m.hop,hopStart:m.hopStart};
+  const rx={rssi:m.rssi,snr:m.snr,hop:m.hop,hopStart:m.hopStart,ts:devTs};
   // Check for existing dedup entry within time window
   const existing=meshyDedup[key];
   if(existing&&(now-existing.ts)<MESHY_DEDUP_WINDOW){
     existing.count++;
     existing.receptions.push(rx);
-    existing.ts=now;
+    existing.ts=now;  // tracks recency for dedup window — firstTs stays fixed
     // Update position flag if node gained position since first reception
     if(!existing.has_pos && nodeHasPosition(m.node)) existing.has_pos=true;
     renderMeshyLine(existing);
@@ -1347,7 +1514,7 @@ function addMeshyMsg(m){
   d.dataset.mk=m.kind;
   d.dataset.node=m.node;
   d.style.display=isMeshyKindVisible(m.kind)?'':'none';
-  const entry={el:d,msg:m,count:1,receptions:[rx],ts:now,has_pos:m.kind==='pos'||nodeHasPosition(m.node)};
+  const entry={el:d,msg:m,count:1,receptions:[rx],ts:now,firstTs:devTs,has_pos:m.kind==='pos'||nodeHasPosition(m.node)};
   meshyDedup[key]=entry;
   d.addEventListener('click',(ev)=>{
     // If clicking the count badge (x3, x4...), toggle expand
@@ -1412,7 +1579,7 @@ function refilterMeshy(){
 
 // --- Table sort ---
 let sortCol=null, sortDir=0; // 0=default, 1=asc, -1=desc
-const sortKeys=['icao','cs','alt','spd','hdg','vr','dist','brg','age'];
+const sortKeys=['icao','cs','alt','spd','hdg','vr','dist','brg','age','msgs'];
 function tblSort(col){
   if(sortCol===col){
     if(sortDir===1)sortDir=-1;
@@ -1437,6 +1604,7 @@ function sortVal(ic,ac,n){
     case'dist':return ac.dist??999;
     case'brg':return ac.brg??999;
     case'age':return age;
+    case'msgs':return ac.msgs||0;
     default:return ac.dist??999;
   }
 }
@@ -1491,6 +1659,7 @@ function tick(){
   });
   if(selSet.size)updDet();
   updSessionInfo();
+  updGnss();
   const tb=document.getElementById('ac-tbody');
   // Sort: expired always at bottom, then by user-selected column or default (distance)
   const so=[...A.entries()].sort((a,b)=>{
@@ -1512,15 +1681,28 @@ function tick(){
       const expOp=isSel?'opacity:0.5':'opacity:0.25';
       const expCol=isSel?'#99a':'#556';
       const dismiss=ac.pinned?`<span style="cursor:pointer;color:#ff6b6b;margin-left:4px" onclick="dismissAc('${ic}',event)">✕</span>`:'';
-      return`<tr class="${sel}" style="${expOp}" onclick="sel0('${ic}',event)"><td class="col-icao" style="color:${expCol}">${ic}${dismiss}</td><td class="col-cs" style="color:${expCol}">${ac.cs||'---'}</td><td style="color:${expCol}">${ac.alt!=null?ac.alt.toLocaleString():'---'}</td><td style="color:${expCol}">${ac.speed||'---'}</td><td style="color:${expCol}">${ac.hdg!=null?ac.hdg+'°':'---'}</td><td style="color:${expCol}">${ac.vr?(ac.vr>0?'+':'')+ac.vr:'---'}</td><td style="color:${expCol}">${ac.dist!=null?ac.dist.toFixed(1)+'nm':'---'}</td><td style="color:${expCol}">${ac.brg!=null?ac.brg+'°':'---'}</td><td style="color:${expCol}">${age}s</td></tr>`;
+      return`<tr data-ic="${ic}" class="${sel}" style="${expOp}" onclick="sel0('${ic}',event)"><td class="col-icao" style="color:${expCol}">${ic}${dismiss}</td><td class="col-cs" style="color:${expCol}">${ac.cs||'---'}</td><td style="color:${expCol}">${ac.alt!=null?ac.alt.toLocaleString():'---'}</td><td style="color:${expCol}">${ac.speed||'---'}</td><td style="color:${expCol}">${ac.hdg!=null?ac.hdg+'°':'---'}</td><td style="color:${expCol}">${ac.vr?(ac.vr>0?'+':'')+ac.vr:'---'}</td><td style="color:${expCol}">${ac.dist!=null?ac.dist.toFixed(1)+'nm':'---'}</td><td style="color:${expCol}">${ac.brg!=null?ac.brg+'°':'---'}</td><td style="color:${expCol}">${age}s</td><td style="color:${expCol}">${ac.msgs||0}</td></tr>`;
     }
     const st=acStale(ac,isSel);
     const rowOp=st.gray?(isSel?'opacity:0.5':'opacity:0.35'):st.opacity<1?'opacity:0.5':'';
     const icCol=st.gray?(isSel?'#99a':'#667'):c;
-    return`<tr class="${sel}" style="${rowOp}" onclick="sel0('${ic}',event)"><td class="col-icao" style="color:${icCol}">${ic}</td><td class="col-cs">${ac.cs||'---'}</td><td class="col-alt">${ac.alt!=null?ac.alt.toLocaleString():'---'}</td><td>${ac.speed||'---'}</td><td>${ac.hdg!=null?ac.hdg+'°':'---'}</td><td class="col-vr ${vc}">${ac.vr?(ac.vr>0?'+':'')+ac.vr:'---'}</td><td class="col-dist">${ac.dist!=null?ac.dist.toFixed(1)+'nm':'---'}</td><td class="col-dist">${ac.brg!=null?ac.brg+'°':'---'}</td><td class="col-dist">${age}s</td></tr>`;
+    return`<tr data-ic="${ic}" class="${sel}" style="${rowOp}" onclick="sel0('${ic}',event)"><td class="col-icao" style="color:${icCol}">${ic}</td><td class="col-cs">${ac.cs||'---'}</td><td class="col-alt">${ac.alt!=null?ac.alt.toLocaleString():'---'}</td><td>${ac.speed||'---'}</td><td>${ac.hdg!=null?ac.hdg+'°':'---'}</td><td class="col-vr ${vc}">${ac.vr?(ac.vr>0?'+':'')+ac.vr:'---'}</td><td class="col-dist">${ac.dist!=null?ac.dist.toFixed(1)+'nm':'---'}</td><td class="col-dist">${ac.brg!=null?ac.brg+'°':'---'}</td><td class="col-dist">${age}s</td><td class="col-dist">${ac.msgs||0}</td></tr>`;
   }).join('');
+  // Re-apply keyboard focus after table rebuild
+  if(kbFocusIdx>=0){
+    const rows=tb.querySelectorAll('tr');
+    if(kbFocusIdx>=rows.length)kbFocusIdx=rows.length-1;
+    if(kbFocusIdx>=0&&rows[kbFocusIdx])rows[kbFocusIdx].classList.add('kb-focus');
+  }
 }
-function togglePanel(){const p=document.getElementById('panel');const b=document.getElementById('panel-toggle');if(p.classList.contains('collapsed')){p.classList.remove('collapsed');p.style.height=panelH+'px';b.textContent='\u25B2 Aircraft \u25B2'}else{p.classList.add('collapsed');p.style.height='';b.textContent='\u25BC Aircraft \u25BC'}}
+function togglePanel(){const p=document.getElementById('panel');const b=document.getElementById('panel-toggle');if(p.classList.contains('collapsed')){p.classList.remove('collapsed');p.style.height=panelH+'px';b.textContent='\u25B2 Aircraft \u25B2'}else{p.classList.add('collapsed');p.style.height='';b.textContent='\u25BC Aircraft \u25BC'}syncPanelH()}
+
+// Sync detail-wrap bottom to actual aircraft panel height
+function syncPanelH(){
+  const p=document.getElementById('panel');
+  const h=p.classList.contains('collapsed')?44:p.offsetHeight;
+  document.documentElement.style.setProperty('--panel-h',h+'px');
+}
 
 // --- Panel drag resize ---
 let panelH=Math.round(window.innerHeight*0.35);
@@ -1529,8 +1711,8 @@ let panelH=Math.round(window.innerHeight*0.35);
   const drag=document.getElementById('panel-drag');
   let dragging=false,startY,startH;
   function onStart(y){dragging=true;startY=y;startH=panel.offsetHeight;if(panel.classList.contains('collapsed')){panel.classList.remove('collapsed');panel.style.height=startH+'px'}panel.style.transition='none';document.body.style.cursor='ns-resize';document.body.style.userSelect='none'}
-  function onMove(y){if(!dragging)return;const h=Math.max(44,Math.min(window.innerHeight-60,startH+(startY-y)));panel.style.height=h+'px';panelH=h}
-  function onEnd(){if(!dragging)return;dragging=false;panel.style.transition='';document.body.style.cursor='';document.body.style.userSelect='';if(panelH<=60){panel.classList.add('collapsed');panel.style.height='';document.getElementById('panel-toggle').textContent='\u25BC Aircraft \u25BC'}else{panel.classList.remove('collapsed');document.getElementById('panel-toggle').textContent='\u25B2 Aircraft \u25B2'}}
+  function onMove(y){if(!dragging)return;const h=Math.max(44,Math.min(window.innerHeight-60,startH+(startY-y)));panel.style.height=h+'px';panelH=h;syncPanelH()}
+  function onEnd(){if(!dragging)return;dragging=false;panel.style.transition='';document.body.style.cursor='';document.body.style.userSelect='';if(panelH<=60){panel.classList.add('collapsed');panel.style.height='';document.getElementById('panel-toggle').textContent='\u25BC Aircraft \u25BC'}else{panel.classList.remove('collapsed');document.getElementById('panel-toggle').textContent='\u25B2 Aircraft \u25B2'}syncPanelH()}
   drag.addEventListener('mousedown',e=>{e.preventDefault();onStart(e.clientY)});
   window.addEventListener('mousemove',e=>onMove(e.clientY));
   window.addEventListener('mouseup',onEnd);
@@ -1538,6 +1720,48 @@ let panelH=Math.round(window.innerHeight*0.35);
   window.addEventListener('touchmove',e=>{if(dragging)onMove(e.touches[0].clientY)});
   window.addEventListener('touchend',onEnd);
 })();
+
+// --- Aircraft table keyboard navigation ---
+// Arrow Up/Down: move focus row. Enter or Space: select focused row.
+// Shift+Arrow: extend selection to focused row. Escape: deselect all.
+let kbFocusIdx=-1; // -1 = no keyboard focus
+function kbApplyFocus(){
+  const rows=document.querySelectorAll('#ac-tbody tr');
+  rows.forEach((r,i)=>r.classList.toggle('kb-focus',i===kbFocusIdx));
+  if(kbFocusIdx>=0&&kbFocusIdx<rows.length){
+    const row=rows[kbFocusIdx];
+    const scroll=document.getElementById('panel-scroll');
+    const rr=row.getBoundingClientRect(),sr=scroll.getBoundingClientRect();
+    if(rr.bottom>sr.bottom)row.scrollIntoView({block:'nearest'});
+    if(rr.top<sr.top)row.scrollIntoView({block:'nearest'});
+  }
+}
+document.getElementById('panel-scroll').addEventListener('keydown',function(e){
+  if(e.key!=='ArrowUp'&&e.key!=='ArrowDown'&&e.key!=='Enter'&&e.key!==' '&&e.key!=='Escape')return;
+  const rows=document.querySelectorAll('#ac-tbody tr');
+  if(!rows.length)return;
+  e.preventDefault();
+  if(e.key==='Escape'){desel();kbFocusIdx=-1;kbApplyFocus();return}
+  if(e.key==='ArrowUp'){
+    kbFocusIdx=kbFocusIdx<=0?rows.length-1:kbFocusIdx-1;
+    const ic=rows[kbFocusIdx]?.dataset.ic;
+    if(ic)sel0(ic,e.shiftKey?{shiftKey:true}:{});
+    kbApplyFocus();return;
+  }
+  if(e.key==='ArrowDown'){
+    kbFocusIdx=kbFocusIdx>=rows.length-1?0:kbFocusIdx+1;
+    const ic=rows[kbFocusIdx]?.dataset.ic;
+    if(ic)sel0(ic,e.shiftKey?{shiftKey:true}:{});
+    kbApplyFocus();return;
+  }
+  if(e.key==='Enter'||e.key===' '){
+    if(kbFocusIdx>=0&&kbFocusIdx<rows.length){
+      const ic=rows[kbFocusIdx]?.dataset.ic;
+      if(ic)sel0(ic,e.shiftKey?{shiftKey:true}:{});
+    }
+    return;
+  }
+});
 
 // --- Meshy panel: drag to move (header), CSS resize:both for corner ---
 (function(){
@@ -1651,6 +1875,10 @@ function cmdResetTO(){
 }
 function handleLine(l){
   l=stripAnsi(l);
+  lastSerialMs=Date.now();
+  // Track device UTC from serial timestamps
+  const _dts=parseDeviceTs(l);
+  if(_dts&&_dts>0)deviceUtcMs=_dts;
   // Always check for console ready, even during cmd exchange
   if(/\[CONSOLE\] Serial console (ready|heartbeat)/.test(l))consoleReady=true;
   if(cmdWaiting){
@@ -1742,15 +1970,14 @@ async function toggleFiles(){
   }
   p.classList.add('visible');b.classList.add('active');syncPanelLayout();
   // Wait for serial console ready + SD card mounted before listing
-  const sd=document.getElementById('sd-status');
-  if(!consoleReady||!sd.classList.contains('sd-ok')){
+  if(!consoleReady||!sdMounted){
     const st=document.getElementById('files-status');
     const list=document.getElementById('files-list');
     st.textContent='Waiting for device...';list.innerHTML='';
     const ok=await new Promise(res=>{
       let checks=0;
       const iv=setInterval(()=>{
-        if(consoleReady&&sd.classList.contains('sd-ok')){clearInterval(iv);res(true)}
+        if(consoleReady&&sdMounted){clearInterval(iv);res(true)}
         else if(++checks>120){clearInterval(iv);res(false)} // 60s timeout
       },500);
     });
@@ -1774,14 +2001,14 @@ function renderFiles(files,path,suffix){
     const ic=f.isDir?'\uD83D\uDCC1':'\uD83D\uDCC4';
     const cls=f.isDir?'dir':'';
     const isCsv=f.name.endsWith('.csv');
-    const isActive=(!f.isDir&&sdActiveFile&&f.name===sdActiveFile)?'active-log':'';
+    const isActive=(!f.isDir&&(f.name===sdAdsb.file||f.name===sdMeshy.file))?'active-log':'';
     const n=f.name.replace(/'/g,"\\'");
     let acts='';
     if(!f.isDir){
       acts='<div class="file-actions">';
-      if(isCsv)acts+='<button onclick="event.stopPropagation();fileReplay(\''+n+'\',\''+f.size+'\')">Replay</button>';
-      acts+='<button onclick="event.stopPropagation();fileDL(\''+n+'\',\''+f.size+'\')">DL</button>';
-      acts+='<button onclick="event.stopPropagation();fileDel(\''+n+'\')">Del</button>';
+      if(isCsv)acts+='<button title="Replay ADS-B log on map" onclick="event.stopPropagation();fileReplay(\''+n+'\',\''+f.size+'\')">Replay</button>';
+      acts+='<button title="Download file from SD card" onclick="event.stopPropagation();fileDL(\''+n+'\',\''+f.size+'\')">DL</button>';
+      acts+='<button title="Delete file from SD card" onclick="event.stopPropagation();fileDel(\''+n+'\')">Del</button>';
       acts+='</div>';
     }
     const ck=f.isDir?'onclick="fileNav(\''+n+'\')"':'';
@@ -2052,9 +2279,9 @@ function feedCSVRow(row){
   if(row.type==='meshy'){feedMeshyCSVRow(row);return}
   const ic=row.icao;if(!ic||ic==='000000')return;
   let ac=A.get(ic);
-  if(!ac){ac={cs:null,alt:null,speed:null,hdg:null,vr:null,lat:null,lon:null,hasPos:false,expired:false,dist:null,brg:null,ls:row.t,mk:null,lb:null,tr:null,trPts:[]};A.set(ic,ac)}
-  ac.ls=row.t;
-  if(ac.expired){ac.expired=false;ac.mk=null;ac.lb=null;ac.tr=null;ac.trPts=[];}
+  if(!ac){ac={cs:null,alt:null,speed:null,hdg:null,vr:null,lat:null,lon:null,hasPos:false,expired:false,dist:null,brg:null,ls:row.t,msgs:0,mk:null,lb:null,tr:null,trPts:[]};A.set(ic,ac)}
+  ac.ls=row.t;ac.msgs++;
+  if(ac.expired){ac.expired=false;ac.mk=null;ac.lb=null;ac.tr=null;}
   if(row.cs)ac.cs=row.cs;
   if(row.alt!=null)ac.alt=row.alt;
   if(row.speed!=null)ac.speed=row.speed;
@@ -2504,7 +2731,7 @@ async function flashLocalFile(input){
   await doFlash(binData);
 }
 
-initMap();setInterval(tick,1000);fetchLatestVersion();
+initMap();syncPanelH();setInterval(tick,1000);fetchLatestVersion();
 function posZoom(){const h=document.getElementById('panel').offsetHeight;document.getElementById('zoom-ctrl').style.bottom=(h+12)+'px';document.getElementById('legend').style.bottom=(h+12)+'px'}
 function posTopbar(){
   const tb=document.getElementById('topbar').offsetHeight;

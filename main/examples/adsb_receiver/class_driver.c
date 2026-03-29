@@ -5,7 +5,9 @@
 
 #include "class_driver.h"
 #include "serial_console.h"
+#include "sd_config.h"
 #include "device_settings.h"
+#include "aircraft_db.h"
 #include <math.h>
 #include <stdio.h>
 #include <time.h>
@@ -469,8 +471,7 @@ static void sd_log_pick_filename(void) {
 
     if (now < 1704067200LL) {
         snprintf(sd_log_filename, sizeof(sd_log_filename),
-            "/sdcard/adsb_boot%llu.csv",
-            (unsigned long long)(esp_timer_get_time() / 1000));
+            "/sdcard/adsb_boot%s.csv", sd_config_boot_id());
     } else {
         strftime(sd_log_filename, sizeof(sd_log_filename),
             "/sdcard/adsb_%Y-%m-%dT%H%M%SZ.csv", &timeinfo);
@@ -508,12 +509,28 @@ static void sd_log_flush(void) {
     if (!sd_log_initialized || sd_log_buf_pos == 0) return;
     if (sd_log_filename[0] == '\0') return;
 
+    static int s_flush_fail_count = 0;
+
     FILE *f = fopen(sd_log_filename, "a");
     if (!f) {
-        ESP_LOGW(TAG, "SD flush: cannot open %s", sd_log_filename);
-        // Don't discard buffer — retry next cycle
+        s_flush_fail_count++;
+        ESP_LOGW(TAG, "SD flush: cannot open %s (%d consecutive)", sd_log_filename, s_flush_fail_count);
+        if (s_flush_fail_count >= 5) {
+            // SD card likely removed — unmount the dead filesystem so
+            // the recovery path in sd_log_aircraft can remount.
+            ESP_LOGW(TAG, "SD card unresponsive after %d failures — unmounting", s_flush_fail_count);
+            // Set uninitialized FIRST to prevent recursion:
+            // sd_safe_shutdown → sd_log_close → sd_log_flush → returns immediately
+            sd_log_initialized = false;
+            sd_log_filename[0] = '\0';
+            sd_log_buf_pos = 0;
+            s_flush_fail_count = 0;
+            extern void sd_safe_shutdown(void);
+            sd_safe_shutdown();  // unmounts card, sets sd_card_handle = NULL
+        }
         return;
     }
+    s_flush_fail_count = 0;  // reset on success
 
     size_t written = fwrite(sd_log_buf, 1, sd_log_buf_pos, f);
     fflush(f);
@@ -541,6 +558,7 @@ static void sd_log_flush(void) {
 
 // Close the log permanently (for clean shutdown/unmount).
 void sd_log_close(void) {
+    if (!sd_log_initialized) return;  // already closed or never opened
     sd_log_flush();  // write any remaining buffered data
     sd_log_initialized = false;
     ESP_LOGI(TAG, "SD log closed: %s", sd_log_filename);
@@ -552,6 +570,18 @@ void sd_log_print_status(void) {
         printf("I (%lu) CLASS: SD log: %s\n",
             (unsigned long)(esp_timer_get_time() / 1000), sd_log_filename);
     }
+}
+
+// Check if ADS-B SD logging is active (log file open and header written).
+bool sd_log_is_active(void) {
+    return sd_log_initialized;
+}
+
+// Close current log and create a fresh one with a new boot-numbered filename.
+// Called after MSC mode exit to start a clean log file.
+void sd_log_create_new(void) {
+    if (sd_log_initialized) sd_log_close();
+    sd_log_create();
 }
 
 // Rename boot-numbered log to UTC-timestamped name.
@@ -608,6 +638,10 @@ static void sd_log_buf_timestamp(void) {
 }
 
 static void sd_log_aircraft(aircraft_t *ac, const struct mode_s_msg *mm) {
+    // Don't write to SD while USB MSC owns the card
+    extern bool sd_msc_is_active_fn(void);
+    if (sd_msc_is_active_fn()) return;
+
     // Allocate buffer once
     if (!sd_log_buf) {
         sd_log_buf = heap_caps_malloc(SD_LOG_BUFSIZE, MALLOC_CAP_SPIRAM);
@@ -726,6 +760,20 @@ void on_msg(mode_s_t *self, struct mode_s_msg *mm)
     ac->last_seen = esp_timer_get_time();
     ac->msg_count++;
 
+    // Emit aircraft database info on first message for a new ICAO.
+    // Separate log line so we don't change the ADS-B data format.
+    // Webapp and firmware scope cache this for detail display.
+    if (ac->msg_count == 1 && aircraft_db_ready()) {
+        aircraft_db_entry_t db;
+        if (aircraft_db_lookup(icao, &db)) {
+            char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+            serial_console_print("%sICAO: %06lX|%s|%s|%s|%s|%s|%s|%c\n",
+                _ts, (unsigned long)icao,
+                db.reg, db.typecode, db.mfr, db.model, db.owner, db.op_icao,
+                db.ac_class ? db.ac_class : '?');
+        }
+    }
+
     // --- Update aircraft state from this message ---
 
     // Callsign (DF17, ME 1-4)
@@ -803,22 +851,9 @@ void on_msg(mode_s_t *self, struct mode_s_msg *mm)
     char line[384];
     int pos = 0, avail = sizeof(line);
 
-    // Timestamp — use ISO format only after GPS fix, boot+ before
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    if (g_gps_fix_epoch > 0) {
-        struct tm tm_info;
-        gmtime_r(&tv.tv_sec, &tm_info);
-        int n = snprintf(line + pos, avail, "[%04d-%02d-%02d %02d:%02d:%02d.%03ldZ] ",
-            tm_info.tm_year + 1900, tm_info.tm_mon + 1, tm_info.tm_mday,
-            tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec,
-            (long)(tv.tv_usec / 1000));
-        if (n > 0) { pos += n; avail -= n; }
-    } else {
-        int64_t boot_ms = esp_timer_get_time() / 1000;
-        int n = snprintf(line + pos, avail, "[boot+%lld.%03lld] ", boot_ms / 1000, boot_ms % 1000);
-        if (n > 0) { pos += n; avail -= n; }
-    }
+    // Timestamp — shared format with GNSS and Meshy log lines
+    { int n = log_format_timestamp(line + pos, avail);
+      if (n > 0) { pos += n; avail -= n; } }
 
     // ICAO + callsign
     { int n = snprintf(line + pos, avail, "%06lX", (unsigned long)icao);

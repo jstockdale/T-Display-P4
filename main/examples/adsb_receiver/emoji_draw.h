@@ -131,13 +131,14 @@ static inline int draw_text_with_emoji(uint16_t *buf, int32_t buf_w, int32_t buf
                                         const char *text, int32_t x, int32_t y,
                                         const lv_font_t *font, lv_color_t color) {
     int32_t cursor_x = x;
-    int32_t max_x = buf_w - 4;  // right margin
+    int32_t clip_x = buf_w;  // stop drawing past canvas edge (layer clips, but saves work)
     const char *p = text;
     int font_h = lv_font_get_line_height(font);
 
     const char *run_start = p;
 
     while (*p) {
+        if (cursor_x >= clip_x) break;  // rest is off-screen
         const char *before = p;
         uint32_t cp = utf8_decode(&p);
         if (cp == 0) break;
@@ -154,11 +155,12 @@ static inline int draw_text_with_emoji(uint16_t *buf, int32_t buf_w, int32_t buf
                 dsc.font = font;
                 dsc.opa = LV_OPA_COVER;
                 dsc.text = persistent;
-                lv_area_t area = { cursor_x, y, max_x, y + font_h };
+                // Wide area prevents LVGL word-wrap; canvas layer clips at buffer edge
+                lv_area_t area = { cursor_x, y, (int32_t)16384, y + font_h };
                 lv_draw_label(layer, &dsc, &area);
 
                 lv_point_t txt_size;
-                lv_text_get_size(&txt_size, persistent, font, 0, 0, max_x - cursor_x, LV_TEXT_FLAG_NONE);
+                lv_text_get_size(&txt_size, persistent, font, 0, 0, 16384, LV_TEXT_FLAG_EXPAND);
                 cursor_x += txt_size.x;
             }
 
@@ -170,7 +172,7 @@ static inline int draw_text_with_emoji(uint16_t *buf, int32_t buf_w, int32_t buf
         }
     }
 
-    if (p > run_start) {
+    if (p > run_start && cursor_x < clip_x) {
         int len = p - run_start;
         char *persistent = _emoji_pool_alloc(run_start, len);
 
@@ -180,11 +182,12 @@ static inline int draw_text_with_emoji(uint16_t *buf, int32_t buf_w, int32_t buf
         dsc.font = font;
         dsc.opa = LV_OPA_COVER;
         dsc.text = persistent;
-        lv_area_t area = { cursor_x, y, max_x, y + font_h };
+        // Wide area prevents LVGL word-wrap; canvas layer clips at buffer edge
+        lv_area_t area = { cursor_x, y, (int32_t)16384, y + font_h };
         lv_draw_label(layer, &dsc, &area);
 
         lv_point_t txt_size;
-        lv_text_get_size(&txt_size, persistent, font, 0, 0, max_x - cursor_x, LV_TEXT_FLAG_NONE);
+        lv_text_get_size(&txt_size, persistent, font, 0, 0, 16384, LV_TEXT_FLAG_EXPAND);
         cursor_x += txt_size.x;
     }
 

@@ -105,6 +105,8 @@ extern void adsb_update_display(lv_obj_t *table);
 extern void sd_log_rename_with_time(void);
 extern void sd_log_close(void);
 extern void sd_log_print_status(void);
+extern bool sd_log_is_active(void);
+extern void sd_log_create_new(void);
 extern void sd_clear_dirty_flag(void);
 
 // Receiver position — updated by GPS task, read by ADS-B display/logging

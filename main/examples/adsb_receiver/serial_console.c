@@ -64,6 +64,26 @@
 
 static const char *CONSOLE_TAG = "CONSOLE";
 
+// Shared device timestamp — same format as ADS-B log lines.
+// "[2026-03-28 20:45:36.127Z] " after GPS fix, "[boot+818.793] " before.
+extern volatile time_t g_gps_fix_epoch;
+
+int log_format_timestamp(char *buf, int bufsize) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    if (g_gps_fix_epoch > 0) {
+        struct tm t;
+        gmtime_r(&tv.tv_sec, &t);
+        return snprintf(buf, bufsize, "[%04d-%02d-%02d %02d:%02d:%02d.%03ldZ] ",
+            t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+            t.tm_hour, t.tm_min, t.tm_sec, (long)(tv.tv_usec / 1000));
+    } else {
+        int64_t boot_ms = esp_timer_get_time() / 1000;
+        return snprintf(buf, bufsize, "[boot+%lld.%03lld] ",
+            (long long)(boot_ms / 1000), (long long)(boot_ms % 1000));
+    }
+}
+
 // Embedded adsb_scope.htm — built into firmware via EMBED_TXTFILES in CMakeLists.txt
 extern const uint8_t adsb_scope_htm_start[] asm("_binary_adsb_scope_htm_start");
 extern const uint8_t adsb_scope_htm_end[]   asm("_binary_adsb_scope_htm_end");
@@ -254,6 +274,13 @@ static void cmd_help(void) {
         "  \033[32mchannels\033[0m [list|reset|add|remove]  manage Meshtastic channels\n"
         "  \033[32midentity\033[0m [<long> [<short>]]  show/set Meshy node identity\n"
         "  \033[32mnvs\033[0m [list|dump|clear] [device|meshy|pki|all]  NVS management\n"
+        "  \033[32mmsc\033[0m               enter USB Mass Storage mode (stops logging)\n"
+        "  \033[32mcdc\033[0m               exit USB Mass Storage mode (resumes logging)\n"
+        "  \033[32mwifi\033[0m [on|off|status|ssid <n>|pass <pw>]  WiFi control\n"
+        "  \033[32mntp\033[0m [server] [poll_s]  show/set NTP config\n"
+        "  \033[32mtime\033[0m              show time source status\n"
+        "  \033[32mscreenshot\033[0m        save screen as PNG to SD card\n"
+        "  \033[32mscreenshot send\033[0m   send last screenshot as base64 over serial\n"
         "  \033[32mreboot\033[0m            software reset\n"
         "\n"
         "  Ctrl+C to escape from log mode to command mode\n"
@@ -989,6 +1016,137 @@ static void dispatch_command(char *line) {
         }
     } else if (strcmp(cmd, "nvs") == 0) {
         cmd_nvs(arg1, arg2);
+
+    // ── USB Mass Storage ──
+    } else if (strcmp(cmd, "msc") == 0) {
+        extern bool sd_msc_is_active_fn(void);
+        extern bool sd_msc_enter_fn(void);
+        if (sd_msc_is_active_fn()) {
+            printf("  Already in MSC mode. Type 'cdc' to exit.\n");
+        } else {
+            printf("  Entering USB Mass Storage mode...\n");
+            printf("  \033[33mWARNING: ADS-B and Meshy logging will stop.\033[0m\n");
+            if (sd_msc_enter_fn()) {
+                printf("  \033[32mUSB Storage active.\033[0m SD card available to host.\n");
+                printf("  Type 'cdc' to exit and resume logging.\n");
+            } else {
+                printf("  \033[31mFailed to enter MSC mode.\033[0m\n");
+            }
+        }
+    } else if (strcmp(cmd, "cdc") == 0) {
+        extern bool sd_msc_is_active_fn(void);
+        extern void sd_msc_exit_fn(void);
+        if (!sd_msc_is_active_fn()) {
+            printf("  Not in MSC mode.\n");
+        } else {
+            sd_msc_exit_fn();
+            printf("  \033[32mNormal operation resumed.\033[0m Fresh logs created.\n");
+        }
+
+    // ── WiFi ──
+    } else if (strcmp(cmd, "wifi") == 0) {
+        extern bool wifi_hosted_is_connected_fn(void);
+        extern bool wifi_hosted_is_active(void);
+        extern const char *wifi_hosted_get_ip_fn(void);
+        if (!arg1 || strcmp(arg1, "status") == 0) {
+            printf("  WiFi: %s\n", g_settings.wifi_enabled ? "enabled" : "disabled");
+            printf("  SSID: %s\n", g_settings.wifi_ssid[0] ? g_settings.wifi_ssid : "(not set)");
+            printf("  Active: %s  Connected: %s\n",
+                   wifi_hosted_is_active() ? "yes" : "no",
+                   wifi_hosted_is_connected_fn() ? "yes" : "no");
+            if (wifi_hosted_is_connected_fn()) {
+                printf("  IP: %s\n", wifi_hosted_get_ip_fn());
+            }
+        } else if (strcmp(arg1, "on") == 0) {
+            if (g_settings.wifi_ssid[0] == '\0') {
+                printf("  No SSID configured. Use 'wifi ssid <name>' first.\n");
+            } else {
+                g_settings.wifi_enabled = true;
+                g_settings_save_pending = true;
+                printf("  WiFi enabled. Reboot to connect.\n");
+            }
+        } else if (strcmp(arg1, "off") == 0) {
+            g_settings.wifi_enabled = false;
+            g_settings_save_pending = true;
+            extern void wifi_hosted_pause(void);
+            if (wifi_hosted_is_active()) wifi_hosted_pause();
+            printf("  WiFi disabled.\n");
+        } else if (strcmp(arg1, "ssid") == 0) {
+            if (!arg2) {
+                printf("  SSID: %s\n", g_settings.wifi_ssid[0] ? g_settings.wifi_ssid : "(not set)");
+            } else {
+                strncpy(g_settings.wifi_ssid, arg2, sizeof(g_settings.wifi_ssid) - 1);
+                g_settings.wifi_ssid[sizeof(g_settings.wifi_ssid) - 1] = '\0';
+                g_settings_save_pending = true;
+                printf("  SSID set: %s\n", g_settings.wifi_ssid);
+            }
+        } else if (strcmp(arg1, "pass") == 0) {
+            // Restore arg split so password can contain spaces
+            if (arg_split) *arg_split = ' ';
+            const char *pass_start = arg2 ? arg2 : NULL;
+            if (!pass_start) {
+                printf("  Password: %s\n", g_settings.wifi_pass[0] ? "(set)" : "(not set)");
+            } else {
+                strncpy(g_settings.wifi_pass, pass_start, sizeof(g_settings.wifi_pass) - 1);
+                g_settings.wifi_pass[sizeof(g_settings.wifi_pass) - 1] = '\0';
+                g_settings_save_pending = true;
+                printf("  Password set (%d chars)\n", (int)strlen(g_settings.wifi_pass));
+            }
+        } else {
+            printf("  usage: wifi [on|off|status|ssid <name>|pass <password>]\n");
+        }
+
+    // ── NTP ──
+    } else if (strcmp(cmd, "ntp") == 0) {
+        extern void time_manager_set_ntp_config_fn(const char *server, int32_t poll_s);
+        if (!arg1) {
+            printf("  NTP server: %s\n", g_settings.ntp_server);
+            printf("  Poll interval: %d seconds\n", g_settings.ntp_poll_s);
+        } else {
+            // ntp <server> [poll_s]
+            strncpy(g_settings.ntp_server, arg1, sizeof(g_settings.ntp_server) - 1);
+            g_settings.ntp_server[sizeof(g_settings.ntp_server) - 1] = '\0';
+            if (arg2) {
+                int poll = atoi(arg2);
+                if (poll >= 300 && poll <= 3600) {
+                    g_settings.ntp_poll_s = poll;
+                } else {
+                    printf("  Poll interval must be 300-3600 seconds.\n");
+                }
+            }
+            g_settings_save_pending = true;
+            time_manager_set_ntp_config_fn(g_settings.ntp_server, g_settings.ntp_poll_s);
+            printf("  NTP: %s (poll %ds)\n", g_settings.ntp_server, g_settings.ntp_poll_s);
+        }
+
+    // ── Time source status ──
+    } else if (strcmp(cmd, "time") == 0) {
+        extern void time_manager_print_status_fn(void);
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        struct tm tm;
+        gmtime_r(&tv.tv_sec, &tm);
+        printf("  System clock: %04d-%02d-%02d %02d:%02d:%02d.%03ld UTC\n",
+               tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+               tm.tm_hour, tm.tm_min, tm.tm_sec, tv.tv_usec / 1000);
+        time_manager_print_status_fn();
+
+    } else if (strcmp(cmd, "screenshot") == 0) {
+        if (arg1 && strcmp(arg1, "send") == 0) {
+            // screenshot send — base64 encode last saved PNG over serial
+            extern bool screenshot_send_fn(void);
+            if (!screenshot_send_fn()) {
+                printf("  No screenshot to send (capture one first)\n");
+            }
+        } else {
+            // screenshot — save to SD only
+            extern bool screenshot_save_fn(void);
+            printf("  Capturing screenshot...\n");
+            if (!screenshot_save_fn()) {
+                printf("  Screenshot failed (SD card mounted?)\n");
+            }
+        }
+
     } else if (strcmp(cmd, "reboot") == 0) {
         printf("  Shutting down SD card...\n");
         extern void sd_safe_shutdown(void);
@@ -1025,11 +1183,12 @@ static void serial_console_task(void *arg) {
             // Heartbeat in log mode
             if (s_mode == MODE_LOG && g_settings.heartbeat_enabled &&
                 esp_log_timestamp() >= heartbeat_next) {
-                printf("[CONSOLE] Serial console heartbeat\n");
-                printf("[MEM] internal=%u largest=%u PSRAM=%u\n",
-                       heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                       heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-                       heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+                printf("\033[0;33m[CONSOLE] Serial console heartbeat\033[0m\n");
+                printf("[MEM] free=%u largest_blk=%u min_ever=%u PSRAM=%u\n",
+                       (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                       (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+                       (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
                 heartbeat_next = esp_log_timestamp() + (g_settings.heartbeat_period_s * 1000);
             }
             vTaskDelay(pdMS_TO_TICKS(50));

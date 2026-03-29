@@ -2,31 +2,23 @@
  * @Description: lvgl_9_ui
  * @Author: LILYGO_L
  * @Date: 2025-06-13 13:34:16
- * @LastEditTime: 2026-03-10 (jstockdale: non-blocking USB, ADSB table on live screen)
+ * @LastEditTime: 2026-01-14 11:27:43
  * @License: GPL 3.0
  */
 #include <stdio.h>
 #include <unistd.h>
-#include <math.h>
 #include <sys/lock.h>
-#include <sys/time.h>
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
-#include "freertos/queue.h"
-#include "freertos/event_groups.h"
 #include "esp_timer.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_mipi_dsi.h"
 #include "esp_ldo_regulator.h"
 #include "driver/gpio.h"
-#include "driver/i2c_master.h"
 #include "esp_err.h"
 #include "esp_log.h"
-#include "esp_intr_alloc.h"
-#include "usb/usb_host.h"
-#include "driver/gpio.h"
 #include "lvgl.h"
 #include "t_display_p4_driver.h"
 #include "cpp_bus_driver_library.h"
@@ -42,13 +34,8 @@
 #include "lvgl_ui.h"
 #include "sd_pwr_ctrl_by_on_chip_ldo.h"
 #include "esp_vfs_fat.h"
-#include "sdmmc_cmd.h"
-#include "driver/sdmmc_host.h"
-#include "driver/sdspi_host.h"
-#include "driver/spi_common.h"
 #include "New Notification 010_c2_b16_s44100.h"
 #include "ICM20948_WE.h"
-#include "meshtastic_task.h"
 #include "esp_netif.h"
 #include "esp_eth.h"
 #include "esp_event.h"
@@ -56,50 +43,13 @@
 #if CONFIG_ENABLE_USB_DISPLAY == true
 #include "esp_lcd_usb_display.h"
 #else
-//#include "tinyusb.h"
-//#include "tusb_cdc_acm.h"
+#include "tinyusb.h"
+#include "tusb_cdc_acm.h"
 #endif
 #include "app_video.h"
 #include "driver/ppa.h"
 #include "esp_private/esp_cache_private.h"
 #include <fstream>
-
-#include "class_driver.h"
-#include "serial_console.h"
-#include "music_player.h"
-#include "nvs_flash.h"
-#include "device_settings.h"
-#include "meshy_channels.h"
-
-// Global settings instance — declared extern in device_settings.h
-device_settings_t g_settings;
-volatile bool g_settings_save_pending = false;
-volatile bool g_settings_reset_pending = false;
-// Global channel store — declared extern in meshy_channels.h
-meshy_channel_store_t g_meshy_channels;
-// WiFi disabled — Espressif Issue #17889 (SDMMC controller DMA conflict)
-// WiFi disabled — esp_hosted and esp_wifi_remote removed from build
-// to prevent SDIO auto-init that fragments internal heap (Issue #17889)
-// #include "sd_http_server.h"
-// #include "esp_wifi.h"
-// #include "esp_sntp.h"
-
-#define CONFIG_APP_QUIT_PIN 0
-#define HOST_LIB_TASK_PRIORITY 2
-#define CLASS_TASK_PRIORITY 3
-#define APP_QUIT_PIN CONFIG_APP_QUIT_PIN
-
-#ifdef CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK
-#define ENABLE_ENUM_FILTER_CALLBACK
-#endif // CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK
-
-// extern void class_driver_task(void *arg);
-// extern void class_driver_client_deregister(void);
-// extern void adsb_update_display(lv_obj_t *table);
-
-//static const char *TAG = "USB host lib";
-
-QueueHandle_t app_event_queue = NULL;
 
 #define SD_FILE_PATH_MUSIC "/sdcard/t_display_p4_lvgl_9_ui_resource/music/Erik Satie-Gymnopedie 1-Chase Coleman (piano).wav"
 
@@ -124,7 +74,6 @@ enum class Es8311_Mode
 enum class Imu_Mode
 {
     TEST = 0,
-    DOUBLE_TAP_WAKE = 1,
 };
 
 enum class Battery_Health_Mode
@@ -134,8 +83,7 @@ enum class Battery_Health_Mode
 
 enum class Gps_Mode
 {
-    RUN = 0,   // Normal operation — feed ADS-B receiver pos, no CIT UI
-    TEST = 1,  // CIT test screen — update GPS data label
+    TEST = 0,
 };
 
 enum class Ethernet_Mode
@@ -173,61 +121,128 @@ enum class At_Mode
     TEST = 0,
 };
 
+// enum class Sleep_Mode
+// {
+//     NORMAL_SLEEP_TEST,
+//     LIGHT_SLEEP_TEST,
+// };
+
 enum class Music_File_Read_Speed_Enum
 {
     LOW_SPEED,
     HIGH_SPEED,
 };
 
-// WAV file header
+// WAV 文件头结构体
 struct Wav_Header
 {
-    char riff_header[4];
-    uint32_t riff_size;
-    char wave_header[4];
-    char fmt_header[4];
-    uint32_t fmt_chunk_size;
-    uint16_t audio_format;
-    uint16_t num_channel;
-    uint32_t sample_rate;
-    uint32_t byte_rate;
-    uint16_t block_align;
-    uint16_t bits_per_sample;
-    char data_header[4];
-    uint32_t data_size;
+    char riff_header[4];      // "RIFF" 标记，表示这是一个 RIFF 文件
+    uint32_t riff_size;       // 整个 RIFF 块的大小，不包括 "RIFF" 标记和 riff_size 本身 (文件大小 - 8)
+    char wave_header[4];      // "WAVE" 标记，表示这是一个 WAVE 文件
+    char fmt_header[4];       // "fmt " 标记，表示这是格式块
+    uint32_t fmt_chunk_size;  // 格式块的大小，通常是 16 (PCM) 或 18/40 (有附加信息)
+    uint16_t audio_format;    // 音频格式，1 表示 PCM (未压缩)，其他值表示压缩格式
+    uint16_t num_channel;     // 声道数，1 表示单声道，2 表示立体声
+    uint32_t sample_rate;     // 采样率，例如 44100 Hz, 48000 Hz
+    uint32_t byte_rate;       // 字节率，每秒的字节数 (sample_rate * num_channel * bits_per_sample / 8)
+    uint16_t block_align;     // 块对齐，每个采样需要的字节数 (num_channel * bits_per_sample / 8)
+    uint16_t bits_per_sample; // 位深度，每个采样的位数，例如 8, 16, 24, 32
+    char data_header[4];      // "data" 标记，表示这是数据块
+    uint32_t data_size;       // 数据块的大小，即音频数据的字节数
 };
 
 struct System_Status
 {
-    struct { bool init_flag = false; } sgm38121;
-    struct { bool init_flag = false; } sx1262;
-    struct { bool init_flag = false; } camera;
-
-#if defined CONFIG_BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
-    struct { bool init_flag = false; } xl9555;
-    struct { bool init_flag = false; } tca8418;
-    struct { bool init_flag = false; } st25r3916;
-    struct { bool init_flag = false; } cc1101;
-    struct { bool init_flag = false; } nrf24l01;
-    struct { bool init_flag = false; } bq25896;
-#endif
-
-    struct { bool init_flag = false; } pcf8563;
-    struct { bool init_flag = false; } bq27220;
-    struct { bool init_flag = false; } aw86224;
-    struct { bool init_flag = false; } es8311;
-    struct { bool init_flag = false; } icm20948;
-    struct { bool init_flag = false; } l76k;
     struct
     {
         bool init_flag = false;
+    } sgm38121;
+
+    struct
+    {
+        bool init_flag = false;
+    } sx1262;
+
+    struct
+    {
+        bool init_flag = false;
+    } camera;
+
+#if defined CONFIG_BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
+    struct
+    {
+        bool init_flag = false;
+    } xl9555;
+
+    struct
+    {
+        bool init_flag = false;
+    } tca8418;
+
+    struct
+    {
+        bool init_flag = false;
+    } st25r3916;
+
+    struct
+    {
+        bool init_flag = false;
+    } cc1101;
+
+    struct
+    {
+        bool init_flag = false;
+    } nrf24l01;
+
+    struct
+    {
+        bool init_flag = false;
+    } bq25896;
+#endif
+
+    struct
+    {
+        bool init_flag = false;
+    } pcf8563;
+
+    struct
+    {
+        bool init_flag = false;
+    } bq27220;
+
+    struct
+    {
+        bool init_flag = false;
+    } aw86224;
+
+    struct
+    {
+        bool init_flag = false;
+    } es8311;
+
+    struct
+    {
+        bool init_flag = false;
+    } icm20948;
+
+    struct
+    {
+        bool init_flag = false;
+    } l76k;
+
+    struct
+    {
+        bool init_flag = false;
+
         bool wifi_connect_status = false;
     } esp32c6;
 };
 
 Ethernet_Info Eth_Info;
+
 System_Status Sys_Status;
 
+// LVGL library is not thread-safe, this example will call LVGL APIs from different tasks, so use a mutex to protect it
 _lock_t lvgl_api_lock;
 
 lv_obj_t *Lvgl_Startup_Progress_Bar;
@@ -242,14 +257,8 @@ TaskHandle_t Gps_Task_Handle = NULL;
 TaskHandle_t Ethernet_Task_Handle = NULL;
 TaskHandle_t At_Task_Handle = NULL;
 TaskHandle_t Sleep_Task_Handle = NULL;
-TaskHandle_t Adsb_App_Task_Handle = NULL;
-TaskHandle_t Meshy_App_Task_Handle = NULL;
-TaskHandle_t Scope_App_Task_Handle = NULL;
+TaskHandle_t Rf_Task_Handle = NULL;
 TaskHandle_t Iis_Transmission_Data_Stream_Task = NULL;
-
-// USB host task handles — kept so app_main can clean up if needed
-static TaskHandle_t s_host_lib_task_hdl = NULL;
-static TaskHandle_t s_class_driver_task_hdl = NULL;
 
 uint8_t AW86224_Vibration_Play_Count = 0;
 
@@ -265,7 +274,8 @@ std::ifstream Music_File;
 Music_File_Read_Speed_Enum Music_File_Read_Speed = Music_File_Read_Speed_Enum::HIGH_SPEED;
 
 Imu_Mode ICM20948_Imu_Mode = Imu_Mode::TEST;
-Gps_Mode L76k_Gps_Mode = Gps_Mode::RUN;
+
+Gps_Mode L76k_Gps_Mode = Gps_Mode::TEST;
 
 bool L76k_Gps_Positioning_Flag = false;
 size_t L76k_Gps_Positioning_Time = 0;
@@ -273,6 +283,8 @@ size_t L76k_Gps_Positioning_Time = 0;
 Ethernet_Mode Ip101gri_Ethernet_Mode = Ethernet_Mode::TEST;
 
 At_Mode Esp32c6_At_Mode = At_Mode::TEST;
+
+// Sleep_Mode Esp32p4_Sleep_Mode = Sleep_Mode::LIGHT_SLEEP_TEST;
 
 ppa_client_handle_t ppa_srm_handle = NULL;
 size_t data_cache_line_size = 0;
@@ -282,6 +294,11 @@ void *lcd_buffer[CONFIG_EXAMPLE_CAM_BUF_COUNT];
 int32_t fps_count;
 int64_t start_time;
 int32_t video_cam_fd0;
+
+bool Rf_Send_Flag = false;
+uint8_t Rf_Send_Package[255] = {0};
+
+bool Device_Rf_Task_Stop_Flag = false;
 
 QueueHandle_t app_queue;
 
@@ -331,6 +348,7 @@ auto L76K = std::make_unique<Cpp_Bus_Driver::L76k>(L76K_Uart_Bus, [](bool Value)
 auto ESP32C6_AT = std::make_unique<Cpp_Bus_Driver::Esp_At>(ESP32C6_AT_SDIO_Bus,
                                                            [](bool value) -> IRAM_ATTR void
                                                            {
+                                                               // ESP32C6复位
                                                                XL9535->pin_write(XL9535_ESP32C6_EN, static_cast<Cpp_Bus_Driver::Xl95x5::Value>(value));
                                                            });
 
@@ -338,81 +356,72 @@ auto ESP32C6_AT = std::make_unique<Cpp_Bus_Driver::Esp_At>(ESP32C6_AT_SDIO_Bus,
 auto SX1262 = std::make_unique<Cpp_Bus_Driver::Sx126x>(SX1262_SPI_Bus, Cpp_Bus_Driver::Sx126x::Chip_Type::SX1262, SX1262_BUSY,
                                                        SX1262_CS, DEFAULT_CPP_BUS_DRIVER_VALUE);
 
-// Screen detection globals — set by detect_screen_type() before display init
-#include "screen_detect.h"
-screen_type_t g_screen_type = SCREEN_TYPE_UNKNOWN;
-uint32_t g_screen_width = HI8561_SCREEN_WIDTH;   // default until detected
-uint32_t g_screen_height = HI8561_SCREEN_HEIGHT;
-
-// Screen timeout / wake state (accessed from lvgl_ui.cpp settings)
-volatile uint32_t g_last_touch_ms = 0;
-volatile bool g_screen_blanked = false;
-
-// GPS fix epoch — set once on first quality GPS fix.
-// Both ADS-B and Meshy SD logs use this for rename timestamps.
-// Zero means no fix yet — log lines use [boot+X] format.
-extern "C" volatile time_t g_gps_fix_epoch = 0;
-
-// Bridge: allow C music_player code to reconfigure I2S + ES8311 clock rate.
-// Called when an MP3/WAV has a different sample rate than the current output.
-static uint32_t s_current_output_rate = 44100;
-extern "C" bool music_set_output_rate(uint32_t rate_hz) {
-    if (rate_hz == s_current_output_rate) return true;
-    bool ok = ES8311_IIS_Bus->set_clock_rate(rate_hz);
-    if (ok) ok = ES8311->set_clock_coeff(256, rate_hz);
-    if (ok) {
-        s_current_output_rate = rate_hz;
-        ESP_LOGI("MUSIC", "Output rate changed to %lu Hz", (unsigned long)rate_hz);
-    } else {
-        ESP_LOGW("MUSIC", "Failed to set output rate %lu Hz", (unsigned long)rate_hz);
-    }
-    return ok;
-}
-
 #if defined SCREEN_ROTATION_DIRECTION_0
-auto System_Ui = std::make_unique<Lvgl_Ui::System>(SCREEN_WIDTH_MAX, SCREEN_HEIGHT_MAX);
+auto System_Ui = std::make_unique<Lvgl_Ui::System>(SCREEN_WIDTH, SCREEN_HEIGHT);
 #elif defined SCREEN_ROTATION_DIRECTION_90
-auto System_Ui = std::make_unique<Lvgl_Ui::System>(SCREEN_HEIGHT_MAX, SCREEN_WIDTH_MAX);
+auto System_Ui = std::make_unique<Lvgl_Ui::System>(SCREEN_HEIGHT, SCREEN_WIDTH);
 #else
 #error "unknown macro definition, please select the correct macro definition."
 #endif
 
-// Both touch drivers always constructed — only the detected one gets begin()
+#if defined CONFIG_SCREEN_TYPE_HI8561
 auto HI8561_T_IIC_Bus = std::make_shared<Cpp_Bus_Driver::Hardware_Iic_1>(HI8561_TOUCH_SDA, HI8561_TOUCH_SCL, I2C_NUM_0);
+
 auto HI8561_T = std::make_unique<Cpp_Bus_Driver::Hi8561_Touch>(HI8561_T_IIC_Bus, HI8561_TOUCH_IIC_ADDRESS, DEFAULT_CPP_BUS_DRIVER_VALUE);
 
+#elif defined CONFIG_SCREEN_TYPE_RM69A10
+
 auto GT9895_IIC_Bus = std::make_shared<Cpp_Bus_Driver::Hardware_Iic_1>(GT9895_TOUCH_SDA, GT9895_TOUCH_SCL, I2C_NUM_0);
+
 auto GT9895 = std::make_unique<Cpp_Bus_Driver::Gt9895>(GT9895_IIC_Bus, GT9895_IIC_ADDRESS, GT9895_X_SCALE_FACTOR, GT9895_Y_SCALE_FACTOR,
                                                        DEFAULT_CPP_BUS_DRIVER_VALUE);
+#else
+#error "unknown macro definition, please select the correct macro definition."
+#endif
 
 #if defined CONFIG_BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
 
-enum class Nfc_Mode { TEST = 0, };
-enum class Cc1101_Rf_Switch { RF_SWITCH_315MHZ, RF_SWITCH_434MHZ, RF_SWITCH_868_915MHZ, };
+enum class Nfc_Mode
+{
+    TEST = 0,
+};
+
+enum class Cc1101_Rf_Switch
+{
+    RF_SWITCH_315MHZ,
+    RF_SWITCH_434MHZ,
+    RF_SWITCH_868_915MHZ,
+};
 
 volatile bool TCA8418_Interrupt_Flag = false;
 volatile bool Cc1101_Interrupt_Flag = false;
 volatile bool Nrf24l01_Interrupt_Flag = false;
 
 bool Device_Nfc_Task_Stop_Flag = false;
+
 TaskHandle_t Nfc_Task_Handle = NULL;
+
 Nfc_Mode St25r3916_Nfc_Mode = Nfc_Mode::TEST;
 
 auto Bq25896_Dev = std::make_shared<Kode_Bq25896::bq25896_dev_t>();
 Kode_Bq25896::bq25896_handle_t Bq25896_Handle = Bq25896_Dev.get();
 
+//  Software IIC
 auto XL9555_IIC_Bus = std::make_shared<Cpp_Bus_Driver::Software_Iic>(XL9555_SDA, XL9555_SCL);
 auto TCA8418_IIC_Bus = std::make_shared<Cpp_Bus_Driver::Software_Iic>(TCA8418_SDA, TCA8418_SCL);
 auto Bq25896_Iic_Bus = std::make_shared<Cpp_Bus_Driver::Software_Iic>(BQ25896_SDA, BQ25896_SCL);
 
+// SPI
 auto Cc1101_SPI_Bus = std::make_shared<Cpp_Bus_Driver::Hardware_Spi>(T_MIXRF_CC1101_MOSI, T_MIXRF_CC1101_SCLK, T_MIXRF_CC1101_MISO, SPI2_HOST, 0);
 auto Nrf24l01_SPI_Bus = std::make_shared<Cpp_Bus_Driver::Hardware_Spi>(T_MIXRF_NRF24L01_MOSI, T_MIXRF_NRF24L01_SCLK, T_MIXRF_NRF24L01_MISO, SPI2_HOST, 0);
 RadioLibHal *Cc1101_Radiolib_Hal = new Radiolib_Cpp_Bus_Driver_Hal(Cc1101_SPI_Bus, 10000000, T_MIXRF_CC1101_CS);
 RadioLibHal *Nrf24l01_Radiolib_Hal = new Radiolib_Cpp_Bus_Driver_Hal(Nrf24l01_SPI_Bus, 10000000, T_MIXRF_NRF24L01_CS);
 
+//  Software IIC
 auto XL9555 = std::make_unique<Cpp_Bus_Driver::Xl95x5>(XL9555_IIC_Bus, XL9555_IIC_ADDRESS, DEFAULT_CPP_BUS_DRIVER_VALUE);
 auto TCA8418 = std::make_unique<Cpp_Bus_Driver::Tca8418>(TCA8418_IIC_Bus, TCA8418_IIC_ADDRESS, DEFAULT_CPP_BUS_DRIVER_VALUE);
 
+// SPI
 CC1101 Cc1101 = new Module(Cc1101_Radiolib_Hal, static_cast<uint32_t>(RADIOLIB_NC),
                            static_cast<uint32_t>(RADIOLIB_NC), static_cast<uint32_t>(RADIOLIB_NC), T_MIXRF_CC1101_BUSY);
 nRF24 Nrf24l01 = new Module(Nrf24l01_Radiolib_Hal, static_cast<uint32_t>(RADIOLIB_NC),
@@ -426,94 +435,197 @@ auto ESP32P4 = std::make_unique<Cpp_Bus_Driver::Tool>();
 #else
 typedef struct
 {
-    size_t buf_len;
-    uint8_t itf;
+    uint8_t buf[CONFIG_TINYUSB_CDC_RX_BUFSIZE + PREPEND_LENGTH + 1]; // Data buffer
+    size_t buf_len;                                                  // Number of bytes received
+    uint8_t itf;                                                     // Index of CDC device interface
 } app_message_t;
+
+uint8_t rx_buf[CONFIG_TINYUSB_CDC_RX_BUFSIZE + 1];
 #endif
 
-// Get local timezone offset in minutes from GPS position and UTC date.
-// Uses the full tz_lookup library with 0.1° resolution grid and DST rules.
-// Returns 0 (UTC) if no GPS fix or system clock not set.
-#include "tz_lookup.h"
+// esp_err_t register_gpio_wakeup(void)
+// {
+//     /* Initialize GPIO */
+//     gpio_config_t config = {
+//         .pin_bit_mask = BIT64(35),
+//         .mode = GPIO_MODE_INPUT,
+//         .pull_up_en = GPIO_PULLUP_DISABLE,
+//         .pull_down_en = GPIO_PULLDOWN_DISABLE,
+//         .intr_type = GPIO_INTR_DISABLE,
+// #if SOC_GPIO_SUPPORT_PIN_HYS_FILTER
+//         .hys_ctrl_mode = GPIO_HYS_SOFT_ENABLE, /*!< GPIO hysteresis: hysteresis filter on slope input    */
+// #endif
+//     };
+//     ESP_RETURN_ON_ERROR(gpio_config(&config), TAG, "Initialize GPIO%d failed", 35);
 
-static int16_t get_tz_offset_minutes(void) {
-    if (tz_is_manual()) {
-        // Manual override — tz_lookup handles this internally but we
-        // need the value here for direct RTC calculations.
-        receiver_pos_t rx = {0};  // dummy
-        struct timeval tv;
-        gettimeofday(&tv, NULL);
-        struct tm tm_utc;
-        gmtime_r(&tv.tv_sec, &tm_utc);
-        tz_result_t r = tz_lookup(0, 0, tm_utc.tm_year + 1900, tm_utc.tm_mon + 1, tm_utc.tm_mday);
-        return r.total_offset_min;
-    }
-    receiver_pos_t rx = adsb_get_receiver_pos();
-    if (!rx.fix_valid) return 0;
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    struct tm tm_utc;
-    gmtime_r(&tv.tv_sec, &tm_utc);
-    return tz_get_offset_minutes(rx.lat, rx.lon,
-        tm_utc.tm_year + 1900, tm_utc.tm_mon + 1, tm_utc.tm_mday);
-}
+//     /* Enable wake up from GPIO */
+//     ESP_RETURN_ON_ERROR(gpio_wakeup_enable(gpio_num_t(35), GPIO_WAKEUP_LEVEL == 0 ? GPIO_INTR_LOW_LEVEL : GPIO_INTR_HIGH_LEVEL),
+//                         TAG, "Enable gpio wakeup failed");
+//     ESP_RETURN_ON_ERROR(esp_sleep_enable_gpio_wakeup(), TAG, "Configure gpio as wakeup source failed");
+
+//     /* Make sure the GPIO is inactive and it won't trigger wakeup immediately */
+//     example_wait_gpio_inactive();
+//     ESP_LOGI(TAG, "gpio wakeup source is ready");
+
+//     return ESP_OK;
+// }
+
+// void Esp_Enter_Light_Sleep(void)
+// {
+//     register_gpio_wakeup();
+
+//     printf("Entering light sleep\n");
+//     /* To make sure the complete line is printed before entering sleep mode,
+//      * need to wait until UART TX FIFO is empty:
+//      */
+//     uart_wait_tx_idle_polling((uart_port_t)CONFIG_ESP_CONSOLE_UART_NUM);
+
+//     /* Get timestamp before entering sleep */
+//     int64_t t_before_us = esp_timer_get_time();
+
+//     esp_light_sleep_start();
+
+//     /* Get timestamp after waking up from sleep */
+//     int64_t t_after_us = esp_timer_get_time();
+
+//     /* Determine wake up reason */
+//     const char *wakeup_reason;
+//     switch (esp_sleep_get_wakeup_cause())
+//     {
+//     case ESP_SLEEP_WAKEUP_TIMER:
+//         wakeup_reason = "timer";
+//         break;
+//     case ESP_SLEEP_WAKEUP_GPIO:
+//         wakeup_reason = "pin";
+//         break;
+//     case ESP_SLEEP_WAKEUP_UART:
+//         wakeup_reason = "uart";
+//         /* Hang-up for a while to switch and execute the uart task
+//          * Otherwise the chip may fall sleep again before running uart task */
+//         vTaskDelay(1);
+//         break;
+// #if TOUCH_LSLEEP_SUPPORTED
+//     case ESP_SLEEP_WAKEUP_TOUCHPAD:
+//         wakeup_reason = "touch";
+//         break;
+// #endif
+//     default:
+//         wakeup_reason = "other";
+//         break;
+//     }
+// #if CONFIG_NEWLIB_NANO_FORMAT
+//     /* printf in newlib-nano does not support %ll format, causing example test fail */
+//     printf("Returned from light sleep, reason: %s, t=%d ms, slept for %d ms\n",
+//            wakeup_reason, (int)(t_after_us / 1000), (int)((t_after_us - t_before_us) / 1000));
+// #else
+//     printf("Returned from light sleep, reason: %s, t=%lld ms, slept for %lld ms\n",
+//            wakeup_reason, t_after_us / 1000, (t_after_us - t_before_us) / 1000);
+// #endif
+// }
+
+// void Device_Sleep_Status(bool status)
+// {
+//     if (status == true)
+//     {
+//         printf("device sleep start\n");
+
+//         SX1262->set_sleep();
+
+//         XL9535->pin_write(XL9535_GPS_WAKE_UP, Cpp_Bus_Driver::Xl95x5::Value::LOW);
+
+//         ICM20948->sleep(true);
+
+//         Cpp_Bus_Driver::Es8311::Power_Status ps =
+//             {
+//                 .contorl =
+//                     {
+//                         .analog_circuits = false,               // 关闭模拟电路
+//                         .analog_bias_circuits = false,          // 关闭模拟偏置电路
+//                         .analog_adc_bias_circuits = false,      // 关闭模拟ADC偏置电路
+//                         .analog_adc_reference_circuits = false, // 关闭模拟ADC参考电路
+//                         .analog_dac_reference_circuit = false,  // 关闭模拟DAC参考电路
+//                         .internal_reference_circuits = false,   // 关闭内部参考电路
+//                     },
+//                 .vmid = Cpp_Bus_Driver::Es8311::Vmid::POWER_DOWN,
+//             };
+//         ES8311->set_power_status(ps);
+//         ES8311->set_pga_power(false);
+//         ES8311->set_adc_power(false);
+//         ES8311->set_dac_power(false);
+
+//         ESP32C6_AT->set_sleep(Cpp_Bus_Driver::Esp_At::Sleep_Mode::POWER_DOWN);
+
+//         XL9535->pin_write(XL9535_SD_EN, Cpp_Bus_Driver::Xl95x5::Value::HIGH);
+
+//         SGM38121->set_channel_status(Cpp_Bus_Driver::Sgm38121::Channel::AVDD_1, Cpp_Bus_Driver::Sgm38121::Status::OFF);
+//         SGM38121->set_channel_status(Cpp_Bus_Driver::Sgm38121::Channel::AVDD_2, Cpp_Bus_Driver::Sgm38121::Status::OFF);
+
+//         XL9535->pin_write(XL9535_5_0_V_POWER_EN, Cpp_Bus_Driver::Xl95x5::Value::LOW);
+//         XL9535->pin_write(XL9535_3_3_V_POWER_EN, Cpp_Bus_Driver::Xl95x5::Value::HIGH);
+
+//         // 背光150ma
+//         HI8561_T->start_pwm_gradient_time(0, 500);
+
+//         // Esp_Enter_Light_Sleep();
+//     }
+//     else
+//     {
+//         printf("device sleep close\n");
+//     }
+// }
 
 void Save_Real_Time(Cpp_Bus_Driver::Esp_At::Real_Time time)
 {
-    int16_t tz_off_min = get_tz_offset_minutes();
-
-    // Compute local time from UTC for RTC and UI display
-    time_t utc_epoch = 0;
-    {
-        struct tm tm_utc = {};
-        tm_utc.tm_year = time.year - 1900;
-        tm_utc.tm_mon  = time.month - 1;
-        tm_utc.tm_mday = time.day;
-        tm_utc.tm_hour = time.hour;
-        tm_utc.tm_min  = time.minute;
-        tm_utc.tm_sec  = time.second;
-        utc_epoch = mktime(&tm_utc);
-    }
-    time_t local_epoch = utc_epoch + tz_off_min * 60;
-    struct tm tm_local;
-    gmtime_r(&local_epoch, &tm_local);
-
+    // 保存实时时间
     Cpp_Bus_Driver::Pcf8563x::Time t =
         {
-            .second = static_cast<uint8_t>(tm_local.tm_sec),
-            .minute = static_cast<uint8_t>(tm_local.tm_min),
-            .hour = static_cast<uint8_t>(tm_local.tm_hour),
-            .day = static_cast<uint8_t>(tm_local.tm_mday),
+            .second = time.second,
+            .minute = time.minute,
+            .hour = static_cast<uint8_t>((time.hour + 8 + 24) % 24),
+            .day = time.day,
             .week = Cpp_Bus_Driver::Pcf8563x::Week::SUNDAY,
             .month = time.month,
             .year = static_cast<uint8_t>(time.year - 2000),
         };
 
-    if (time.week == "Sun")       t.week = Cpp_Bus_Driver::Pcf8563x::Week::SUNDAY;
-    else if (time.week == "Mon")  t.week = Cpp_Bus_Driver::Pcf8563x::Week::MONDAY;
-    else if (time.week == "Tue")  t.week = Cpp_Bus_Driver::Pcf8563x::Week::TUESDAY;
-    else if (time.week == "Wed")  t.week = Cpp_Bus_Driver::Pcf8563x::Week::WEDNESDAY;
-    else if (time.week == "Thu")  t.week = Cpp_Bus_Driver::Pcf8563x::Week::THURSDAY;
-    else if (time.week == "Fri")  t.week = Cpp_Bus_Driver::Pcf8563x::Week::FRIDAY;
-    else if (time.week == "Sat")  t.week = Cpp_Bus_Driver::Pcf8563x::Week::SATURDAY;
+    if (time.week == "Sun")
+    {
+        t.week = Cpp_Bus_Driver::Pcf8563x::Week::SUNDAY;
+    }
+    else if (time.week == "Mon")
+    {
+        t.week = Cpp_Bus_Driver::Pcf8563x::Week::MONDAY;
+    }
+    else if (time.week == "Tue")
+    {
+        t.week = Cpp_Bus_Driver::Pcf8563x::Week::TUESDAY;
+    }
+    else if (time.week == "Wed")
+    {
+        t.week = Cpp_Bus_Driver::Pcf8563x::Week::WEDNESDAY;
+    }
+    else if (time.week == "Thu")
+    {
+        t.week = Cpp_Bus_Driver::Pcf8563x::Week::THURSDAY;
+    }
+    else if (time.week == "Fri")
+    {
+        t.week = Cpp_Bus_Driver::Pcf8563x::Week::FRIDAY;
+    }
+    else if (time.week == "Sat")
+    {
+        t.week = Cpp_Bus_Driver::Pcf8563x::Week::SATURDAY;
+    }
 
     PCF8563->set_time(t);
 
-    // Sync the POSIX system clock so gettimeofday() returns real UTC time.
-    if (utc_epoch > 0) {
-        struct timeval tv_now = { .tv_sec = utc_epoch, .tv_usec = 0 };
-        settimeofday(&tv_now, NULL);
-    }
-
-    // UI displays local time
-    static const char *wday_names[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
-    System_Ui->_time.week = wday_names[tm_local.tm_wday];
-    System_Ui->_time.year = static_cast<uint16_t>(tm_local.tm_year + 1900);
-    System_Ui->_time.month = static_cast<uint8_t>(tm_local.tm_mon + 1);
-    System_Ui->_time.day = static_cast<uint8_t>(tm_local.tm_mday);
-    System_Ui->_time.hour = static_cast<uint8_t>(tm_local.tm_hour);
-    System_Ui->_time.minute = static_cast<uint8_t>(tm_local.tm_min);
-    System_Ui->_time.second = static_cast<uint8_t>(tm_local.tm_sec);
+    System_Ui->_time.week = time.week;
+    System_Ui->_time.year = time.year;
+    System_Ui->_time.month = time.month;
+    System_Ui->_time.day = time.day;
+    System_Ui->_time.hour = static_cast<uint8_t>((time.hour + 8 + 24) % 24);
+    System_Ui->_time.minute = time.minute;
+    System_Ui->_time.second = time.second;
     System_Ui->_time.time_zone = time.time_zone;
 }
 
@@ -535,38 +647,68 @@ bool Play_Wav_File(const char *file_path)
         return false;
     }
 
+    // 分别检查 WAV 文件头的每个部分
     if (strncmp(wav_header.riff_header, "RIFF", 4) != 0)
+    {
         printf("invalid wav file format: riff_header is not 'RIFF'\n");
+        // Music_File.close();
+        // return false;
+    }
     else if (strncmp(wav_header.wave_header, "WAVE", 4) != 0)
+    {
         printf("invalid wav file format: wave_header is not 'WAVE'\n");
+        // Music_File.close();
+        // return false;
+    }
     else if (strncmp(wav_header.fmt_header, "fmt ", 4) != 0)
+    {
         printf("invalid wav file format: fmt_header is not 'fmt '\n");
+        // Music_File.close();
+        // return false;
+    }
     else if (strncmp(wav_header.data_header, "data", 4) != 0)
+    {
         printf("invalid wav file format: data_header is not 'data'\n");
+        // Music_File.close();
+        // return false;
+    }
 
     printf("sample rate: %ld\n", wav_header.sample_rate);
     printf("channels: %d\n", wav_header.num_channel);
     printf("bits per sample: %d\n", wav_header.bits_per_sample);
     printf("data_size: %ld\n", wav_header.data_size);
 
+    // 检查采样率、通道数和位深度是否与 I2S 配置匹配 (如果使用 I2S)
     if (wav_header.sample_rate != SAMPLE_RATE ||
         wav_header.num_channel != NUM_CHANNEL ||
         wav_header.bits_per_sample != BITS_PER_SAMPLE)
     {
-        printf("wav file parameters do not match i2s configuration\n");
+        printf("wav file parameters do not match i2s configuration audio may not play correctly\n");
         Music_File.close();
         return false;
     }
 
+    // 计算播放时间
     double duration = 0.0;
     if (wav_header.sample_rate > 0 && wav_header.num_channel > 0 && wav_header.bits_per_sample > 0)
+    {
         duration = static_cast<double>(wav_header.data_size) / (wav_header.sample_rate * wav_header.num_channel * (wav_header.bits_per_sample / 8.0));
+    }
 
     printf("duration: %.2f s\n", duration);
 
     _lock_acquire(&lvgl_api_lock);
     System_Ui->set_win_music_current_total_time(0, duration);
     _lock_release(&lvgl_api_lock);
+
+    // 读取并播放音频数据
+    // std::unique_ptr<char[]> data_buffer = std::make_unique<char[]>(1024 * 8);
+    // if (data_buffer == nullptr)
+    // {
+    //     printf("failed to allocate memory for audio buffer\n");
+    //     Music_File.close();
+    //     return false;
+    // }
 
     size_t cycle_time = 0;
 
@@ -578,22 +720,33 @@ bool Play_Wav_File(const char *file_path)
     while (Music_File.good())
     {
         if (Music_Play_End_Flag == true)
+        {
             break;
+        }
 
         if (ES8311_Speaker_Mode == Es8311_Mode::TEST)
         {
+            // 播放音乐测试
             ES8311->write_data(c2_b16_s44100, sizeof(c2_b16_s44100));
+
             ES8311_Speaker_Mode = Es8311_Mode::PLAY_MUSIC;
         }
 
         if (Set_Music_Current_Time_S_Flag == true)
         {
             printf("music play set current time: %.2f s\n", Set_Music_Current_Time_S);
+
+            // 计算每帧的字节数
             size_t bytes_per_frame = wav_header.num_channel * (wav_header.bits_per_sample / 8);
-            std::streamoff seek_offset = static_cast<std::streamoff>(Set_Music_Current_Time_S * wav_header.sample_rate) * bytes_per_frame;
+            // 确保seek_offset是帧的整数倍
+            std::streamoff seek_offset = static_cast<std::streamoff>(
+                                             Set_Music_Current_Time_S * wav_header.sample_rate) *
+                                         bytes_per_frame;
             Music_File.seekg(sizeof(wav_header) + seek_offset, std::ios::beg);
+
             Iis_Transmission_Data_Stream.clear();
             Iis_Read_Data_Size_Index = 0;
+
             Set_Music_Current_Time_S_Flag = false;
         }
 
@@ -601,28 +754,62 @@ bool Play_Wav_File(const char *file_path)
         {
             if (System_Ui->_current_win == Lvgl_Ui::System::Current_Win::MUSIC)
             {
+                // 每隔1秒更新一次音乐播放时间数据
                 if (esp_log_timestamp() > cycle_time)
                 {
                     std::streamoff current_pos = Music_File.tellg();
                     double current_time = 0.0;
                     if (current_pos > 0)
                     {
+                        // 当前数据在文件中的偏移量，减去头部长度
                         std::streamoff data_offset = current_pos - sizeof(wav_header);
                         current_time = static_cast<double>(data_offset) / (wav_header.sample_rate * wav_header.num_channel * (wav_header.bits_per_sample / 8.0));
                         _lock_acquire(&lvgl_api_lock);
                         System_Ui->set_win_music_current_total_time(current_time, duration);
                         _lock_release(&lvgl_api_lock);
                     }
+
                     printf("music play current time: %.2f s\n", current_time);
+
                     cycle_time = esp_log_timestamp() + 1000;
                 }
             }
 
+            // Music_File.read(data_buffer.get(), 1024 * 8);
+            // std::streamsize bytes_read = Music_File.gcount(); // 获取实际读取的字节数
+
+            // if (bytes_read > 0)
+            // {
+            //     ES8311->write_data(data_buffer.get(), bytes_read); // 这一行需要根据你的 I2S 驱动实现来修改
+            // }
+            // // else
+            // // {
+            // //     break; // 结束循环，如果读取的字节数为 0
+            // // }
+
             if (Iis_Transmission_Data_Stream.size() > 1024 * 10)
             {
-                size_t bytes_read = ES8311->write_data(Iis_Transmission_Data_Stream.data() + Iis_Read_Data_Size_Index, 1024 * 10);
+                // 存储数据
+                // memcpy(data_buffer.get(), Iis_Transmission_Data_Stream.data(), 1024 * 100);
+                // size_t bytes_read = ES8311->write_data(data_buffer.get(), 1024 * 100); // 这一行需要根据你的 I2S 驱动实现来修改
+                // if (bytes_read > 0)
+                // {
+                //     // 删除已经存储的数据
+                //     Iis_Transmission_Data_Stream.erase(Iis_Transmission_Data_Stream.begin(), Iis_Transmission_Data_Stream.begin() + bytes_read);
+                // }
+
+                size_t bytes_read = ES8311->write_data(Iis_Transmission_Data_Stream.data() + Iis_Read_Data_Size_Index, 1024 * 10); // 这一行需要根据你的 I2S 驱动实现来修改
                 Iis_Read_Data_Size_Index += bytes_read;
+                // if (bytes_read > 0)
+                // {
+                //     // 删除已经存储的数据
+                //     Iis_Transmission_Data_Stream.erase(Iis_Transmission_Data_Stream.begin(), Iis_Transmission_Data_Stream.begin() + bytes_read);
+                // }
             }
+            // else
+            // {
+            //     break; // 结束循环，如果读取的字节数为 0
+            // }
         }
 
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -630,7 +817,7 @@ bool Play_Wav_File(const char *file_path)
 
     vTaskSuspend(Iis_Transmission_Data_Stream_Task);
     Iis_Transmission_Data_Stream.clear();
-    Iis_Transmission_Data_Stream.shrink_to_fit();
+    Iis_Transmission_Data_Stream.shrink_to_fit(); // 释放内存
 
     Music_File.close();
 
@@ -639,6 +826,7 @@ bool Play_Wav_File(const char *file_path)
     if (Music_Play_End_Flag == false)
     {
         printf("music play finish\n");
+
         _lock_acquire(&lvgl_api_lock);
         System_Ui->set_win_music_play_imagebutton_status(System_Ui->_registry.win.music.play_flag);
         System_Ui->set_win_music_current_total_time(0, duration);
@@ -657,7 +845,6 @@ void lvgl_ui_task(void *arg)
 {
     printf("lvgl_ui_task start\n");
     uint32_t time_till_next_ms = 0;
-    uint32_t tick_count = 0;
 
     while (1)
     {
@@ -665,27 +852,15 @@ void lvgl_ui_task(void *arg)
         time_till_next_ms = lv_timer_handler();
         _lock_release(&lvgl_api_lock);
 
-        // Screen timeout — blank display after inactivity
-        if (g_settings.screen_timeout_s > 0 && !g_screen_blanked && g_last_touch_ms > 0) {
-            uint32_t elapsed = esp_log_timestamp() - g_last_touch_ms;
-            if (elapsed > (uint32_t)g_settings.screen_timeout_s * 1000) {
-                g_screen_blanked = true;
-                if (screen_is_rm69a10()) {
-                    set_rm69a10_brightness(Screen_Mipi_Dpi_Panel, 0);
-                } else {
-                    HI8561_T->start_pwm_gradient_time(0, 500);
-                }
-            }
-        }
-
+        // in case of task watch dog timeout, set the minimal delay to 10ms
         if (time_till_next_ms < 10)
+        {
             time_till_next_ms = 10;
-
-        // Temporary: print every 5 seconds to confirm handler is running
-        if (++tick_count % 500 == 0)
-            ESP_LOGI("LVGL", "tick %lu, next_ms=%lu", tick_count, time_till_next_ms);
-
+        }
         usleep(1000 * time_till_next_ms);
+
+        // lv_timer_handler();
+        // vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -696,12 +871,13 @@ void device_vibration_task(void *arg)
 
     while (1)
     {
-        if (AW86224_Vibration_Play_Count == static_cast<uint8_t>(-1))
+        if (AW86224_Vibration_Play_Count == static_cast<uint8_t>(-1)) // 开启F0校验
         {
             uint8_t timeout_count = 0;
             uint32_t f0_value = 0;
             bool f0_detection_result = false;
 
+            // 等待F0校准
             while (1)
             {
                 f0_value = AW86224->get_f0_detection();
@@ -714,6 +890,7 @@ void device_vibration_task(void *arg)
                 }
                 else
                 {
+                    // 阈值限定
                     if (f0_value > AW86224->_f0_value)
                     {
                         if ((f0_value - AW86224->_f0_value) <= 1500)
@@ -741,9 +918,11 @@ void device_vibration_task(void *arg)
                     f0_detection_result = false;
                     break;
                 }
+
                 vTaskDelay(pdMS_TO_TICKS(10));
             }
 
+            // 将触摸数据格式化为字符串
             std::string vibration_data_str = "vibration data:\n";
             vibration_data_str += "f0 value: " + std::to_string(f0_value) + "\n";
 
@@ -760,6 +939,7 @@ void device_vibration_task(void *arg)
                     vibration_data_str += "result: success\n";
                     lv_obj_set_style_text_color(System_Ui->_registry.win.cit.vibration_test.data_label, lv_color_hex(0x008B45), LV_PART_MAIN);
                 }
+                // 更新数据的标签
                 lv_label_set_text(System_Ui->_registry.win.cit.vibration_test.data_label, vibration_data_str.c_str());
                 _lock_release(&lvgl_api_lock);
             }
@@ -768,9 +948,11 @@ void device_vibration_task(void *arg)
         }
         else if (AW86224_Vibration_Play_Count > 0)
         {
+            // 启动振动
             AW86224->run_ram_playback_waveform(1, 15, 255);
             vTaskDelay(pdMS_TO_TICKS(50));
             AW86224->stop_ram_playback_waveform();
+
             AW86224_Vibration_Play_Count--;
         }
         else
@@ -792,39 +974,15 @@ void device_speaker_task(void *arg)
         switch (ES8311_Speaker_Mode)
         {
         case Es8311_Mode::TEST:
+            // 播放音乐测试
             ES8311->write_data(c2_b16_s44100, sizeof(c2_b16_s44100));
             break;
         case Es8311_Mode::PLAY_MUSIC:
-        {
-            // Play tracks in a loop until explicitly stopped
-            Music_Play_End_Flag = false;
-            int consecutive_failures = 0;
-            while (!Music_Play_End_Flag) {
-                music_player_ack_track_change();
-                music_player_play_blocking();
-                if (Music_Play_End_Flag) break;
-                // If play_blocking returned immediately (file not found / SD removed),
-                // state will be STOPPED. Don't loop forever.
-                music_player_info_t pinfo = music_player_get_info();
-                if (pinfo.state == MUSIC_STATE_STOPPED && pinfo.position_s == 0) {
-                    consecutive_failures++;
-                    if (consecutive_failures >= 3) {
-                        ESP_LOGW("MUSIC", "Too many consecutive failures — stopping");
-                        break;
-                    }
-                } else {
-                    consecutive_failures = 0;
-                }
-                // Track ended naturally or next/prev → keep playing
-                vTaskDelay(pdMS_TO_TICKS(100));
-            }
-            // Update UI — playback stopped
-            _lock_acquire(&lvgl_api_lock);
-            System_Ui->_registry.win.music.play_flag = false;
-            System_Ui->set_win_music_play_imagebutton_status(false);
-            _lock_release(&lvgl_api_lock);
+            // 播放音乐
+
+            Play_Wav_File(SD_FILE_PATH_MUSIC);
             break;
-        }
+
         default:
             break;
         }
@@ -842,41 +1000,56 @@ void device_microphone_task(void *arg)
 
     while (1)
     {
+
         switch (ES8311_Microphone_Mode)
         {
         case Es8311_Mode::TEST:
         {
             if (esp_log_timestamp() > cycle_time)
             {
+                // 读取麦克风数据
                 int16_t microphone_data[1] = {0};
                 ES8311->read_data(microphone_data, 1 * sizeof(int16_t));
 
                 if (microphone_data[0] < 0)
+                {
                     continue;
+                }
 
                 int16_t max_microphone_data = microphone_data[0];
                 int16_t max_microphone_data_2 = microphone_data[0];
 
                 if (max_microphone_data >= 1000)
+                {
                     max_microphone_data_2 = 1000;
+                }
                 uint8_t max_microphone_data_percentage = (static_cast<float>(max_microphone_data_2) / static_cast<float>(1000)) * 100;
 
+                // 将麦克风数据格式化为字符串
                 std::string microphone_data_str = "microphone data: " + std::to_string(max_microphone_data);
 
                 _lock_acquire(&lvgl_api_lock);
+                // 更新麦克风圆盘
+                // 使用动画
                 lv_anim_t anim;
                 lv_anim_init(&anim);
                 lv_anim_set_var(&anim, System_Ui->_registry.win.cit.microphone_test.needle_line);
                 lv_anim_set_values(&anim, System_Ui->_registry.win.cit.microphone_test.data.value_percentage, max_microphone_data_percentage);
-                lv_anim_set_time(&anim, 300);
+                lv_anim_set_time(&anim, 300); // Animation duration in milliseconds
                 lv_anim_set_exec_cb(&anim, [](void *needle, int32_t value)
                                     { lv_scale_set_line_needle_value(System_Ui->_registry.win.cit.microphone_test.scale_line,
                                                                      (lv_obj_t *)needle, 150, value); });
                 lv_anim_start(&anim);
+                // 不使用动画
+                //  lv_scale_set_line_needle_value(System_Ui->_registry.win.cit.microphone_test.scale_line,
+                //                                 System_Ui->_registry.win.cit.microphone_test.needle_line, 150, max_microphone_data_percentage);
+
+                // 更新数据的标签
                 lv_label_set_text(System_Ui->_registry.win.cit.microphone_test.data.label, microphone_data_str.c_str());
                 _lock_release(&lvgl_api_lock);
 
                 System_Ui->_registry.win.cit.microphone_test.data.value_percentage = max_microphone_data_percentage;
+
                 cycle_time = esp_log_timestamp() + 300;
             }
         }
@@ -899,12 +1072,14 @@ void device_imu_task(void *arg)
 
     while (1)
     {
+
         switch (ICM20948_Imu_Mode)
         {
         case Imu_Mode::TEST:
         {
             if (esp_log_timestamp() > cycle_time)
             {
+                // 读取IMU数据
                 ICM20948->readSensor();
                 xyzFloat gValue;
                 ICM20948->getGValues(&gValue);
@@ -913,10 +1088,12 @@ void device_imu_task(void *arg)
                 float pitch = ICM20948->getPitch();
                 float roll = ICM20948->getRoll();
 
+                // 获取磁力计的 x, y 值以计算航向角（Yaw）
                 xyzFloat magValues;
                 ICM20948->getMagValues(&magValues);
-                float yaw = atan2(magValues.y, magValues.x) * (180.0 / M_PI);
+                float yaw = atan2(magValues.y, magValues.x) * (180.0 / M_PI); // 计算航向角
 
+                // 将IMU数据格式化为字符串
                 std::string imu_data_str = "imu data:\n";
                 imu_data_str += "gyroscope:\nx: " + std::to_string(gValue.x) + "\ny: " + std::to_string(gValue.y) + "\nz:  " + std::to_string(gValue.z) + "\n\n";
                 imu_data_str += "accelerometer:\nx: " + std::to_string(angle.x) + "\ny: " + std::to_string(angle.y) + "\nz: " + std::to_string(angle.z) + "\n\n";
@@ -924,75 +1101,11 @@ void device_imu_task(void *arg)
                 imu_data_str += "euler angles:\npitch: " + std::to_string(pitch) + "\nroll: " + std::to_string(roll) + "\nyaw: " + std::to_string(yaw);
 
                 _lock_acquire(&lvgl_api_lock);
+                // 更新数据的标签
                 lv_label_set_text(System_Ui->_registry.win.cit.imu_test.data_label, imu_data_str.c_str());
                 _lock_release(&lvgl_api_lock);
 
                 cycle_time = esp_log_timestamp() + 100;
-            }
-        }
-        break;
-
-        case Imu_Mode::DOUBLE_TAP_WAKE:
-        {
-            // Double-tap detection by polling accelerometer magnitude.
-            // State machine: IDLE → TAP1 → WAIT → TAP2 → ACTION → COOLDOWN → IDLE
-            // Runs every 10ms (vTaskDelay at bottom of loop), ~1 I2C read per cycle.
-            static enum { DT_IDLE, DT_TAP1, DT_WAIT, DT_TAP2, DT_COOLDOWN } dt_state = DT_IDLE;
-            static uint32_t dt_time = 0;
-            static const float TAP_G = 1.6f;  // g-force spike threshold
-
-            ICM20948->readSensor();
-            xyzFloat gVal;
-            ICM20948->getGValues(&gVal);
-            float mag = sqrtf(gVal.x * gVal.x + gVal.y * gVal.y + gVal.z * gVal.z);
-            // At rest mag ≈ 1.0g. A tap spike reaches 1.6-3.0g briefly.
-            bool spike = (mag > TAP_G);
-            uint32_t now = esp_log_timestamp();
-
-            switch (dt_state) {
-                case DT_IDLE:
-                    if (spike) { dt_time = now; dt_state = DT_TAP1; }
-                    break;
-                case DT_TAP1:
-                    // Wait for motion to settle (~80ms debounce)
-                    if (!spike && (now - dt_time > 80)) {
-                        dt_state = DT_WAIT;
-                    } else if (now - dt_time > 300) {
-                        dt_state = DT_IDLE; // too long — tilt, not tap
-                    }
-                    break;
-                case DT_WAIT:
-                    if (spike) {
-                        dt_state = DT_TAP2; dt_time = now;
-                    } else if (now - dt_time > 400) {
-                        dt_state = DT_IDLE; // window expired
-                    }
-                    break;
-                case DT_TAP2:
-                    if (now - dt_time > 50) {
-                        // Double tap confirmed — toggle screen
-                        if (g_screen_blanked) {
-                            g_screen_blanked = false;
-                            g_last_touch_ms = now;
-                            if (screen_is_rm69a10()) {
-                                set_rm69a10_brightness(Screen_Mipi_Dpi_Panel, g_settings.brightness * 255 / 100);
-                            } else {
-                                HI8561_T->start_pwm_gradient_time(g_settings.brightness, 200);
-                            }
-                        } else {
-                            g_screen_blanked = true;
-                            if (screen_is_rm69a10()) {
-                                set_rm69a10_brightness(Screen_Mipi_Dpi_Panel, 0);
-                            } else {
-                                HI8561_T->start_pwm_gradient_time(0, 200);
-                            }
-                        }
-                        dt_state = DT_COOLDOWN; dt_time = now;
-                    }
-                    break;
-                case DT_COOLDOWN:
-                    if (now - dt_time > 800) dt_state = DT_IDLE;
-                    break;
             }
         }
         break;
@@ -1015,57 +1128,72 @@ void device_battery_health_task(void *arg)
     {
         if (esp_log_timestamp() > cycle_time)
         {
+            // 读取Battery Health数据
+
             uint16_t battery_level = BQ27220->get_status_of_charge();
 
             System_Ui->set_battery_level(battery_level);
 
-            // Update all status bar indicators (runs every 1s)
-            {
-                // GPS status
-                receiver_pos_t rx = adsb_get_receiver_pos();
-                System_Ui->set_gps_status(rx.fix_valid, rx.sats);
-
-                // ADS-B status
-                adsb_stats_t stats = adsb_get_stats();
-                System_Ui->set_adsb_status(stats.rtlsdr_connected, stats.rtlsdr_error, stats.active_aircraft);
-
-                // SD card status
-                extern bool sd_is_mounted(void);
-                extern bool sd_is_logging(void);
-                System_Ui->set_sd_status(sd_is_mounted(), sd_is_logging());
-            }
-
             _lock_acquire(&lvgl_api_lock);
             System_Ui->status_bar_battery_level_update();
-            System_Ui->status_bar_gps_update();
-            System_Ui->status_bar_adsb_update();
-            System_Ui->status_bar_sd_update();
             _lock_release(&lvgl_api_lock);
 
             switch (System_Ui->get_current_win())
             {
             case Lvgl_Ui::System::Current_Win::CIT_BATTERY_HEALTH_TEST:
             {
+                // 将电池数据格式化为字符串
                 std::string battery_health_data_str = "battery health data:\n\n";
+                
                 battery_health_data_str += "bq27220 data:\n";
                 battery_health_data_str += "device id: " + std::to_string(BQ27220->get_device_id()) + "\n\n";
+
                 battery_health_data_str += "design capacity: " + std::to_string(BQ27220->get_design_capacity()) + " mah\n";
                 battery_health_data_str += "remaining capacity: " + std::to_string(BQ27220->get_remaining_capacity()) + " mah\n";
                 battery_health_data_str += "full charge capacity: " + std::to_string(BQ27220->get_full_charge_capacity()) + " mah\n\n";
+
+                // battery_health_data_str += "raw coulomb count: " + std::to_string(BQ27220->get_raw_coulomb_count()) + " c\n";
+                // battery_health_data_str += "cycle count: " + std::to_string(BQ27220->get_cycle_count()) + "\n\n";
+
                 battery_health_data_str += "battery level: " + std::to_string(battery_level) + "%\n";
                 battery_health_data_str += "battery health: " + std::to_string(BQ27220->get_status_of_charge()) + "%\n\n";
+
                 battery_health_data_str += "voltage: " + std::to_string(BQ27220->get_voltage()) + " mv\n";
                 battery_health_data_str += "current: " + std::to_string(BQ27220->get_current()) + " ma\n";
+                // battery_health_data_str += "charging voltage: " + std::to_string(BQ27220->get_charging_voltage()) + " mv\n";
+                // battery_health_data_str += "charging current: " + std::to_string(BQ27220->get_charging_current()) + " ma\n";
+                // battery_health_data_str += "standby current: " + std::to_string(BQ27220->get_standby_current()) + " ma\n";
+                // battery_health_data_str += "max load current: " + std::to_string(BQ27220->get_max_load_current()) + " ma\n";
+                // battery_health_data_str += "average power: " + std::to_string(BQ27220->get_average_power()) + " mw\n\n";
+
                 battery_health_data_str += "chip temperature: " + std::to_string(BQ27220->get_chip_temperature_celsius()) + " °c\n\n";
+                // battery_health_data_str += "ntc temperature: " + std::to_string(BQ27220->get_temperature_celsius()) + " °c\n\n";
+
+                // battery_health_data_str += "at rate: " + std::to_string(BQ27220->get_at_rate()) + " ma\n";
+                // battery_health_data_str += "at rate battery time to empty: " + std::to_string(BQ27220->get_at_rate_time_to_empty()) + " min\n";
+                // battery_health_data_str += "battery time to empty: " + std::to_string(BQ27220->get_time_to_empty()) + " min\n";
+                // battery_health_data_str += "battery time to full charge: " + std::to_string(BQ27220->get_time_to_full()) + " min\n";
+                // battery_health_data_str += "battery standby time to empty: " + std::to_string(BQ27220->get_standby_time_to_empty()) + " min\n";
+                // battery_health_data_str += "battery max load time to empty: " + std::to_string(BQ27220->get_max_load_time_to_empty()) + " min\n\n";
 
                 Cpp_Bus_Driver::Bq27220xxxx::Battery_Status bs;
                 if (BQ27220->get_battery_status(bs) == true)
                 {
+                    // battery_health_data_str += "fully discharged flag: " + std::to_string(bs.flag.fd) + "\n";
                     battery_health_data_str += "sleep flag: " + std::to_string(bs.flag.sleep) + "\n";
+                    // battery_health_data_str += "charging overheat flag: " + std::to_string(bs.flag.otc) + "\n";
+                    // battery_health_data_str += "discharging overheat flag: " + std::to_string(bs.flag.otd) + "\n";
+                    // battery_health_data_str += "fully charged flag: " + std::to_string(bs.flag.fc) + "\n";
+                    // battery_health_data_str += "charging prohibited flag: " + std::to_string(bs.flag.chginh) + "\n";
+                    // battery_health_data_str += "terminate charging alarm flag: " + std::to_string(bs.flag.tca) + "\n";
+                    // battery_health_data_str += "terminate discharging alarm flag: " + std::to_string(bs.flag.tda) + "\n";
+                    // battery_health_data_str += "battery insertion detection flag: " + std::to_string(bs.flag.auth_gd) + "\n";
+                    // battery_health_data_str += "battery present flag: " + std::to_string(bs.flag.battpres) + "\n";
                     battery_health_data_str += "discharge flag: " + std::to_string(bs.flag.dsg) + "\n";
                 }
 
 #if defined CONFIG_BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
+
                 battery_health_data_str += "\nbq25896 data:\n";
                 uint8_t part_number = 0;
                 Kode_Bq25896::bq25896_get_part_number(Bq25896_Handle, &part_number);
@@ -1075,27 +1203,50 @@ void device_battery_health_task(void *arg)
                 Kode_Bq25896::bq25896_get_vbus_status(Bq25896_Handle, &vbus_stat);
                 switch (vbus_stat)
                 {
-                case Kode_Bq25896::BQ25896_VBUS_STAT_NO_INPUT:    battery_health_data_str += "vbus status: no input\n"; break;
-                case Kode_Bq25896::BQ25896_VBUS_STAT_USB_HOST:    battery_health_data_str += "vbus status: usb host sdp\n"; break;
-                case Kode_Bq25896::BQ25896_VBUS_STAT_ADAPTER:     battery_health_data_str += "vbus status: adapter (3.25a)\n"; break;
-                case Kode_Bq25896::BQ25896_VBUS_STAT_OTG:         battery_health_data_str += "vbus status: otg\n"; break;
-                default:                                           battery_health_data_str += "vbus status: unknown\n"; break;
+                case Kode_Bq25896::BQ25896_VBUS_STAT_NO_INPUT:
+                    battery_health_data_str += "vbus status: no input\n";
+                    break;
+                case Kode_Bq25896::BQ25896_VBUS_STAT_USB_HOST:
+                    battery_health_data_str += "vbus status: usb host sdp\n";
+                    break;
+                case Kode_Bq25896::BQ25896_VBUS_STAT_ADAPTER:
+                    battery_health_data_str += "vbus status: adapter (3.25a)\n";
+                    break;
+                case Kode_Bq25896::BQ25896_VBUS_STAT_OTG:
+                    battery_health_data_str += "vbus status: otg\n";
+                    break;
+                default:
+                    battery_health_data_str += "vbus status: unknown\n";
+                    break;
                 }
 
                 Kode_Bq25896::bq25896_chrg_stat_t chrg_stat;
                 Kode_Bq25896::bq25896_get_charging_status(Bq25896_Handle, &chrg_stat);
                 switch (chrg_stat)
                 {
-                case Kode_Bq25896::BQ25896_CHRG_STAT_NOT_CHARGING:  battery_health_data_str += "charging status: not charging\n"; break;
-                case Kode_Bq25896::BQ25896_CHRG_STAT_PRE_CHARGE:    battery_health_data_str += "charging status: pre charge\n"; break;
-                case Kode_Bq25896::BQ25896_CHRG_STAT_FAST_CHARGING: battery_health_data_str += "charging status: fast charging\n"; break;
-                case Kode_Bq25896::BQ25896_CHRG_STAT_TERM_DONE:     battery_health_data_str += "charging status: done charging\n"; break;
-                default:                                             battery_health_data_str += "charging status: unknown\n"; break;
+                case Kode_Bq25896::BQ25896_CHRG_STAT_NOT_CHARGING:
+                    battery_health_data_str += "charging status: not charging\n";
+                    break;
+                case Kode_Bq25896::BQ25896_CHRG_STAT_PRE_CHARGE:
+                    battery_health_data_str += "charging status: pre charge\n";
+                    break;
+                case Kode_Bq25896::BQ25896_CHRG_STAT_FAST_CHARGING:
+                    battery_health_data_str += "charging status: fast charging\n";
+                    break;
+                case Kode_Bq25896::BQ25896_CHRG_STAT_TERM_DONE:
+                    battery_health_data_str += "charging status: done charging\n";
+                    break;
+                default:
+                    battery_health_data_str += "charging status: unknown\n";
+                    break;
                 }
 
                 battery_health_data_str += "\n";
 
-                uint16_t bat_voltage = 0, sys_voltage = 0, vbus_voltage = 0;
+                uint16_t bat_voltage = 0;
+                uint16_t sys_voltage = 0;
+                uint16_t vbus_voltage = 0;
+
                 Kode_Bq25896::bq25896_get_battery_voltage(Bq25896_Handle, &bat_voltage);
                 Kode_Bq25896::bq25896_get_system_voltage(Bq25896_Handle, &sys_voltage);
                 Kode_Bq25896::bq25896_get_vbus_voltage(Bq25896_Handle, &vbus_voltage);
@@ -1104,15 +1255,19 @@ void device_battery_health_task(void *arg)
                 battery_health_data_str += "system voltage: " + std::to_string(sys_voltage) + "mv\n";
                 battery_health_data_str += "vbus voltage: " + std::to_string(vbus_voltage) + "mv\n\n";
 
-                uint16_t charge_current = 0, ico_current_limit = 0;
+                uint16_t charge_current = 0;
+                uint16_t ico_current_limit = 0;
+
                 Kode_Bq25896::bq25896_get_charge_current(Bq25896_Handle, &charge_current);
                 Kode_Bq25896::bq25896_get_ico_current_limit(Bq25896_Handle, &ico_current_limit);
 
                 battery_health_data_str += "charge current: " + std::to_string(charge_current) + "ma\n";
                 battery_health_data_str += "ico current limit: " + std::to_string(ico_current_limit) + "ma\n";
+
 #endif
 
                 _lock_acquire(&lvgl_api_lock);
+                // 更新数据的标签
                 lv_label_set_text(System_Ui->_registry.win.cit.battery_health_test.data_label, battery_health_data_str.c_str());
                 lv_obj_align(System_Ui->_registry.win.cit.battery_health_test.data_label, LV_ALIGN_TOP_MID, 0, 10);
 #if defined CONFIG_BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
@@ -1125,22 +1280,22 @@ void device_battery_health_task(void *arg)
                 {
                     lv_obj_remove_flag(System_Ui->_registry.win.cit.battery_health_test.otg_label, LV_OBJ_FLAG_HIDDEN);
                     lv_obj_remove_flag(System_Ui->_registry.win.cit.battery_health_test.otg_switch, LV_OBJ_FLAG_HIDDEN);
+
                     lv_obj_align_to(System_Ui->_registry.win.cit.battery_health_test.otg_label,
                                     System_Ui->_registry.win.cit.battery_health_test.data_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 10);
                     lv_obj_align_to(System_Ui->_registry.win.cit.battery_health_test.otg_switch,
                                     System_Ui->_registry.win.cit.battery_health_test.otg_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 10);
                 }
 #endif
+
                 _lock_release(&lvgl_api_lock);
             }
+
             break;
 
             default:
                 break;
             }
-
-            // Flush any pending settings to NVS (must run on internal RAM stack)
-            settings_save_if_pending();
 
             cycle_time = esp_log_timestamp() + 1000;
         }
@@ -1152,204 +1307,34 @@ void device_battery_health_task(void *arg)
 void device_gps_task(void *arg)
 {
     printf("device_gps_task start\n");
-    // Task runs continuously — no vTaskSuspend.
-    // GPS is kept awake at boot to always feed ADS-B receiver position.
+    vTaskSuspend(Gps_Task_Handle);
 
     size_t cycle_time = 0;
-    size_t last_summary_time = 0;  // for cooked output every ~5s
 
     while (1)
     {
-        // Skip GPS processing if disabled in settings
-        if (!g_settings.gps_enabled) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            continue;
-        }
-        if (esp_log_timestamp() > cycle_time)
+        switch (L76k_Gps_Mode)
         {
-            std::unique_ptr<uint8_t[]> buffer;
-            uint32_t buffer_length = 0;
-
-            if (L76K->get_info_data(buffer, &buffer_length) == true)
+        case Gps_Mode::TEST:
+        {
+            if (esp_log_timestamp() > cycle_time)
             {
-                Cpp_Bus_Driver::L76k::Rmc rmc;
+                // 读取Gps数据
+                std::unique_ptr<uint8_t[]> buffer;
+                uint32_t buffer_length = 0;
 
-                if (L76K->parse_rmc_info(buffer.get(), buffer_length, rmc) == true)
+                if (L76K->get_info_data(buffer, &buffer_length) == true)
                 {
-                    // Parse GGA every cycle for sat count, HDOP, altitude
-                    Cpp_Bus_Driver::L76k::Gga gga;
-                    bool gga_ok = L76K->parse_gga_info(buffer.get(), buffer_length, gga);
+                    // 打印RMC的相关信息
+                    Cpp_Bus_Driver::L76k::Rmc rmc;
 
-                    // ------------------------------------------------
-                    // Always feed position to ADS-B when we have a fix
-                    // ------------------------------------------------
-                    bool has_pos = rmc.location.lat.update_flag &&
-                                   rmc.location.lat.direction_update_flag &&
-                                   rmc.location.lon.update_flag &&
-                                   rmc.location.lon.direction_update_flag;
-
-                    if (has_pos)
-                    {
-                        L76k_Gps_Positioning_Flag = true;
-
-                        double lat = rmc.location.lat.degrees_minutes;
-                        if (rmc.location.lat.direction == "S") lat = -lat;
-
-                        double lon = rmc.location.lon.degrees_minutes;
-                        if (rmc.location.lon.direction == "W") lon = -lon;
-
-                        adsb_set_receiver_pos(lat, lon, 0.0,
-                            gga_ok ? gga.online_satellite_count : 0,
-                            gga_ok ? (double)gga.hdop : 99.9,
-                            gga_ok ? gga.gps_mode_status : 0);
-                    }
-
-                    // ------------------------------------------------
-                    // GPS → system clock + RTC sync
-                    // Priority: RTC < GPS serial << WiFi NTP
-                    // GPS serial has only whole-second resolution (no PPS
-                    // on this board — L76K pin 5 is RESERVED / not routed),
-                    // plus ~500ms serial latency.  Only correct when drift
-                    // exceeds 1s to avoid oscillation from sub-second jitter.
-                    // NTP (when available) keeps <50ms so GPS won't interfere.
-                    // ------------------------------------------------
-                    static size_t last_rtc_write = 0;
-
-                    if (rmc.location_status == "A" &&
-                        gga_ok && gga.gps_mode_status > 0 &&
-                        rmc.utc.update_flag &&
-                        rmc.data.update_flag)
-                    {
-                        int utc_year = rmc.data.year + 2000;
-                        int utc_mon  = rmc.data.month;
-                        int utc_day  = rmc.data.day;
-                        int utc_hour = rmc.utc.hour;
-                        int utc_min  = rmc.utc.minute;
-                        int utc_sec  = static_cast<int>(rmc.utc.second);
-
-                        struct tm tm_gps = {};
-                        tm_gps.tm_year = utc_year - 1900;
-                        tm_gps.tm_mon  = utc_mon - 1;
-                        tm_gps.tm_mday = utc_day;
-                        tm_gps.tm_hour = utc_hour;
-                        tm_gps.tm_min  = utc_min;
-                        tm_gps.tm_sec  = utc_sec;
-                        time_t gps_epoch = mktime(&tm_gps);  // ESP32 default TZ is UTC
-
-                        if (gps_epoch > 1704067200) {  // sanity: after 2024-01-01
-                            // The RMC timestamp is the actual UTC fix time, but
-                            // arrives ~650ms later over serial (UART TX + library
-                            // buffering).  Compensate so the system clock is set
-                            // to (gps_epoch + 650ms) rather than exactly on the
-                            // second boundary.  Measured from observed jitter:
-                            // serial delay ranges 530–780ms, median ~650ms.
-                            static const long GPS_SERIAL_DELAY_US = 650000;  // 650ms
-
-                            struct timeval tv_sys;
-                            gettimeofday(&tv_sys, NULL);
-                            long long drift_s = (long long)(gps_epoch - tv_sys.tv_sec);
-
-                            // Record GPS fix epoch for SD log renames (once)
-                            if (g_gps_fix_epoch == 0) {
-                                g_gps_fix_epoch = gps_epoch;
-                                serial_console_print("\033[0;36m[GNSS] GPS fix acquired — epoch %lld\033[0m\n",
-                                    (long long)gps_epoch);
-                            }
-
-                            // Only step clock if off by more than 1 second
-                            if (drift_s > 1 || drift_s < -1) {
-                                struct timeval tv_now = {
-                                    .tv_sec = gps_epoch,
-                                    .tv_usec = GPS_SERIAL_DELAY_US
-                                };
-                                settimeofday(&tv_now, NULL);
-                                serial_console_print("\033[0;36m[GNSS] Clock corrected by %+llds → %04d-%02d-%02d %02d:%02d:%02d.%03ld UTC\033[0m\n",
-                                    drift_s, utc_year, utc_mon, utc_day,
-                                    utc_hour, utc_min, utc_sec,
-                                    GPS_SERIAL_DELAY_US / 1000);
-                            }
-
-                            // Rename boot-numbered SD logs to UTC timestamp (once, after fix)
-                            static bool log_renamed = false;
-                            if (!log_renamed && g_gps_fix_epoch > 0) {
-                                sd_log_rename_with_time();
-                                log_renamed = true;
-                            }
-
-                            // --- Set PCF8563 RTC at first fix, then every 60s ---
-                            // RTC stores local time (offset from tz_lookup)
-                            size_t now_ms_clk = esp_log_timestamp();
-                            if (!last_rtc_write || (now_ms_clk > last_rtc_write + 60000)) {
-                                int16_t tz_off_min = get_tz_offset_minutes();
-                                time_t epoch_local = gps_epoch + tz_off_min * 60;
-                                struct tm tm_local;
-                                gmtime_r(&epoch_local, &tm_local);
-
-                                static const Cpp_Bus_Driver::Pcf8563x::Week wday_map[] = {
-                                    Cpp_Bus_Driver::Pcf8563x::Week::SUNDAY,
-                                    Cpp_Bus_Driver::Pcf8563x::Week::MONDAY,
-                                    Cpp_Bus_Driver::Pcf8563x::Week::TUESDAY,
-                                    Cpp_Bus_Driver::Pcf8563x::Week::WEDNESDAY,
-                                    Cpp_Bus_Driver::Pcf8563x::Week::THURSDAY,
-                                    Cpp_Bus_Driver::Pcf8563x::Week::FRIDAY,
-                                    Cpp_Bus_Driver::Pcf8563x::Week::SATURDAY,
-                                };
-
-                                Cpp_Bus_Driver::Pcf8563x::Time t = {
-                                    .second = static_cast<uint8_t>(tm_local.tm_sec),
-                                    .minute = static_cast<uint8_t>(tm_local.tm_min),
-                                    .hour   = static_cast<uint8_t>(tm_local.tm_hour),
-                                    .day    = static_cast<uint8_t>(tm_local.tm_mday),
-                                    .week   = wday_map[tm_local.tm_wday],
-                                    .month  = static_cast<uint8_t>(tm_local.tm_mon + 1),
-                                    .year   = static_cast<uint8_t>(tm_local.tm_year + 1900 - 2000),
-                                };
-                                PCF8563->set_time(t);
-
-                                serial_console_print("\033[0;36m[GNSS] RTC set: %04d-%02d-%02d %02d:%02d:%02d UTC%+d:%02d\033[0m\n",
-                                    tm_local.tm_year + 1900, tm_local.tm_mon + 1, tm_local.tm_mday,
-                                    tm_local.tm_hour, tm_local.tm_min, tm_local.tm_sec,
-                                    tz_off_min / 60, abs(tz_off_min) % 60);
-
-                                last_rtc_write = now_ms_clk;
-                            }
-                        }
-                    }
-
-                    // ------------------------------------------------
-                    // Periodic cooked GPS summary (every 5s)
-                    // ------------------------------------------------
-                    size_t now_ms = esp_log_timestamp();
-                    if (now_ms > last_summary_time) {
-                        double lat = 0.0, lon = 0.0;
-                        if (has_pos) {
-                            lat = rmc.location.lat.degrees_minutes;
-                            if (rmc.location.lat.direction == "S") lat = -lat;
-                            lon = rmc.location.lon.degrees_minutes;
-                            if (rmc.location.lon.direction == "W") lon = -lon;
-                        }
-
-                        int sats   = gga_ok ? gga.online_satellite_count : 0;
-                        double hdop = gga_ok ? (double)gga.hdop : 99.9;
-                        int fix_q  = gga_ok ? gga.gps_mode_status : -1;
-
-                        serial_console_print("\033[0;36m[GNSS] fix=%s lat=%.6f lon=%.6f sats=%d hdop=%.1f q=%d\033[0m\n",
-                            rmc.location_status.c_str(), lat, lon, sats, hdop, fix_q);
-
-                        last_summary_time = now_ms + 5000;
-                    }
-
-                    // ------------------------------------------------
-                    // Update CIT GPS test label when that screen is up
-                    // ------------------------------------------------
-                    switch (L76k_Gps_Mode)
-                    {
-                    case Gps_Mode::TEST:
+                    if (L76K->parse_rmc_info(buffer.get(), buffer_length, rmc) == true)
                     {
                         std::string rmc_data_str = "";
                         if (L76k_Gps_Positioning_Flag == false)
                         {
                             L76k_Gps_Positioning_Time++;
+
                             rmc_data_str = "getting location time: " + std::to_string(L76k_Gps_Positioning_Time) + " s\n\n";
                         }
                         else
@@ -1367,12 +1352,7 @@ void device_gps_task(void *arg)
                         if (rmc.utc.update_flag == true)
                         {
                             rmc_data_str += "utc time: " + std::to_string(rmc.utc.hour) + ":" + std::to_string(rmc.utc.minute) + ":" + std::to_string(static_cast<uint8_t>(rmc.utc.second)) + "\n";
-                            {
-                                int16_t tz_m = get_tz_offset_minutes();
-                                int local_h = ((int)rmc.utc.hour * 60 + (int)rmc.utc.minute + tz_m + 1440) / 60 % 24;
-                                int local_min = ((int)rmc.utc.hour * 60 + (int)rmc.utc.minute + tz_m + 1440) % 60;
-                                rmc_data_str += "local time: " + std::to_string(local_h) + ":" + std::to_string(local_min) + ":" + std::to_string(static_cast<uint8_t>(rmc.utc.second)) + "\n";
-                            }
+                            rmc_data_str += "china time: " + std::to_string((rmc.utc.hour + 8 + 24) % 24) + ":" + std::to_string(rmc.utc.minute) + ":" + std::to_string(static_cast<uint8_t>(rmc.utc.second)) + "\n";
                             rmc.utc.update_flag = false;
                         }
 
@@ -1380,6 +1360,8 @@ void device_gps_task(void *arg)
 
                         if ((rmc.location.lat.update_flag == true) && (rmc.location.lat.direction_update_flag == true))
                         {
+                            L76k_Gps_Positioning_Flag = true;
+
                             rmc_data_str += "lat degrees: " + std::to_string(rmc.location.lat.degrees) + "\n";
                             rmc_data_str += "lat minutes: " + std::to_string(rmc.location.lat.minutes) + "\n";
                             rmc_data_str += "lat degrees_minutes: " + std::to_string(rmc.location.lat.degrees_minutes) + "\n";
@@ -1392,6 +1374,8 @@ void device_gps_task(void *arg)
 
                         if ((rmc.location.lon.update_flag == true) && (rmc.location.lon.direction_update_flag == true))
                         {
+                            L76k_Gps_Positioning_Flag = true;
+
                             rmc_data_str += "lon degrees: " + std::to_string(rmc.location.lon.degrees) + "\n";
                             rmc_data_str += "lon minutes: " + std::to_string(rmc.location.lon.minutes) + "\n";
                             rmc_data_str += "lon degrees_minutes: " + std::to_string(rmc.location.lon.degrees_minutes) + "\n";
@@ -1400,20 +1384,38 @@ void device_gps_task(void *arg)
                             rmc.location.lon.direction_update_flag = false;
                         }
 
+                        // 更新数据的标签
                         _lock_acquire(&lvgl_api_lock);
-                        if (System_Ui->_registry.win.cit.gps_test.data_label)
-                            lv_label_set_text(System_Ui->_registry.win.cit.gps_test.data_label, rmc_data_str.c_str());
+                        lv_label_set_text(System_Ui->_registry.win.cit.gps_test.data_label, rmc_data_str.c_str());
                         _lock_release(&lvgl_api_lock);
                     }
-                    break;
+                    else
+                    {
+                        std::string rmc_data_str = "gps data:\nread fail";
 
-                    default:
-                        break;
+                        // 更新数据的标签
+                        _lock_acquire(&lvgl_api_lock);
+                        lv_label_set_text(System_Ui->_registry.win.cit.gps_test.data_label, rmc_data_str.c_str());
+                        _lock_release(&lvgl_api_lock);
                     }
                 }
-            }
+                else
+                {
+                    std::string rmc_data_str = "gps data:\nread null";
 
-            cycle_time = esp_log_timestamp() + 1000;
+                    // 更新数据的标签
+                    _lock_acquire(&lvgl_api_lock);
+                    lv_label_set_text(System_Ui->_registry.win.cit.gps_test.data_label, rmc_data_str.c_str());
+                    _lock_release(&lvgl_api_lock);
+                }
+
+                cycle_time = esp_log_timestamp() + 1000;
+            }
+        }
+        break;
+
+        default:
+            break;
         }
 
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -1435,12 +1437,17 @@ void device_ethernet_task(void *arg)
         {
             if (esp_log_timestamp() > cycle_time)
             {
+                // 读取Ethernet数据
+
                 if (Eth_Info.status.update_flag == true)
                 {
                     std::string ethernet_data_str = "ethernet data:\n" + Eth_Info.status.data + "\n";
+
                     _lock_acquire(&lvgl_api_lock);
+                    // 更新数据的标签
                     lv_label_set_text(System_Ui->_registry.win.cit.ethernet_test.data_label, ethernet_data_str.c_str());
                     _lock_release(&lvgl_api_lock);
+
                     Eth_Info.status.update_flag = false;
                 }
 
@@ -1449,10 +1456,13 @@ void device_ethernet_task(void *arg)
                     if (Eth_Info.link_up_flag == true)
                     {
                         std::string ethernet_data_str = "ethernet data:\n" + Eth_Info.status.data + "\n" + Eth_Info.connect_ip_status.data;
+
                         _lock_acquire(&lvgl_api_lock);
+                        // 更新数据的标签
                         lv_label_set_text(System_Ui->_registry.win.cit.ethernet_test.data_label, ethernet_data_str.c_str());
                         _lock_release(&lvgl_api_lock);
                     }
+
                     Eth_Info.connect_ip_status.update_flag = false;
                 }
 
@@ -1473,40 +1483,18 @@ void device_rtc_task(void *arg)
 {
     printf("device_rtc_task start\n");
 
-    static bool rtc_clock_synced = false;  // one-time sync to system clock
     size_t cycle_time = 0;
 
     while (1)
     {
         if (esp_log_timestamp() > cycle_time)
         {
+            // 读取rtc数据
             Cpp_Bus_Driver::Pcf8563x::Time t;
             if (PCF8563->get_time(t) == true)
             {
-                ESP_LOGI("RTC", "pcf8563 year:[%d] month:[%d] day:[%d] time:[%d:%d:%d] week:[%d]", t.year, t.month, t.day,
+                printf("pcf8563 year:[%d] month:[%d] day:[%d] time:[%d:%d:%d] week:[%d]\n", t.year, t.month, t.day,
                        t.hour, t.minute, t.second, static_cast<uint8_t>(t.week));
-
-                // One-time: seed POSIX system clock from RTC so gettimeofday()
-                // returns approximate real time before GPS fix arrives.
-                // RTC stores LOCAL time, so we reverse the tz offset to get UTC.
-                if (!rtc_clock_synced && t.year >= 24) {
-                    struct tm tm_rtc = {};
-                    tm_rtc.tm_year = t.year + 2000 - 1900;
-                    tm_rtc.tm_mon  = t.month - 1;
-                    tm_rtc.tm_mday = t.day;
-                    tm_rtc.tm_hour = t.hour;
-                    tm_rtc.tm_min  = t.minute;
-                    tm_rtc.tm_sec  = t.second;
-                    time_t local_epoch = mktime(&tm_rtc);
-                    int16_t tz_off_min = get_tz_offset_minutes();
-                    time_t utc_epoch = local_epoch - tz_off_min * 60;
-                    if (utc_epoch > 1704067200) {  // sanity: after 2024-01-01
-                        struct timeval tv_rtc = { .tv_sec = utc_epoch, .tv_usec = 0 };
-                        settimeofday(&tv_rtc, NULL);
-                        ESP_LOGI("RTC", "System clock set from RTC: UTC epoch %lld", (long long)utc_epoch);
-                    }
-                    rtc_clock_synced = true;
-                }
 
                 System_Ui->set_time(t);
 
@@ -1542,13 +1530,15 @@ void device_rtc_task(void *arg)
             }
             else
             {
-                ESP_LOGW("RTC", "pcf8563 integrity of the clock information is not guaranteed");
+                printf("pcf8563 integrity of the clock information is not guaranteed\n");
 
                 if (System_Ui->get_current_win() == Lvgl_Ui::System::Current_Win::CIT_RTC_TEST)
                 {
+                    std::string rtc_data_str = "rtc data:\npcf8563 integrity of the clock\ninformation is not guaranteed\n";
+
                     _lock_acquire(&lvgl_api_lock);
-                    lv_label_set_text(System_Ui->_registry.win.cit.rtc_test.data_label,
-                                      "rtc data:\npcf8563 integrity of the clock\ninformation is not guaranteed\n");
+                    // 更新数据的标签
+                    lv_label_set_text(System_Ui->_registry.win.cit.rtc_test.data_label, rtc_data_str.c_str());
                     _lock_release(&lvgl_api_lock);
                 }
 
@@ -1577,67 +1567,59 @@ void device_at_task(void *arg)
         {
             if (esp_log_timestamp() > cycle_time)
             {
-                // ADS-B status display (repurposed from AT test)
-                adsb_stats_t stats = adsb_get_stats();
-                receiver_pos_t rx = adsb_get_receiver_pos();
+                Cpp_Bus_Driver::Esp_At::Real_Time rt;
+                if (ESP32C6_AT->get_real_time(rt) == true)
+                {
+                    printf("get_real_time success\n");
+                    printf("week: [%s] day: [%d] month: [%d] year: [%d] time: [%02d:%02d:%02d] time zone: [%s] china time: [%02d:%02d:%02d]\n",
+                           rt.week.c_str(), rt.day, rt.month, rt.year, rt.hour, rt.minute, rt.second, rt.time_zone.c_str(),
+                           (rt.hour + 8 + 24) % 24, rt.minute, rt.second);
 
-                std::string status_str = "ADS-B Receiver Status\n\n";
+                    // 读取At数据
+                    std::string at_data_str = "esp32c6 at time data:\n";
+                    char buffer[200];
+                    snprintf(buffer, sizeof(buffer),
+                             "week: [%s]\ndata: [%d/%d/%d]\nchina time: [%02d:%02d:%02d]\n",
+                             rt.week.c_str(), rt.year, rt.month, rt.day,
+                             (rt.hour + 8 + 24) % 24, rt.minute, rt.second);
+                    at_data_str += buffer;
 
-                // RTL-SDR connection
-                status_str += "RTL-SDR: ";
-                if (stats.rtlsdr_connected)
-                    status_str += "[OK] connected\n";
-                else if (stats.rtlsdr_error)
-                    status_str += "[ERR] buffer alloc failed\n";
+                    _lock_acquire(&lvgl_api_lock);
+                    // 更新数据的标签
+                    lv_label_set_text(System_Ui->_registry.win.cit.esp32c6_at_test.data_label, at_data_str.c_str());
+                    _lock_release(&lvgl_api_lock);
+
+                    Save_Real_Time(rt);
+                    _lock_acquire(&lvgl_api_lock);
+                    System_Ui->status_bar_wifi_connect_status_update();
+                    _lock_release(&lvgl_api_lock);
+                }
                 else
-                    status_str += "[--] not connected\n";
+                {
+                    printf("get_real_time fail\n");
 
-                // Message stats
-                char buf[128];
-                snprintf(buf, sizeof(buf), "\nMessages: %lu\nRate: %.1f msg/s\n",
-                    (unsigned long)stats.total_messages, stats.msg_rate);
-                status_str += buf;
+                    std::string at_data_str = "esp32c6 at time data:\nget_real_time fail\n";
 
-                // Aircraft count
-                snprintf(buf, sizeof(buf), "\nAircraft tracked: %d\n", stats.active_aircraft);
-                status_str += buf;
-
-                // Nearest aircraft
-                if (stats.nearest_icao) {
-                    snprintf(buf, sizeof(buf), "\nNearest aircraft:\n  %06lX %s\n  %.1f nm, %d ft\n",
-                        (unsigned long)stats.nearest_icao,
-                        stats.nearest_callsign[0] ? stats.nearest_callsign : "----",
-                        stats.nearest_dist_nm,
-                        stats.nearest_alt);
-                    status_str += buf;
+                    _lock_acquire(&lvgl_api_lock);
+                    // 更新数据的标签
+                    lv_label_set_text(System_Ui->_registry.win.cit.esp32c6_at_test.data_label, at_data_str.c_str());
+                    _lock_release(&lvgl_api_lock);
                 }
 
-                // GPS status
-                status_str += "\nReceiver GPS: ";
-                if (rx.fix_valid) {
-                    snprintf(buf, sizeof(buf), "fix (%d sats)\n  %.4f, %.4f\n  HDOP: %.1f\n",
-                        rx.sats, rx.lat, rx.lon, rx.hdop);
-                    status_str += buf;
-                } else {
-                    status_str += "no fix\n";
-                }
+                if (ESP32C6_AT->get_connect_status() == false)
+                {
+                    printf("esp32c6 at lost connection,attempting to reconnect\n");
+                    std::string at_data_str = "esp32c6 at lost connection,\nattempting to reconnect";
 
-                // UTC time
-                struct timeval tv;
-                gettimeofday(&tv, NULL);
-                struct tm tm_info;
-                gmtime_r(&tv.tv_sec, &tm_info);
-                if (tm_info.tm_year + 1900 >= 2024) {
-                    snprintf(buf, sizeof(buf), "\nUTC: %04d-%02d-%02d %02d:%02d:%02d\n",
-                        tm_info.tm_year + 1900, tm_info.tm_mon + 1, tm_info.tm_mday,
-                        tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec);
-                    status_str += buf;
-                }
+                    _lock_acquire(&lvgl_api_lock);
+                    // 更新数据的标签
+                    lv_label_set_text(System_Ui->_registry.win.cit.esp32c6_at_test.data_label, at_data_str.c_str());
+                    _lock_release(&lvgl_api_lock);
 
-                _lock_acquire(&lvgl_api_lock);
-                if (System_Ui->_registry.win.cit.esp32c6_at_test.data_label)
-                    lv_label_set_text(System_Ui->_registry.win.cit.esp32c6_at_test.data_label, status_str.c_str());
-                _lock_release(&lvgl_api_lock);
+                    _lock_acquire(&lvgl_api_lock);
+                    ESP32C6_AT->reconnect_esp_at();
+                    _lock_release(&lvgl_api_lock);
+                }
 
                 cycle_time = esp_log_timestamp() + 1000;
             }
@@ -1652,159 +1634,563 @@ void device_at_task(void *arg)
     }
 }
 
-void device_adsb_app_task(void *arg)
-{
-    printf("device_adsb_app_task start\n");
-    vTaskSuspend(NULL);  // suspend self until ADS-B app opens
+// void esp32p4_sleep_task(void *arg)
+// {
+//     printf("esp32p4_sleep_task start\n");
+//     vTaskSuspend(Sleep_Task_Handle);
 
-    // Buffers for formatting — allocated once on task stack
-    static char stats_buf[512];
-    static char list_buf[4096];
+//     while (1)
+//     {
+
+//             switch (Esp32p4_Sleep_Mode)
+//             {
+//             case Sleep_Mode::NORMAL_SLEEP_TEST:
+//                 /* code */
+//                 break;
+//             case Sleep_Mode::LIGHT_SLEEP_TEST:
+//                 Device_Sleep_Status(true);
+
+//                 break;
+
+//             default:
+//                 break;
+//             }
+
+//             vTaskSuspend(Sleep_Task_Handle);
+
+//         vTaskDelay(pdMS_TO_TICKS(10));
+//     }
+// }
+
+void device_rf_task(void *arg)
+{
+    printf("device_rf_task start\n");
 
     size_t cycle_time = 0;
+    size_t auto_send_cycle_time = 0;
 
     while (1)
     {
-        if (esp_log_timestamp() > cycle_time)
+        switch (System_Ui->_rf_chip_type)
         {
-            if (System_Ui->get_current_win() == Lvgl_Ui::System::Current_Win::ADSB)
+        case Lvgl_Ui::System::Rf_Chip_Type::SX1262:
+        {
+            // if (esp_log_timestamp() > cycle_time)
+            // {
+            //     printf("sx1262 ID: %#X\n", SX1262->get_device_id());
+
+            //     printf("sx1262 get current limit: %d\n", SX1262->get_current_limit());
+
+            //     switch (SX1262->get_packet_type())
+            //     {
+            //     case Cpp_Bus_Driver::Sx126x::Packet_Type::GFSK:
+            //         printf("sx1262 packet type: GFSK\n");
+            //         break;
+            //     case Cpp_Bus_Driver::Sx126x::Packet_Type::LORA:
+            //         printf("sx1262 packet type: LORA\n");
+            //         break;
+            //     case Cpp_Bus_Driver::Sx126x::Packet_Type::LR_FHSS:
+            //         printf("sx1262 packet type: LR_FHSS\n");
+            //         break;
+
+            //     default:
+            //         break;
+            //     }
+
+            //     switch (SX1262->parse_chip_mode_status(SX1262->get_status()))
+            //     {
+            //     case Cpp_Bus_Driver::Sx126x::Chip_Mode_Status::STBY_RC:
+            //         printf("sx1262 chip mode status: STBY_RC\n");
+            //         break;
+            //     case Cpp_Bus_Driver::Sx126x::Chip_Mode_Status::STBY_XOSC:
+            //         printf("sx1262 chip mode status: STBY_XOSC\n");
+            //         break;
+            //     case Cpp_Bus_Driver::Sx126x::Chip_Mode_Status::FS:
+            //         printf("sx1262 chip mode status: FS\n");
+            //         break;
+            //     case Cpp_Bus_Driver::Sx126x::Chip_Mode_Status::RX:
+            //         printf("sx1262 chip mode status: RX\n");
+            //         break;
+            //     case Cpp_Bus_Driver::Sx126x::Chip_Mode_Status::TX:
+            //         printf("sx1262 chip mode status: TX\n");
+            //         break;
+
+            //     default:
+            //         break;
+            //     }
+
+            //     cycle_time = esp_log_timestamp() + 1000;
+            // }
+
+            if (System_Ui->_device_sx1262.auto_send.flag == true)
             {
-                adsb_stats_t stats = adsb_get_stats();
-                receiver_pos_t rx = adsb_get_receiver_pos();
+                if (Rf_Send_Flag == false)
+                {
+                    if (esp_log_timestamp() > auto_send_cycle_time)
+                    {
+                        memset(Rf_Send_Package, '\0', sizeof(Rf_Send_Package));
 
-                // Format stats panel
-                int pos = 0;
-                if (stats.rtlsdr_error) {
-                    pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
-                        "RTL-SDR: ERROR (buffer alloc failed)");
-                } else {
-                    pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
-                        "RTL-SDR: %s", stats.rtlsdr_connected ? "connected" : "disconnected");
+                        // 检查长度是否越界
+                        if (System_Ui->_device_sx1262.auto_send.text.size() <= 255)
+                        {
+                            memcpy(Rf_Send_Package, System_Ui->_device_sx1262.auto_send.text.data(), System_Ui->_device_sx1262.auto_send.text.size());
+                        }
+                        else
+                        {
+                            // 处理错误：数据过长
+                            memcpy(Rf_Send_Package, System_Ui->_device_sx1262.auto_send.text.data(), 254);
+                            Rf_Send_Package[254] = '\0';
+
+                            printf("sx1262 send out of bounds(data > Rf_Send_Package)\n");
+                        }
+
+                        char buffer_time[15];
+                        snprintf(buffer_time, sizeof(buffer_time), "%02d:%02d:%02d", System_Ui->_time.hour, System_Ui->_time.minute, System_Ui->_time.second);
+
+                        Lvgl_Ui::System::Win_Rf_Chat_Message wlcm =
+                            {
+                                .direction = Lvgl_Ui::System::Chat_Message_Direction::SEND,
+                                .time = buffer_time,
+                                .data = System_Ui->_device_sx1262.auto_send.text,
+                            };
+                        System_Ui->_registry.win.rf.chat_message_data.push_back(wlcm);
+
+                        if (System_Ui->_current_win == Lvgl_Ui::System::Current_Win::RF)
+                        {
+                            // 更新聊天容器
+                            _lock_acquire(&lvgl_api_lock);
+                            System_Ui->win_rf_chat_message_data_update(System_Ui->_registry.win.rf.chat_message_data);
+                            _lock_release(&lvgl_api_lock);
+                        }
+
+                        Rf_Send_Flag = true;
+
+                        auto_send_cycle_time = esp_log_timestamp() + System_Ui->_device_sx1262.auto_send.interval;
+                    }
                 }
-
-                if (stats.rtlsdr_connected) {
-                    pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
-                        "   %.1f msg/s", stats.msg_rate);
-                }
-
-                pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
-                    "\nAircraft: %d   Messages: %lu",
-                    stats.active_aircraft, (unsigned long)stats.total_messages);
-
-                // GPS line
-                if (rx.fix_valid) {
-                    pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
-                        "\nGPS: %.4f, %.4f (%d sats)",
-                        rx.lat, rx.lon, rx.sats);
-                } else {
-                    pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
-                        "\nGPS: searching...");
-                }
-
-                // Nearest aircraft
-                if (stats.nearest_icao) {
-                    pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
-                        "\nNearest: %06lX %s  %.1fnm  %dft",
-                        (unsigned long)stats.nearest_icao,
-                        stats.nearest_callsign[0] ? stats.nearest_callsign : "----",
-                        stats.nearest_dist_nm, stats.nearest_alt);
-                }
-
-                // UTC time
-                struct timeval tv;
-                gettimeofday(&tv, NULL);
-                struct tm tm_info;
-                gmtime_r(&tv.tv_sec, &tm_info);
-                if (tm_info.tm_year + 1900 >= 2024) {
-                    pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
-                        "\nUTC: %02d:%02d:%02d",
-                        tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec);
-                }
-
-                // Format aircraft list
-                adsb_format_aircraft_list(list_buf, sizeof(list_buf));
-
-                _lock_acquire(&lvgl_api_lock);
-                System_Ui->win_adsb_update(stats_buf, list_buf);
-                _lock_release(&lvgl_api_lock);
             }
 
-            cycle_time = esp_log_timestamp() + 500;  // update every 500ms for responsive feel
+            if (Rf_Send_Flag == true)
+            {
+                // 设置发送模式，发送完成后进入快速切换模式（FS模式）
+                SX1262->start_lora_transmit(Cpp_Bus_Driver::Sx126x::Chip_Mode::TX, 0, Cpp_Bus_Driver::Sx126x::Fallback_Mode::FS);
+                SX1262->set_irq_pin_mode(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::TX_DONE);
+                SX1262->clear_irq_flag(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::TX_DONE);
+
+                printf("sx1262 send start\n");
+                printf("sx1262 send data size: %d\n", strlen(reinterpret_cast<const char *>(Rf_Send_Package)));
+                uint16_t timeout_count = 0;
+                if (SX1262->send_data(Rf_Send_Package, strlen(reinterpret_cast<const char *>(Rf_Send_Package))) == true)
+                {
+                    while (1) // 等待发送完成
+                    {
+                        if (XL9535->pin_read(XL9535_SX1262_DIO1) == 1) // 发送完成中断
+                        {
+                            // 检查中断
+                            Cpp_Bus_Driver::Sx126x::Irq_Status is;
+                            if (SX1262->parse_irq_status(SX1262->get_irq_flag(), is) == false)
+                            {
+                                printf("parse_Iqr_status fail\n");
+                            }
+                            else
+                            {
+                                if (is.all_flag.tx_done == true) // 发送完成
+                                {
+                                    printf("sx1262 send success\n");
+                                    break;
+                                }
+                            }
+                        }
+
+                        timeout_count++;
+                        if (timeout_count > 1000) // 超时
+                        {
+                            printf("sx1262 send timeout\n");
+                            break;
+                        }
+                        vTaskDelay(pdMS_TO_TICKS(10));
+                    }
+                }
+                else
+                {
+                    printf("sx1262 send fail\n");
+                }
+
+                // vTaskDelay(pdMS_TO_TICKS(1000));
+
+                // 还原接收模式
+                SX1262->start_lora_transmit(Cpp_Bus_Driver::Sx126x::Chip_Mode::RX);
+                SX1262->set_irq_pin_mode(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::RX_DONE);
+                SX1262->clear_irq_flag(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::RX_DONE);
+
+                Rf_Send_Flag = false;
+            }
+
+            if (XL9535->pin_read(XL9535_SX1262_DIO1) == 1) // 接收完成中断
+            {
+                // 检查中断
+                Cpp_Bus_Driver::Sx126x::Irq_Status is;
+                if (SX1262->parse_irq_status(SX1262->get_irq_flag(), is) == false)
+                {
+                    printf("parse_irq_status fail\n");
+                }
+                else
+                {
+                    if (is.all_flag.tx_rx_timeout == true)
+                    {
+                        printf("receive timeout\n");
+                        SX1262->clear_irq_flag(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::TIMEOUT);
+                    }
+                    else if (is.all_flag.crc_error == true)
+                    {
+                        printf("receive crc error\n");
+                        SX1262->clear_irq_flag(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::CRC_ERROR);
+                    }
+                    else if (is.lora_reg_flag.header_error == true)
+                    {
+                        printf("receive header error\n");
+                        SX1262->clear_irq_flag(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::HEADER_ERROR);
+                    }
+                    else
+                    {
+                        uint8_t receive_package[255] = {0};
+                        uint8_t length_buffer = SX1262->receive_data(receive_package);
+                        if (length_buffer == 0)
+                        {
+                            printf("sx1262 receive fail (error assert: %d)\n", SX1262->_assert);
+                        }
+                        else
+                        {
+                            Cpp_Bus_Driver::Sx126x::Packet_Metrics pm;
+                            if (SX1262->get_lora_packet_metrics(pm) == true)
+                            {
+                                printf("sx1262 receive rssi_average: %.01f rssi_instantaneous: %.01f snr: %.01f\n", pm.lora.rssi_average, pm.lora.rssi_instantaneous, pm.lora.snr);
+                            }
+
+                            for (uint8_t i = 0; i < length_buffer; i++)
+                            {
+                                printf("get sx1262 data[%d]: %d\n", i, receive_package[i]);
+                            }
+
+                            char buffer_time[15];
+                            snprintf(buffer_time, sizeof(buffer_time), "%02d:%02d:%02d", System_Ui->_time.hour, System_Ui->_time.minute, System_Ui->_time.second);
+
+                            // 创建一个 vector 来存储数据，因为 std::remove 需要可修改的序列
+                            std::vector<uint8_t> buffer_vector(receive_package, receive_package + length_buffer);
+
+                            // 使用 std::remove 将 \0 字符移除
+                            buffer_vector.erase(std::remove(buffer_vector.begin(), buffer_vector.end(), 0), buffer_vector.end());
+
+                            // 使用 string 的构造函数从 vector 创建 string
+                            std::string message_str(buffer_vector.begin(), buffer_vector.end());
+
+                            message_str += '\0';
+
+                            char buffer_data_info[30];
+                            snprintf(buffer_data_info, sizeof(buffer_data_info), "rssi[%.01f] snr[%.01f]", pm.lora.rssi_instantaneous, pm.lora.snr);
+
+                            Lvgl_Ui::System::Win_Rf_Chat_Message wlcm =
+                                {
+                                    .direction = Lvgl_Ui::System::Chat_Message_Direction::RECEIVE,
+                                    .time = buffer_time,
+                                    .data = message_str,
+                                    .data_info = buffer_data_info,
+                                };
+                            System_Ui->_registry.win.rf.chat_message_data.push_back(wlcm);
+
+                            if (System_Ui->_current_win == Lvgl_Ui::System::Current_Win::RF)
+                            {
+                                // 更新聊天容器
+                                _lock_acquire(&lvgl_api_lock);
+                                System_Ui->win_rf_chat_message_data_update(System_Ui->_registry.win.rf.chat_message_data);
+                                _lock_release(&lvgl_api_lock);
+                            }
+                        }
+                    }
+                }
+
+                SX1262->clear_irq_flag(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::RX_DONE);
+            }
+        }
+        break;
+#if defined CONFIG_BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
+        case Lvgl_Ui::System::Rf_Chip_Type::CC1101:
+        {
+            if (System_Ui->_device_cc1101.auto_send.flag == true)
+            {
+                if (Rf_Send_Flag == false)
+                {
+                    if (esp_log_timestamp() > auto_send_cycle_time)
+                    {
+                        memset(Rf_Send_Package, '\0', sizeof(Rf_Send_Package));
+
+                        // 检查长度是否越界
+                        if (System_Ui->_device_cc1101.auto_send.text.size() <= 255)
+                        {
+                            memcpy(Rf_Send_Package, System_Ui->_device_cc1101.auto_send.text.data(), System_Ui->_device_cc1101.auto_send.text.size());
+                        }
+                        else
+                        {
+                            // 处理错误：数据过长
+                            memcpy(Rf_Send_Package, System_Ui->_device_cc1101.auto_send.text.data(), 254);
+                            Rf_Send_Package[254] = '\0';
+
+                            printf("cc1101 send out of bounds(data > Rf_Send_Package)\n");
+                        }
+
+                        char buffer_time[15];
+                        snprintf(buffer_time, sizeof(buffer_time), "%02d:%02d:%02d", System_Ui->_time.hour, System_Ui->_time.minute, System_Ui->_time.second);
+
+                        Lvgl_Ui::System::Win_Rf_Chat_Message wlcm =
+                            {
+                                .direction = Lvgl_Ui::System::Chat_Message_Direction::SEND,
+                                .time = buffer_time,
+                                .data = System_Ui->_device_cc1101.auto_send.text,
+                            };
+                        System_Ui->_registry.win.rf.chat_message_data.push_back(wlcm);
+
+                        if (System_Ui->_current_win == Lvgl_Ui::System::Current_Win::RF)
+                        {
+                            // 更新聊天容器
+                            _lock_acquire(&lvgl_api_lock);
+                            System_Ui->win_rf_chat_message_data_update(System_Ui->_registry.win.rf.chat_message_data);
+                            _lock_release(&lvgl_api_lock);
+                        }
+
+                        Rf_Send_Flag = true;
+
+                        auto_send_cycle_time = esp_log_timestamp() + System_Ui->_device_cc1101.auto_send.interval;
+                    }
+                }
+            }
+
+            if (Rf_Send_Flag == true)
+            {
+                printf("cc1101 send start\n");
+                printf("cc1101 send data size: %d\n", strlen(reinterpret_cast<const char *>(Rf_Send_Package)));
+                Cc1101.finishTransmit();
+                int16_t assert = Cc1101.transmit(Rf_Send_Package, strlen(reinterpret_cast<const char *>(Rf_Send_Package)));
+                if (assert != RADIOLIB_ERR_NONE)
+                {
+                    printf("cc1101 transmit fail (error code: %d)\n", assert);
+                }
+
+                assert = Cc1101.startReceive();
+                if (assert != RADIOLIB_ERR_NONE)
+                {
+                    printf("cc1101 startReceive fail (error code: %d)\n", assert);
+                }
+
+                Cc1101_Interrupt_Flag = false;
+
+                Rf_Send_Flag = false;
+            }
+
+            if (Cc1101_Interrupt_Flag == true) // 接收完成中断
+            {
+                uint8_t receive_package[255] = {0};
+                uint8_t length_buffer = Cc1101.getPacketLength();
+                int16_t assert = Cc1101.readData(receive_package, length_buffer);
+                if (assert != RADIOLIB_ERR_NONE)
+                {
+                    printf("cc1101 receive fail (error assert: %d)\n", assert);
+                }
+                else
+                {
+                    float buffer_rssi = Cc1101.getRSSI();
+                    uint8_t buffer_lqi = Cc1101.getLQI();
+                    printf("cc1101 receive rssi: %.01f lqi: %d\n", buffer_rssi, buffer_lqi);
+
+                    for (uint8_t i = 0; i < length_buffer; i++)
+                    {
+                        printf("get cc1101 data[%d]: %d\n", i, receive_package[i]);
+                    }
+
+                    char buffer_time[15];
+                    snprintf(buffer_time, sizeof(buffer_time), "%02d:%02d:%02d", System_Ui->_time.hour, System_Ui->_time.minute, System_Ui->_time.second);
+
+                    // 创建一个 vector 来存储数据，因为 std::remove 需要可修改的序列
+                    std::vector<uint8_t> buffer_vector(receive_package, receive_package + length_buffer);
+
+                    // 使用 std::remove 将 \0 字符移除
+                    buffer_vector.erase(std::remove(buffer_vector.begin(), buffer_vector.end(), 0), buffer_vector.end());
+
+                    // 使用 string 的构造函数从 vector 创建 string
+                    std::string message_str(buffer_vector.begin(), buffer_vector.end());
+
+                    message_str += '\0';
+
+                    char buffer_data_info[30];
+                    snprintf(buffer_data_info, sizeof(buffer_data_info), "rssi[%.01f] lqi[%d]", buffer_rssi, buffer_lqi);
+
+                    Lvgl_Ui::System::Win_Rf_Chat_Message wlcm =
+                        {
+                            .direction = Lvgl_Ui::System::Chat_Message_Direction::RECEIVE,
+                            .time = buffer_time,
+                            .data = message_str,
+                            .data_info = buffer_data_info,
+                        };
+                    System_Ui->_registry.win.rf.chat_message_data.push_back(wlcm);
+
+                    if (System_Ui->_current_win == Lvgl_Ui::System::Current_Win::RF)
+                    {
+                        // 更新聊天容器
+                        _lock_acquire(&lvgl_api_lock);
+                        System_Ui->win_rf_chat_message_data_update(System_Ui->_registry.win.rf.chat_message_data);
+                        _lock_release(&lvgl_api_lock);
+                    }
+                }
+
+                Cc1101_Interrupt_Flag = false;
+            }
+        }
+        break;
+        case Lvgl_Ui::System::Rf_Chip_Type::NRF24L01:
+        {
+            if (System_Ui->_device_nrf24l01.auto_send.flag == true)
+            {
+                if (Rf_Send_Flag == false)
+                {
+                    if (esp_log_timestamp() > auto_send_cycle_time)
+                    {
+                        memset(Rf_Send_Package, '\0', sizeof(Rf_Send_Package));
+
+                        // 检查长度是否越界
+                        if (System_Ui->_device_nrf24l01.auto_send.text.size() <= 255)
+                        {
+                            memcpy(Rf_Send_Package, System_Ui->_device_nrf24l01.auto_send.text.data(), System_Ui->_device_nrf24l01.auto_send.text.size());
+                        }
+                        else
+                        {
+                            // 处理错误：数据过长
+                            memcpy(Rf_Send_Package, System_Ui->_device_nrf24l01.auto_send.text.data(), 254);
+                            Rf_Send_Package[254] = '\0';
+
+                            printf("nrf24l01 send out of bounds(data > Rf_Send_Package)\n");
+                        }
+
+                        char buffer_time[15];
+                        snprintf(buffer_time, sizeof(buffer_time), "%02d:%02d:%02d", System_Ui->_time.hour, System_Ui->_time.minute, System_Ui->_time.second);
+
+                        Lvgl_Ui::System::Win_Rf_Chat_Message wlcm =
+                            {
+                                .direction = Lvgl_Ui::System::Chat_Message_Direction::SEND,
+                                .time = buffer_time,
+                                .data = System_Ui->_device_nrf24l01.auto_send.text,
+                            };
+                        System_Ui->_registry.win.rf.chat_message_data.push_back(wlcm);
+
+                        if (System_Ui->_current_win == Lvgl_Ui::System::Current_Win::RF)
+                        {
+                            // 更新聊天容器
+                            _lock_acquire(&lvgl_api_lock);
+                            System_Ui->win_rf_chat_message_data_update(System_Ui->_registry.win.rf.chat_message_data);
+                            _lock_release(&lvgl_api_lock);
+                        }
+
+                        Rf_Send_Flag = true;
+
+                        auto_send_cycle_time = esp_log_timestamp() + System_Ui->_device_nrf24l01.auto_send.interval;
+                    }
+                }
+            }
+
+            if (Rf_Send_Flag == true)
+            {
+                printf("nrf24l01 send start\n");
+                printf("nrf24l01 send data size: %d\n", strlen(reinterpret_cast<const char *>(Rf_Send_Package)));
+                Nrf24l01.finishTransmit();
+                int16_t assert = Nrf24l01.transmit(Rf_Send_Package, strlen(reinterpret_cast<const char *>(Rf_Send_Package)), 0);
+                if (assert != RADIOLIB_ERR_NONE)
+                {
+                    printf("nrf24l01 transmit fail (error code: %d)\n", assert);
+                }
+
+                assert = Nrf24l01.startReceive();
+                if (assert != RADIOLIB_ERR_NONE)
+                {
+                    printf("nrf24l01 startReceive fail (error code: %d)\n", assert);
+                }
+
+                Nrf24l01_Interrupt_Flag = false;
+
+                Rf_Send_Flag = false;
+            }
+
+            if (Nrf24l01_Interrupt_Flag == true) // 接收完成中断
+            {
+                uint8_t receive_package[255] = {0};
+                uint8_t length_buffer = Nrf24l01.getPacketLength();
+                int16_t assert = Nrf24l01.readData(receive_package, length_buffer);
+                if (assert != RADIOLIB_ERR_NONE)
+                {
+                    printf("nrf24l01 receive fail (error assert: %d)\n", assert);
+                }
+                else
+                {
+                    float buffer_rssi = Nrf24l01.getRSSI();
+                    float buffer_lqi = Nrf24l01.getSNR();
+                    printf("nrf24l01 receive rssi: %.01f snr: %.01f\n", buffer_rssi, buffer_lqi);
+
+                    for (uint8_t i = 0; i < length_buffer; i++)
+                    {
+                        printf("get nrf24l01 data[%d]: %d\n", i, receive_package[i]);
+                    }
+
+                    char buffer_time[15];
+                    snprintf(buffer_time, sizeof(buffer_time), "%02d:%02d:%02d", System_Ui->_time.hour, System_Ui->_time.minute, System_Ui->_time.second);
+
+                    // 创建一个 vector 来存储数据，因为 std::remove 需要可修改的序列
+                    std::vector<uint8_t> buffer_vector(receive_package, receive_package + length_buffer);
+
+                    // 使用 std::remove 将 \0 字符移除
+                    buffer_vector.erase(std::remove(buffer_vector.begin(), buffer_vector.end(), 0), buffer_vector.end());
+
+                    // 使用 string 的构造函数从 vector 创建 string
+                    std::string message_str(buffer_vector.begin(), buffer_vector.end());
+
+                    message_str += '\0';
+
+                    char buffer_data_info[30];
+                    snprintf(buffer_data_info, sizeof(buffer_data_info), "rssi[%.01f] snr[%.01f]", buffer_rssi, buffer_lqi);
+
+                    Lvgl_Ui::System::Win_Rf_Chat_Message wlcm =
+                        {
+                            .direction = Lvgl_Ui::System::Chat_Message_Direction::RECEIVE,
+                            .time = buffer_time,
+                            .data = message_str,
+                            .data_info = buffer_data_info,
+                        };
+                    System_Ui->_registry.win.rf.chat_message_data.push_back(wlcm);
+
+                    if (System_Ui->_current_win == Lvgl_Ui::System::Current_Win::RF)
+                    {
+                        // 更新聊天容器
+                        _lock_acquire(&lvgl_api_lock);
+                        System_Ui->win_rf_chat_message_data_update(System_Ui->_registry.win.rf.chat_message_data);
+                        _lock_release(&lvgl_api_lock);
+                    }
+                }
+
+                Nrf24l01_Interrupt_Flag = false;
+            }
+        }
+        break;
+#endif
+        default:
+            break;
+        }
+
+        // 如果有触发停止标志就等待一次发送或接收过程完成后再停止
+        // 这样做为了防止spi意外终止导致的iic的0x107错误
+        // 多任务处理spi和iic不能同时工作，spi工作的时候有概率会导致iic死机
+        if (Device_Rf_Task_Stop_Flag == true)
+        {
+            vTaskSuspend(Rf_Task_Handle);
         }
 
         vTaskDelay(pdMS_TO_TICKS(10));
     }
-}
-
-void device_meshy_app_task(void *arg)
-{
-    printf("device_meshy_app_task start\n");
-    vTaskSuspend(NULL);  // suspend self until Meshy app opens
-
-    static char stats_buf[256];
-    static const size_t MSG_BUF_SIZE = 65536;  // 64KB — enough for 1000 messages
-    static char *msg_buf = nullptr;
-    if (!msg_buf) {
-        msg_buf = (char *)heap_caps_malloc(MSG_BUF_SIZE, MALLOC_CAP_SPIRAM);
-        if (!msg_buf) {
-            printf("meshy_app_task: failed to alloc msg_buf in PSRAM\n");
-            vTaskDelete(NULL);
-            return;
-        }
-    }
-
-    size_t cycle_time = 0;
-
-    while (1)
-    {
-        if (esp_log_timestamp() > cycle_time)
-        {
-            if (System_Ui->get_current_win() == Lvgl_Ui::System::Current_Win::MESHY)
-            {
-                meshy_stats_t stats = meshy_get_stats();
-
-                int pos = 0;
-                pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
-                    "%s %s  %s  %ddBm",
-                    settings_region_name(g_settings.meshy_region),
-                    settings_preset_name(g_settings.meshy_preset),
-                    settings_role_name(g_settings.meshy_role),
-                    g_settings.meshy_tx_power);
-                if (g_settings.meshy_freq_slot > 0)
-                    pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
-                        "  slot:%d", g_settings.meshy_freq_slot);
-                pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
-                    "\n%.3f MHz  %s  +%d ch",
-                    stats.freq_mhz,
-                    stats.running ? "ACTIVE" : "STOPPED",
-                    meshy_channels_count());
-                pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos,
-                    "\nRX: %lu  Nodes: %lu  TX: %lu",
-                    (unsigned long)stats.rx_decoded,
-                    (unsigned long)stats.known_nodes,
-                    (unsigned long)stats.tx_packets);
-
-                meshy_format_messages(msg_buf, MSG_BUF_SIZE);
-
-                _lock_acquire(&lvgl_api_lock);
-                System_Ui->win_meshy_update(stats_buf, msg_buf);
-                _lock_release(&lvgl_api_lock);
-            }
-
-            cycle_time = esp_log_timestamp() + 500;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-}
-
-void device_scope_app_task(void *arg)
-{
-    // This task is no longer used — scope redraws via LVGL timer instead.
-    // Kept as a stub so the task handle/creation doesn't need to change.
-    printf("device_scope_app_task start (stub — using LVGL timer)\n");
-    vTaskSuspend(NULL);
-    while (1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
 }
 
 void iis_transmission_data_stream_task(void *arg)
@@ -1812,24 +2198,137 @@ void iis_transmission_data_stream_task(void *arg)
     printf("iis_transmission_data_stream_task start\n");
 
     size_t cycle_time = 0;
+    size_t cycle_time_2 = 0;
 
     vTaskSuspend(Iis_Transmission_Data_Stream_Task);
 
+    // 读取音频数据
+    // std::unique_ptr<char[]> data_buffer = std::make_unique<char[]>(1024 * 10);
+    // if (data_buffer == nullptr)
+    // {
+    //     printf("failed to allocate memory for audio buffer\n");
+    // }
+
     while (1)
     {
+        // 限制读取速度
         if (esp_log_timestamp() > cycle_time)
         {
             if (Music_File.good())
             {
+                // 限制流的最大长度
+                // if (Iis_Transmission_Data_Stream.size() < 1024 * 1000)
+                // {
+                //     Music_File.read(data_buffer.get(), 1024 * 10);
+                //     std::streamsize bytes_read = Music_File.gcount(); // 获取实际读取的字节数
+
+                //     if (bytes_read > 0)
+                //     {
+                //         const auto current_buf_size = Iis_Transmission_Data_Stream.size();
+                //         // 调整容量
+                //         Iis_Transmission_Data_Stream.resize(current_buf_size + bytes_read);
+                //         // 存储数据
+                //         // memcpy拷贝的是字节数据
+                //         memcpy(Iis_Transmission_Data_Stream.data() + current_buf_size, data_buffer.get(), bytes_read);
+                //     }
+                // }
+
+                // 限制流的最大长度
                 const auto current_buf_size = Iis_Transmission_Data_Stream.size();
                 if (current_buf_size < 1024 * 300)
                 {
+                    // printf("current_buf_size: %d\n", current_buf_size);
+
+                    // 调整容量
                     Iis_Transmission_Data_Stream.resize(current_buf_size + 1024 * 20);
+
                     Music_File.read(Iis_Transmission_Data_Stream.data() + current_buf_size, 1024 * 20);
-                    std::streamsize bytes_read = Music_File.gcount();
+                    std::streamsize bytes_read = Music_File.gcount(); // 获取实际读取的字节数
+                    // 如果实际读取的字节数小于预期，则从末尾扣除多余的空间
                     if (bytes_read < 1024 * 20)
+                    {
                         Iis_Transmission_Data_Stream.erase(Iis_Transmission_Data_Stream.end() - (1024 * 20 - bytes_read), Iis_Transmission_Data_Stream.end());
+                    }
                 }
+
+                // const auto current_buf_size = Iis_Transmission_Data_Stream.size();
+                // if (current_buf_size >= 1024 * 400)
+                // {
+                //     Music_File_Read_Speed = Music_File_Read_Speed_Enum::LOW_SPEED;
+                // }
+                // if (current_buf_size <= 1024 * 200)
+                // {
+                //     Music_File_Read_Speed = Music_File_Read_Speed_Enum::HIGH_SPEED;
+                // }
+
+                // switch (Music_File_Read_Speed)
+                // {
+                // case Music_File_Read_Speed_Enum::LOW_SPEED:
+                // {
+                //     if (current_buf_size < 1024 * 600)
+                //     {
+                //         printf("LOW_SPEED current_buf_size: %d\n", current_buf_size);
+
+                //         // 调整容量
+                //         Iis_Transmission_Data_Stream.resize(current_buf_size + 1024 * 5);
+
+                //         Music_File.read(Iis_Transmission_Data_Stream.data() + current_buf_size, 1024 * 5);
+                //         std::streamsize bytes_read = Music_File.gcount(); // 获取实际读取的字节数
+                //         // 如果实际读取的字节数小于预期，则从末尾扣除多余的空间
+                //         if (bytes_read < 1024 * 5)
+                //         {
+                //             Iis_Transmission_Data_Stream.erase(Iis_Transmission_Data_Stream.end() - (1024 * 5 - bytes_read), Iis_Transmission_Data_Stream.end());
+                //         }
+
+                //         // Music_File.read(data_buffer.get(), 1024 * 5);
+                //         // std::streamsize bytes_read = Music_File.gcount(); // 获取实际读取的字节数
+                //         // if (bytes_read > 0)
+                //         // {
+                //         //     current_buf_size = Iis_Transmission_Data_Stream.size();
+                //         //     // 调整容量
+                //         //     Iis_Transmission_Data_Stream.resize(current_buf_size + bytes_read);
+                //         //     // 存储数据
+                //         //     // memcpy拷贝的是字节数据
+                //         //     memcpy(Iis_Transmission_Data_Stream.data() + current_buf_size, data_buffer.get(), bytes_read);
+                //         // }
+                //     }
+
+                //     break;
+                // }
+                // case Music_File_Read_Speed_Enum::HIGH_SPEED:
+                // {
+                //     if (current_buf_size < 1024 * 600)
+                //     {
+                //         printf("HIGH_SPEED current_buf_size: %d\n", current_buf_size);
+
+                //         // 调整容量
+                //         Iis_Transmission_Data_Stream.resize(current_buf_size + 1024 * 10);
+
+                //         Music_File.read(Iis_Transmission_Data_Stream.data() + current_buf_size, 1024 * 10);
+                //         std::streamsize bytes_read = Music_File.gcount(); // 获取实际读取的字节数
+                //         // 如果实际读取的字节数小于预期，则从末尾扣除多余的空间
+                //         if (bytes_read < 1024 * 10)
+                //         {
+                //             Iis_Transmission_Data_Stream.erase(Iis_Transmission_Data_Stream.end() - (1024 * 10 - bytes_read), Iis_Transmission_Data_Stream.end());
+                //         }
+
+                //         // Music_File.read(data_buffer.get(), 1024 * 10);
+                //         // std::streamsize bytes_read = Music_File.gcount(); // 获取实际读取的字节数
+                //         // if (bytes_read > 0)
+                //         // {
+                //         //     current_buf_size = Iis_Transmission_Data_Stream.size();
+                //         //     // 调整容量
+                //         //     Iis_Transmission_Data_Stream.resize(current_buf_size + bytes_read);
+                //         //     // 存储数据
+                //         //     // memcpy拷贝的是字节数据
+                //         //     memcpy(Iis_Transmission_Data_Stream.data() + current_buf_size, data_buffer.get(), bytes_read);
+                //         // }
+                //     }
+                //     break;
+                // }
+                // default:
+                //     break;
+                // }
             }
 
             cycle_time = esp_log_timestamp() + 30;
@@ -1839,6 +2338,7 @@ void iis_transmission_data_stream_task(void *arg)
         {
             if (Iis_Read_Data_Size_Index > 1024 * 250)
             {
+                // 删除已经存储的数据
                 Iis_Transmission_Data_Stream.erase(Iis_Transmission_Data_Stream.begin(), Iis_Transmission_Data_Stream.begin() + 1024 * 250);
                 Iis_Read_Data_Size_Index -= 1024 * 250;
             }
@@ -1846,6 +2346,15 @@ void iis_transmission_data_stream_task(void *arg)
 
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+}
+
+void bsp_init_refresh_monitor_io(void)
+{
+    // gpio_config_t monitor_io_conf = {
+    //     .pin_bit_mask = 1ULL << EXAMPLE_PIN_NUM_REFRESH_MONITOR,
+    //     .mode = GPIO_MODE_OUTPUT,
+    // };
+    // ESP_ERROR_CHECK(gpio_config(&monitor_io_conf));
 }
 
 void my_touchpad_read(lv_indev_t *indev, lv_indev_data_t *data)
@@ -1862,92 +2371,137 @@ void my_touchpad_read(lv_indev_t *indev, lv_indev_data_t *data)
         }
     }
 
-    // --- Unified touch input: runtime screen type detection ---
-    bool got_touch = false;
-    Lvgl_Ui::System::TouchPoint tp;
+// if (XL9535->pin_read(XL9535_TOUCH_INT) == 0)
+// {
+#if defined CONFIG_SCREEN_TYPE_HI8561
 
-    if (screen_is_rm69a10()) {
-        Cpp_Bus_Driver::Gt9895::Touch_Point raw;
-        if (GT9895->get_multiple_touch_point(raw)) {
-            tp.finger_count = raw.finger_count;
-            tp.edge_touch_flag = raw.edge_touch_flag;
-            for (auto &pt : raw.info)
-                tp.info.push_back({pt.x, pt.y, pt.pressure_value});
-            got_touch = true;
-            raw.info.clear();
-        }
-    } else {
-        Cpp_Bus_Driver::Hi8561_Touch::Touch_Point raw;
-        if (HI8561_T->get_multiple_touch_point(raw)) {
-            tp.finger_count = raw.finger_count;
-            tp.edge_touch_flag = raw.edge_touch_flag;
-            for (auto &pt : raw.info)
-                tp.info.push_back({pt.x, pt.y, pt.pressure_value});
-            got_touch = true;
-            raw.info.clear();
-        }
-    }
+    Cpp_Bus_Driver::Hi8561_Touch::Touch_Point tp;
 
-    if (got_touch)
+    if (HI8561_T->get_multiple_touch_point(tp) == true)
     {
-        // Track last touch for screen timeout
-        g_last_touch_ms = esp_log_timestamp();
-        // Wake screen on touch if blanked
-        if (g_screen_blanked) {
-            g_screen_blanked = false;
-            if (screen_is_rm69a10()) {
-                set_rm69a10_brightness(Screen_Mipi_Dpi_Panel, g_settings.brightness * 255 / 100);
-            } else {
-                HI8561_T->start_pwm_gradient_time(g_settings.brightness, 200);
-            }
-            data->state = LV_INDEV_STATE_REL;  // swallow the wake touch
-            return;
-        }
+        // printf("finger_count: %d edge_touch_flag: %d\nx: %d y: %d pressure_value: %d\n",
+        //        tp.finger_count, tp.edge_touch_flag, tp.info[0].x, tp.info[0].y, tp.info[0].pressure_value);
+
+        // printf("touch finger: %d edge touch flag: %d\n", tp.finger_count, tp.edge_touch_flag);
+        // for (uint8_t i = 0; i < tp.info.size(); i++)
+        // {
+        //     printf("touch num [%d] x: %d y: %d p: %d\n", i + 1, tp.info[i].x, tp.info[i].y, tp.info[i].pressure_value);
+        // }
+
         if (System_Ui->get_current_win() == Lvgl_Ui::System::Current_Win::CIT_TOUCH_TEST)
         {
+            /*Set the coordinates*/
             data->point.x = tp.info[0].x;
             data->point.y = tp.info[0].y;
+
             data->state = LV_INDEV_STATE_PR;
         }
         else
         {
             if ((tp.finger_count == 1) && (tp.info[0].x != static_cast<uint16_t>(-1)) && (tp.info[0].y != static_cast<uint16_t>(-1)) && (tp.info[0].pressure_value != 0))
             {
+                /*Set the coordinates*/
                 data->point.x = tp.info[0].x;
                 data->point.y = tp.info[0].y;
+
                 data->state = LV_INDEV_STATE_PR;
             }
             else
+            {
                 data->state = LV_INDEV_STATE_REL;
+            }
+        }
+
+        if (tp.edge_touch_flag == true)
+        {
+            System_Ui->_edge_touch_flag = true;
+
+            edge_touch_scheduled_shutdown_time = esp_log_timestamp() + 100;
+            edge_touch_scheduled_shutdown_lock = true;
+        }
+
+        System_Ui->_touch_point = tp;
+
+        tp.info.clear();
+    }
+    else
+    {
+        data->state = LV_INDEV_STATE_REL;
+    }
+
+#elif defined CONFIG_SCREEN_TYPE_RM69A10
+
+    Cpp_Bus_Driver::Gt9895::Touch_Point tp;
+
+    if (GT9895->get_multiple_touch_point(tp) == true)
+    {
+        if (System_Ui->get_current_win() == Lvgl_Ui::System::Current_Win::CIT_TOUCH_TEST)
+        {
+            /*Set the coordinates*/
+            data->point.x = tp.info[0].x;
+            data->point.y = tp.info[0].y;
+
+            data->state = LV_INDEV_STATE_PR;
+        }
+        else
+        {
+            if ((tp.finger_count == 1) && (tp.info[0].x != static_cast<uint16_t>(-1)) && (tp.info[0].y != static_cast<uint16_t>(-1)) && (tp.info[0].pressure_value != 0))
+            {
+                /*Set the coordinates*/
+                data->point.x = tp.info[0].x;
+                data->point.y = tp.info[0].y;
+
+                data->state = LV_INDEV_STATE_PR;
+            }
+            else
+            {
+                data->state = LV_INDEV_STATE_REL;
+            }
         }
 
 #if defined CONFIG_BOARD_TYPE_T_DISPLAY_P4
         if (tp.edge_touch_flag == true)
         {
             System_Ui->_edge_touch_flag = true;
+
             edge_touch_scheduled_shutdown_time = esp_log_timestamp() + 100;
             edge_touch_scheduled_shutdown_lock = true;
         }
 #elif defined CONFIG_BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
-        if ((tp.info[0].y < 20) || ((tp.info[0].y > g_screen_height - 20) && (tp.info[0].y <= g_screen_height)))
+
+        if ((tp.info[0].y < 20) || ((tp.info[0].y > SCREEN_HEIGHT - 20) && (tp.info[0].y <= SCREEN_HEIGHT)))
         {
             tp.edge_touch_flag = true;
             System_Ui->_edge_touch_flag = true;
+
             edge_touch_scheduled_shutdown_time = esp_log_timestamp() + 200;
             edge_touch_scheduled_shutdown_lock = true;
         }
+
+#else
+#error "unknown macro definition, please select the correct macro definition."
 #endif
 
         System_Ui->_touch_point = tp;
+
+        tp.info.clear();
     }
     else
+    {
         data->state = LV_INDEV_STATE_REL;
+    }
+
+#else
+#error "unknown macro definition, please select the correct macro definition."
+#endif
+
+    // }
 }
 
 #if defined CONFIG_BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
 void my_keyboard_read(lv_indev_t *indev, lv_indev_data_t *data)
 {
-    static uint32_t last_key = 0;
+    static uint32_t last_key = 0; // 静态变量记录上一次按键
     static bool pressed_state_flag = false;
     static bool caps_lock_flag = false;
     static bool shift_press_flag = false;
@@ -1957,7 +2511,9 @@ void my_keyboard_read(lv_indev_t *indev, lv_indev_data_t *data)
         Cpp_Bus_Driver::Tca8418::Irq_Status is;
 
         if (TCA8418->parse_irq_status(TCA8418->get_irq_flag(), is) == false)
+        {
             printf("parse_irq_status fail\n");
+        }
         else
         {
             if (is.key_events_flag == true)
@@ -1965,6 +2521,8 @@ void my_keyboard_read(lv_indev_t *indev, lv_indev_data_t *data)
                 Cpp_Bus_Driver::Tca8418::Touch_Point tp;
                 if (TCA8418->get_multiple_touch_point(tp) == true)
                 {
+                    // printf("touch finger: %d\n", tp.finger_count);
+
                     for (uint8_t i = 0; i < tp.info.size(); i++)
                     {
                         switch (tp.info[i].event_type)
@@ -1974,10 +2532,16 @@ void my_keyboard_read(lv_indev_t *indev, lv_indev_data_t *data)
                             Cpp_Bus_Driver::Tca8418::Touch_Position tp_2;
                             if (TCA8418->parse_touch_num(tp.info[i].num, tp_2) == true)
                             {
+                                // printf("keypad event\n");
+                                // printf("   touch num:[%d] num: %d x: %d y: %d press_flag: %d\n", i + 1, tp.info[i].num, tp_2.x, tp_2.y, tp.info[i].press_flag);
                                 if (tp.info[i].num <= (sizeof(Tca8418_Map) / sizeof(std::string)))
                                 {
+                                    // printf("   touch string: %s\n", Tca8418_Map[tp.info[i].num - 1].c_str());
+
                                     if (System_Ui->get_current_win() == Lvgl_Ui::System::Current_Win::CIT_KEYBOARD_TEST)
+                                    {
                                         lv_label_set_text(System_Ui->_registry.win.cit.keyboard_test.data_label, Tca8418_Map[tp.info[i].num - 1].c_str());
+                                    }
                                 }
 
                                 if (tp.info[i].press_flag == 1)
@@ -1986,34 +2550,60 @@ void my_keyboard_read(lv_indev_t *indev, lv_indev_data_t *data)
                                     if (Tca8418_Map[tp.info[i].num - 1] == "Caps")
                                     {
                                         caps_lock_flag = !caps_lock_flag;
-                                        XL9555->pin_write(XL9555_LED_1, static_cast<Cpp_Bus_Driver::Xl95x5::Value>(!caps_lock_flag));
-                                        XL9555->pin_write(XL9555_LED_2, static_cast<Cpp_Bus_Driver::Xl95x5::Value>(!caps_lock_flag));
-                                        XL9555->pin_write(XL9555_LED_3, static_cast<Cpp_Bus_Driver::Xl95x5::Value>(!caps_lock_flag));
+                                        if (caps_lock_flag == false)
+                                        {
+                                            XL9555->pin_write(XL9555_LED_1, Cpp_Bus_Driver::Xl95x5::Value::HIGH); // 关闭LED
+                                            XL9555->pin_write(XL9555_LED_2, Cpp_Bus_Driver::Xl95x5::Value::HIGH);
+                                            XL9555->pin_write(XL9555_LED_3, Cpp_Bus_Driver::Xl95x5::Value::HIGH);
+                                        }
+                                        else
+                                        {
+                                            XL9555->pin_write(XL9555_LED_1, Cpp_Bus_Driver::Xl95x5::Value::LOW); // 开启LED
+                                            XL9555->pin_write(XL9555_LED_2, Cpp_Bus_Driver::Xl95x5::Value::LOW);
+                                            XL9555->pin_write(XL9555_LED_3, Cpp_Bus_Driver::Xl95x5::Value::LOW);
+                                        }
                                     }
 
                                     if (Tca8418_Map[tp.info[i].num - 1] == "Shift")
+                                    {
                                         shift_press_flag = true;
+                                    }
 
                                     if (shift_press_flag == false)
                                     {
-                                        last_key = Tca8418_Map_Lvgl[tp.info[i].num - 1];
-                                        if (caps_lock_flag == true && last_key >= 'a' && last_key <= 'z')
-                                            last_key = last_key - 'a' + 'A';
+                                        last_key = Tca8418_Map_Lvgl[tp.info[i].num - 1]; // 保存最后按下的键
+                                        if (caps_lock_flag == true)
+                                        {
+                                            // 如果是小写字母，转为大写
+                                            if (last_key >= 'a' && last_key <= 'z')
+                                            {
+                                                last_key = last_key - 'a' + 'A';
+                                            }
+                                        }
                                     }
                                     else
-                                        last_key = Tca8418_Map_Lvgl_Shift[tp.info[i].num - 1];
+                                    {
+                                        last_key = Tca8418_Map_Lvgl_Shift[tp.info[i].num - 1]; // 保存最后按下的键
+                                    }
                                 }
                                 else
                                 {
                                     pressed_state_flag = false;
+
                                     if (Tca8418_Map[tp.info[i].num - 1] == "Shift")
+                                    {
                                         shift_press_flag = false;
+                                    }
                                 }
                             }
+
                             break;
                         }
                         case Cpp_Bus_Driver::Tca8418::Event_Type::GPIO:
+                            // printf("gpio event\n");
+                            // printf("   touch num:[%d] num: %d press_flag: %d\n", i + 1, tp.info[i].num, tp.info[i].press_flag);
                             break;
+
                         default:
                             break;
                         }
@@ -2028,11 +2618,14 @@ void my_keyboard_read(lv_indev_t *indev, lv_indev_data_t *data)
     }
 
     if (pressed_state_flag == false)
-        data->state = LV_INDEV_STATE_RELEASED;
+    {
+        data->state = LV_INDEV_STATE_RELEASED; // 释放状态
+    }
     else
     {
-        data->state = LV_INDEV_STATE_PRESSED;
-        data->key = last_key;
+        data->state = LV_INDEV_STATE_PRESSED; // 按下状态
+
+        data->key = last_key; // 当前按下的键值
     }
 }
 
@@ -2041,19 +2634,29 @@ void device_nfc_task(void *arg)
     printf("device_nfc_task start\n");
     vTaskSuspend(Nfc_Task_Handle);
 
+    size_t cycle_time = 0;
+
     while (1)
     {
         switch (St25r3916_Nfc_Mode)
         {
         case Nfc_Mode::TEST:
+        {
             St25r3916_Loop();
-            break;
+        }
+        break;
+
         default:
             break;
         }
 
+        // 如果有触发停止标志就等待一次发送或接收过程完成后再停止
+        // 这样做为了防止spi意外终止导致的iic的0x107错误
+        // 多任务处理spi和iic不能同时工作，spi工作的时候有概率会导致iic死机
         if (Device_Nfc_Task_Stop_Flag == true)
+        {
             vTaskSuspend(Nfc_Task_Handle);
+        }
 
         vTaskDelay(pdMS_TO_TICKS(10));
     }
@@ -2075,6 +2678,7 @@ void Cc1101_Rf_Switch_Control(Cc1101_Rf_Switch rf_switch)
         XL9555->pin_write(XL9555_T_MIXRF_CC1101_RF_SWITCH_0, Cpp_Bus_Driver::Xl95x5::Value::HIGH);
         XL9555->pin_write(XL9555_T_MIXRF_CC1101_RF_SWITCH_1, Cpp_Bus_Driver::Xl95x5::Value::LOW);
         break;
+
     default:
         printf("unknown rf switch\n");
         break;
@@ -2084,94 +2688,48 @@ void Cc1101_Rf_Switch_Control(Cc1101_Rf_Switch rf_switch)
 bool Set_T_Mixrf_Lr1121_Sleep()
 {
     XL9555->pin_mode(XL9555_T_MIXRF_LR1121_RST, Cpp_Bus_Driver::Xl95x5::Mode::OUTPUT);
+    // XL9555->pin_write(XL9555_T_MIXRF_LR1121_RST, Cpp_Bus_Driver::Xl95x5::Value::HIGH);
+    // vTaskDelay(pdMS_TO_TICKS(10));
     XL9555->pin_write(XL9555_T_MIXRF_LR1121_RST, Cpp_Bus_Driver::Xl95x5::Value::LOW);
+    // vTaskDelay(pdMS_TO_TICKS(10));
+    // XL9555->pin_write(XL9555_T_MIXRF_LR1121_RST, Cpp_Bus_Driver::Xl95x5::Value::HIGH);
+    // vTaskDelay(pdMS_TO_TICKS(10));
+
+    // XL9555->pin_mode(XL9555_T_MIXRF_LR1121_CS, Cpp_Bus_Driver::Xl95x5::Mode::OUTPUT);
+    // XL9555->pin_write(XL9555_T_MIXRF_LR1121_CS, Cpp_Bus_Driver::Xl95x5::Value::HIGH);
+
+    // auto lr1121_spi_bus = std::make_shared<Cpp_Bus_Driver::Hardware_Spi>(T_MIXRF_LR1121_MOSI, T_MIXRF_LR1121_SCLK, T_MIXRF_LR1121_MISO, SPI2_HOST, 0);
+    // RadioLibHal *lr1121_radiolib_hal = new Radiolib_Cpp_Bus_Driver_Hal(lr1121_spi_bus, 10000000, -1);
+    // LR1121 lr1121 = new Module(lr1121_radiolib_hal, static_cast<uint32_t>(RADIOLIB_NC),
+    //                            static_cast<uint32_t>(RADIOLIB_NC), static_cast<uint32_t>(RADIOLIB_NC), static_cast<uint32_t>(RADIOLIB_NC));
+
+    // XL9555->pin_write(XL9555_T_MIXRF_LR1121_CS, Cpp_Bus_Driver::Xl95x5::Value::LOW);
+    // int16_t assert = lr1121.begin(434.0, 125.0, 9, 7, RADIOLIB_LR11X0_LORA_SYNC_WORD_PRIVATE, 10, 8, 3.3);
+    // if (assert == RADIOLIB_ERR_NONE)
+    // {
+    //     printf("lr1121 init success\n");
+    // }
+    // else
+    // {
+    //     printf("lr1121 init fail (error code: %d)\n", assert);
+    //     XL9555->pin_write(XL9555_T_MIXRF_LR1121_CS, Cpp_Bus_Driver::Xl95x5::Value::HIGH);
+    //     return false;
+    // }
+    // assert = lr1121.sleep();
+    // if (assert != RADIOLIB_ERR_NONE)
+    // {
+    //     printf("lr1121 sleep fail (error code: %d)\n", assert);
+    //     XL9555->pin_write(XL9555_T_MIXRF_LR1121_CS, Cpp_Bus_Driver::Xl95x5::Value::HIGH);
+    //     return false;
+    // }
+
+    // XL9555->pin_write(XL9555_T_MIXRF_LR1121_CS, Cpp_Bus_Driver::Xl95x5::Value::HIGH);
     return true;
 }
 
 #endif
 
-static sdmmc_card_t *sd_card_handle = NULL;
-static bool sd_using_spi = false;     // track current mode for clean teardown
-static spi_host_device_t sd_spi_host = SPI3_HOST;
-
-// SD card init — SPI mode (default, coexists with ESP-Hosted SDIO on Slot 1)
-static bool Sd_Spi_Init(const char *base_path, int max_retries = 1)
-{
-    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-        .format_if_mount_failed = false,
-        .max_files = 5,
-        .allocation_unit_size = 16 * 1024,
-    };
-
-    sdmmc_card_t *card;
-
-    printf("initializing sd card (SPI mode)\n");
-
-    // LDO power for SD card
-    sd_pwr_ctrl_ldo_config_t ldo_config = { .ldo_chan_id = 4 };
-    sd_pwr_ctrl_handle_t pwr_ctrl_handle = NULL;
-    int32_t assert = sd_pwr_ctrl_new_on_chip_ldo(&ldo_config, &pwr_ctrl_handle);
-    if (assert != ESP_OK)
-        printf("failed to create a new on-chip ldo power control driver\n");
-
-    // Initialize SPI bus for SD card (SPI3_HOST — SPI2 is used by SX1262)
-    spi_bus_config_t bus_cfg = {};
-    bus_cfg.mosi_io_num = SD_MOSI;   // GPIO 44 (was SDIO_1_CMD)
-    bus_cfg.miso_io_num = SD_MISO;   // GPIO 39 (was SDIO_1_D0)
-    bus_cfg.sclk_io_num = SD_SCLK;   // GPIO 43 (was SDIO_1_CLK)
-    bus_cfg.quadwp_io_num = -1;
-    bus_cfg.quadhd_io_num = -1;
-    bus_cfg.max_transfer_sz = 4096;
-
-    assert = spi_bus_initialize(sd_spi_host, &bus_cfg, SPI_DMA_CH_AUTO);
-    if (assert != ESP_OK) {
-        printf("SPI bus init failed: 0x%lx\n", (long)assert);
-        return false;
-    }
-
-    // SPI device config for SD card
-    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
-    slot_config.host_id = sd_spi_host;
-    slot_config.gpio_cs = static_cast<gpio_num_t>(SD_CS);  // GPIO 42 (was SDIO_1_D3)
-
-    // Host config for SPI mode
-    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    host.slot = sd_spi_host;
-    host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;  // 40MHz SPI
-    host.pwr_ctrl_handle = pwr_ctrl_handle;
-
-    printf("mounting filesystem\n");
-
-    // Retry mount — SD card may need extra time to come online
-    for (int attempt = 0; attempt < max_retries; attempt++) {
-        assert = esp_vfs_fat_sdspi_mount(base_path, &host, &slot_config, &mount_config, &card);
-        if (assert == ESP_OK) break;
-        if (attempt < max_retries - 1) {
-            printf("SD mount attempt %d failed (0x%lx), retrying in 1s...\n", attempt + 1, (long)assert);
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        }
-    }
-    if (assert != ESP_OK) {
-        printf("failed to mount filesystem\n");
-        spi_bus_free(sd_spi_host);
-        return false;
-    }
-
-    printf("filesystem mounted\n");
-    printf("[MEM] after SD mount: internal=%u\n", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-    sdmmc_card_print_info(stdout, card);
-    sd_card_handle = card;
-    sd_using_spi = true;
-
-    // Clear FAT32 dirty flag after mount
-    sd_clear_dirty_flag();
-
-    return true;
-}
-
-// SD card init — SDMMC mode (faster, but conflicts with ESP-Hosted SDIO)
-// Use when WiFi is disabled and high throughput is needed.
-static bool Sdmmc_Init(const char *base_path, int max_retries = 1)
+bool Sdmmc_Init(const char *base_path)
 {
     esp_vfs_fat_sdmmc_mount_config_t mount_config =
         {
@@ -2182,18 +2740,27 @@ static bool Sdmmc_Init(const char *base_path, int max_retries = 1)
 
     sdmmc_card_t *card;
 
-    printf("initializing sd card (SDMMC mode)\n");
+    printf("initializing sd card\n");
+    printf("using sdmmc peripheral\n");
 
-    sd_pwr_ctrl_ldo_config_t ldo_config = { .ldo_chan_id = 4 };
+    sd_pwr_ctrl_ldo_config_t ldo_config =
+        {
+            .ldo_chan_id = 4,
+        };
     sd_pwr_ctrl_handle_t pwr_ctrl_handle = NULL;
 
     int32_t assert = sd_pwr_ctrl_new_on_chip_ldo(&ldo_config, &pwr_ctrl_handle);
     if (assert != ESP_OK)
+    {
         printf("failed to create a new on-chip ldo power control driver\n");
+        // return false;
+    }
 
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     host.slot = SDMMC_HOST_SLOT_0;
+
     host.max_freq_khz = SDMMC_FREQ_52M;
+
     host.pwr_ctrl_handle = pwr_ctrl_handle;
 
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
@@ -2204,19 +2771,12 @@ static bool Sdmmc_Init(const char *base_path, int max_retries = 1)
     slot_config.d1 = static_cast<gpio_num_t>(SD_SDIO_D1);
     slot_config.d2 = static_cast<gpio_num_t>(SD_SDIO_D2);
     slot_config.d3 = static_cast<gpio_num_t>(SD_SDIO_D3);
+
     slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
 
     printf("mounting filesystem\n");
 
-    // Retry mount — SD card may need extra time to come online
-    for (int attempt = 0; attempt < max_retries; attempt++) {
-        assert = esp_vfs_fat_sdmmc_mount(base_path, &host, &slot_config, &mount_config, &card);
-        if (assert == ESP_OK) break;
-        if (attempt < max_retries - 1) {
-            printf("SD mount attempt %d failed (0x%lx), retrying in 1s...\n", attempt + 1, assert);
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        }
-    }
+    assert = esp_vfs_fat_sdmmc_mount(base_path, &host, &slot_config, &mount_config, &card);
     if (assert != ESP_OK)
     {
         printf("failed to mount filesystem\n");
@@ -2224,107 +2784,97 @@ static bool Sdmmc_Init(const char *base_path, int max_retries = 1)
     }
 
     printf("filesystem mounted\n");
-    printf("[MEM] after SD mount: internal=%u\n", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-    sdmmc_card_print_info(stdout, card);
-    sd_card_handle = card;
-    sd_using_spi = false;
 
-    // Clear FAT32 dirty flag after mount
-    sd_clear_dirty_flag();
+    // Card has been initialized, print its properties
+    sdmmc_card_print_info(stdout, card);
 
     return true;
 }
 
-// Clear the FAT32 dirty flag (ClnShutBit + HrdErrBit in FAT[1]).
-// Called after mount and periodically during sd_log_sync so that
-// a hard crash always leaves the flag clean for macOS.
-extern "C" void sd_clear_dirty_flag(void) {
-    if (!sd_card_handle) return;
-    uint8_t bpb[512];
-    if (sdmmc_read_sectors(sd_card_handle, bpb, 0, 1) != ESP_OK) return;
-    if (bpb[510] != 0x55 || bpb[511] != 0xAA) return;
-    uint16_t reserved = *(uint16_t *)(bpb + 14);
-    uint8_t n_fats = bpb[16];
-    uint32_t fat_size = *(uint32_t *)(bpb + 36);
-    if (reserved == 0) return;
-    uint8_t fat_sec[512];
-    if (sdmmc_read_sectors(sd_card_handle, fat_sec, reserved, 1) != ESP_OK) return;
-    uint32_t fat1 = *(uint32_t *)(fat_sec + 4);
-    if ((fat1 & 0x0C000000) == 0x0C000000) return; // already clean
-    fat1 |= 0x0C000000;
-    *(uint32_t *)(fat_sec + 4) = fat1;
-    sdmmc_write_sectors(sd_card_handle, fat_sec, reserved, 1);
-    if (n_fats > 1 && fat_size > 0) {
-        sdmmc_write_sectors(sd_card_handle, fat_sec, reserved + fat_size, 1);
-    }
-}
+bool Sdspi_Init(const char *base_path)
+{
+    esp_vfs_fat_sdmmc_mount_config_t mount_config =
+        {
+            .format_if_mount_failed = false,
+            .max_files = 5,
+            .allocation_unit_size = 16 * 1024,
+        };
 
-// Clean SD shutdown: close log file, unmount FATFS so dirty bit is cleared.
-// Called from shutdown handler and reboot command.
-extern "C" void sd_safe_shutdown(void) {
-    sd_log_close();
-    if (sd_card_handle) {
-        esp_vfs_fat_sdcard_unmount("/sdcard", sd_card_handle);
-        if (sd_using_spi) {
-            spi_bus_free(sd_spi_host);
-        }
-        sd_card_handle = NULL;
-        printf("[SD] Filesystem unmounted cleanly\n");
-    }
-}
+    sdmmc_card_t *card;
 
-extern "C" bool sd_remount(void) {
-    if (sd_card_handle) {
-        printf("[SD] Already mounted\n");
-        return true;
-    }
-    bool ok = Sd_Spi_Init("/sdcard", 1);  // SPI mode, single attempt
-    if (ok) {
-        printf("[SD] Filesystem mounted (SPI)\n");
-    } else {
-        printf("[SD] SPI mount failed\n");
-    }
-    return ok;
-}
+    printf("initializing sd card\n");
+    printf("using sdspi peripheral\n");
 
-bool sd_is_mounted(void) {
-    return sd_card_handle != NULL;
-}
+    sd_pwr_ctrl_ldo_config_t ldo_config =
+        {
+            .ldo_chan_id = 4,
+        };
+    sd_pwr_ctrl_handle_t pwr_ctrl_handle = NULL;
 
-bool sd_is_logging(void) {
-    // We're logging if SD is mounted and the RTL-SDR reader task is running
-    // (sd_log_create is called when the reader task starts)
-    adsb_stats_t stats = adsb_get_stats();
-    return sd_card_handle != NULL && stats.rtlsdr_connected;
+    int32_t assert = sd_pwr_ctrl_new_on_chip_ldo(&ldo_config, &pwr_ctrl_handle);
+    if (assert != ESP_OK)
+    {
+        printf("failed to create a new on-chip ldo power control driver\n");
+        return false;
+    }
+
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot = SPI3_HOST;
+
+    // host.max_freq_khz=SDMMC_FREQ_52M;
+
+    host.pwr_ctrl_handle = pwr_ctrl_handle;
+
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num = SD_MOSI,
+        .miso_io_num = SD_MISO,
+        .sclk_io_num = SD_SCLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4092,
+    };
+
+    assert = spi_bus_initialize(host.slot, &bus_cfg, SDSPI_DEFAULT_DMA);
+    if (assert != ESP_OK)
+    {
+        printf("failed to initialize bus\n");
+        return false;
+    }
+
+    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot_config.host_id = SPI3_HOST;
+    slot_config.gpio_cs = SD_CS;
+    slot_config.host_id = host.slot;
+
+    printf("mounting filesystem\n");
+
+    assert = esp_vfs_fat_sdspi_mount(base_path, &host, &slot_config, &mount_config, &card);
+    if (assert != ESP_OK)
+    {
+        printf("failed to mount filesystem\n");
+        return false;
+    }
+
+    printf("filesystem mounted\n");
+
+    // Card has been initialized, print its properties
+    sdmmc_card_print_info(stdout, card);
+
+    return true;
 }
 
 void System_Ui_Callback_Init(void)
 {
     System_Ui->_device_vibration_callback = [](uint8_t vibration_count)
     {
-        if (!g_settings.haptic_enabled) return;
         AW86224_Vibration_Play_Count = vibration_count;
         vTaskResume(Vibration_Task_Handle);
-    };
-
-    System_Ui->_device_brightness_callback = [](uint8_t percent)
-    {
-        if (g_screen_blanked) return;  // don't override blank state
-        if (screen_is_rm69a10()) {
-            set_rm69a10_brightness(Screen_Mipi_Dpi_Panel, percent * 255 / 100);
-        } else {
-            HI8561_T->start_pwm_gradient_time(percent, 100);
-        }
-    };
-
-    System_Ui->_device_volume_callback = [](uint8_t percent)
-    {
-        ES8311->set_dac_volume(percent * 255 / 100);
     };
 
     System_Ui->_win_cit_speaker_test_callback = [](void)
     {
         ES8311_Speaker_Mode = Es8311_Mode::TEST;
+
         vTaskResume(Speaker_Task_Handle);
     };
 
@@ -2333,15 +2883,26 @@ void System_Ui_Callback_Init(void)
         if (status == true)
         {
             ES8311_Microphone_Mode = Es8311_Mode::TEST;
+
             vTaskResume(Microphone_Task_Handle);
         }
         else
+        {
             vTaskSuspend(Microphone_Task_Handle);
+        }
     };
 
     System_Ui->_win_cit_adc_to_dac_switch_callback = [](bool status)
     {
-        ES8311->set_adc_data_to_dac(status);
+        if (status == true)
+        {
+            // 将ADC的数据自动输出到DAC上
+            ES8311->set_adc_data_to_dac(true);
+        }
+        else
+        {
+            ES8311->set_adc_data_to_dac(false);
+        }
     };
 
     System_Ui->_win_cit_imu_test_callback = [](bool status)
@@ -2349,10 +2910,13 @@ void System_Ui_Callback_Init(void)
         if (status == true)
         {
             ICM20948_Imu_Mode = Imu_Mode::TEST;
+
             vTaskResume(Imu_Task_Handle);
         }
         else
+        {
             vTaskSuspend(Imu_Task_Handle);
+        }
     };
 
     System_Ui->_win_cit_gps_test_callback = [](bool status)
@@ -2361,14 +2925,18 @@ void System_Ui_Callback_Init(void)
         {
             L76k_Gps_Mode = Gps_Mode::TEST;
             L76K->clear_rx_buffer_data();
+
+            L76K->sleep(false);
             L76k_Gps_Positioning_Time = 0;
             L76k_Gps_Positioning_Flag = false;
-            // Task runs continuously for ADS-B — no resume needed
+
+            vTaskResume(Gps_Task_Handle);
         }
         else
         {
-            // Don't suspend task or sleep GPS — ADS-B needs continuous position
-            L76k_Gps_Mode = Gps_Mode::RUN;
+            vTaskSuspend(Gps_Task_Handle);
+
+            L76K->sleep(true);
         }
     };
 
@@ -2379,18 +2947,21 @@ void System_Ui_Callback_Init(void)
             Ip101gri_Ethernet_Mode = Ethernet_Mode::TEST;
             Eth_Info.status.update_flag = true;
             Eth_Info.connect_ip_status.update_flag = true;
+
             vTaskResume(Ethernet_Task_Handle);
         }
         else
+        {
             vTaskSuspend(Ethernet_Task_Handle);
+        }
     };
 
     System_Ui->_win_cit_esp32c6_at_test_callback = [](bool status)
     {
-        // Repurposed: shows ADS-B receiver status instead of AT test
         if (status == true)
         {
             Esp32c6_At_Mode = At_Mode::TEST;
+
             vTaskResume(At_Task_Handle);
         }
         else
@@ -2399,61 +2970,69 @@ void System_Ui_Callback_Init(void)
         }
     };
 
+    // System_Ui->_device_start_sleep_test_callback = [](Lvgl_Ui::System::Sleep_Mode mode)
+    // {
+    //     switch (mode)
+    //     {
+    //     case Lvgl_Ui::System::Sleep_Mode::NORMAL_SLEEP:
+    //         Esp32p4_Sleep_Mode = Sleep_Mode::NORMAL_SLEEP_TEST;
+    //         break;
+
+    //     case Lvgl_Ui::System::Sleep_Mode::LIGHT_SLEEP:
+    //         Esp32p4_Sleep_Mode = Sleep_Mode::LIGHT_SLEEP_TEST;
+    //         break;
+
+    //     default:
+    //         break;
+    //     }
+
+    //     vTaskResume(Sleep_Task_Handle);
+    // };
+
     System_Ui->_win_camera_status_callback = [](bool status)
     {
         if (Sys_Status.camera.init_flag == true)
         {
-#if defined CONFIG_BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
+#if defined CONFIG_BOARD_TYPE_T_DISPLAY_P4
+#elif defined CONFIG_BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
             vTaskDelay(pdMS_TO_TICKS(1000));
+#else
+#error "unknown macro definition, please select the correct macro definition."
 #endif
             if (status == true)
             {
                 esp_err_t assert = app_video_stream_task_restart(video_cam_fd0);
                 if (assert != ESP_OK)
+                {
                     printf("app_video_stream_task_restart fail (error code: %#X)\n", assert);
+                }
                 else
+                {
+                    // Get the initial time for frame rate statistics
                     start_time = esp_timer_get_time();
+                }
             }
             else
             {
                 esp_err_t assert = app_video_stream_task_stop(video_cam_fd0);
                 if (assert != ESP_OK)
+                {
                     printf("app_video_stream_task_stop fail (error code: %#X)\n", assert);
+                }
             }
         }
     };
 
-    System_Ui->_win_adsb_status_callback = [](bool status)
-    {
-        if (Adsb_App_Task_Handle == NULL) return;
-        if (status == true)
-            vTaskResume(Adsb_App_Task_Handle);
-        else
-            vTaskSuspend(Adsb_App_Task_Handle);
-    };
-
-    System_Ui->_win_meshy_status_callback = [](bool status)
-    {
-        if (Meshy_App_Task_Handle == NULL) return;
-        if (status == true)
-            vTaskResume(Meshy_App_Task_Handle);
-        else
-            vTaskSuspend(Meshy_App_Task_Handle);
-    };
-
-    System_Ui->_win_scope_status_callback = [](bool status)
-    {
-        if (Scope_App_Task_Handle == NULL) return;
-        if (status == true)
-            vTaskResume(Scope_App_Task_Handle);
-        else
-            vTaskSuspend(Scope_App_Task_Handle);
-    };
-
     System_Ui->_win_rf_config_sx1262_params_callback = [](Lvgl_Ui::System::Device_Sx1262 device_sx1262) -> bool
     {
-        XL9535->pin_write(XL9535_SKY13453_VCTL,
-            device_sx1262.params.rf_switch == 0 ? Cpp_Bus_Driver::Xl95x5::Value::HIGH : Cpp_Bus_Driver::Xl95x5::Value::LOW);
+        if (device_sx1262.params.rf_switch == 0)
+        {
+            XL9535->pin_write(XL9535_SKY13453_VCTL, Cpp_Bus_Driver::Xl95x5::Value::HIGH);
+        }
+        else
+        {
+            XL9535->pin_write(XL9535_SKY13453_VCTL, Cpp_Bus_Driver::Xl95x5::Value::LOW);
+        }
 
         if (SX1262->config_lora_params(device_sx1262.params.freq, device_sx1262.params.bandwidth, device_sx1262.params.current_limit,
                                        device_sx1262.params.power, device_sx1262.params.sf, device_sx1262.params.cr, device_sx1262.params.crc_type,
@@ -2466,30 +3045,64 @@ void System_Ui_Callback_Init(void)
         SX1262->start_lora_transmit(Cpp_Bus_Driver::Sx126x::Chip_Mode::RX);
         SX1262->set_irq_pin_mode(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::RX_DONE);
         SX1262->clear_irq_flag(Cpp_Bus_Driver::Sx126x::Irq_Mask_Flag::RX_DONE);
+
         printf("config_lora_params finish start sx1262 transmit\n");
         return true;
     };
 
-    // RF send/status callbacks removed — SX1262 is now managed by Meshy (Meshtastic)
+    System_Ui->_win_rf_send_data_callback = [](std::string data)
+    {
+        memset(Rf_Send_Package, '\0', sizeof(Rf_Send_Package));
+
+        // 检查长度是否越界
+        if (data.size() <= 255)
+        {
+            memcpy(Rf_Send_Package, data.data(), data.size());
+        }
+        else
+        {
+            // 处理错误：数据过长
+            memcpy(Rf_Send_Package, data.data(), 254);
+            Rf_Send_Package[254] = '\0';
+
+            printf("lora send out of bounds(data > Rf_Send_Package)\n");
+        }
+
+        Rf_Send_Flag = true;
+    };
+
+    System_Ui->_win_rf_status_callback = [](bool status)
+    {
+        if (status == true)
+        {
+            Device_Rf_Task_Stop_Flag = false;
+            vTaskResume(Rf_Task_Handle);
+        }
+        else
+        {
+            Device_Rf_Task_Stop_Flag = true;
+        }
+    };
 
     System_Ui->_win_music_start_end_callback = [](bool status)
     {
         if (status == true)
         {
-            Music_Play_End_Flag = false;
             ES8311_Speaker_Mode = Es8311_Mode::PLAY_MUSIC;
+
             vTaskResume(Speaker_Task_Handle);
         }
         else
         {
             Music_Play_End_Flag = true;
-            music_player_stop();
         }
     };
 
     System_Ui->_set_music_current_time_s_callback = [](double current_time_s)
     {
-        music_player_seek(current_time_s);
+        Set_Music_Current_Time_S = current_time_s;
+
+        Set_Music_Current_Time_S_Flag = true;
     };
 
 #if defined CONFIG_BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
@@ -2498,11 +3111,14 @@ void System_Ui_Callback_Init(void)
         if (status == true)
         {
             St25r3916_Nfc_Mode = Nfc_Mode::TEST;
+
             Device_Nfc_Task_Stop_Flag = false;
             vTaskResume(Nfc_Task_Handle);
         }
         else
+        {
             Device_Nfc_Task_Stop_Flag = true;
+        }
     };
 
     System_Ui->_win_rf_config_cc1101_params_callback = [](Lvgl_Ui::System::Device_Cc1101 device_cc1101) -> bool
@@ -2510,25 +3126,59 @@ void System_Ui_Callback_Init(void)
         Cc1101_Rf_Switch_Control(static_cast<Cc1101_Rf_Switch>(device_cc1101.params.rf_switch));
 
         float buffer_bandwidth = 0;
+
         switch (device_cc1101.params.bandwidth)
         {
-        case Lvgl_Ui::System::Cc1101_Bw::BW_58KHZ:   buffer_bandwidth = 58.0f;  break;
-        case Lvgl_Ui::System::Cc1101_Bw::BW_68KHZ:   buffer_bandwidth = 68.0f;  break;
-        case Lvgl_Ui::System::Cc1101_Bw::BW_81KHZ:   buffer_bandwidth = 81.0f;  break;
-        case Lvgl_Ui::System::Cc1101_Bw::BW_102KHZ:  buffer_bandwidth = 102.0f; break;
-        case Lvgl_Ui::System::Cc1101_Bw::BW_116KHZ:  buffer_bandwidth = 116.0f; break;
-        case Lvgl_Ui::System::Cc1101_Bw::BW_135KHZ:  buffer_bandwidth = 135.0f; break;
-        case Lvgl_Ui::System::Cc1101_Bw::BW_162KHZ:  buffer_bandwidth = 162.0f; break;
-        case Lvgl_Ui::System::Cc1101_Bw::BW_203KHZ:  buffer_bandwidth = 203.0f; break;
-        case Lvgl_Ui::System::Cc1101_Bw::BW_232KHZ:  buffer_bandwidth = 232.0f; break;
-        case Lvgl_Ui::System::Cc1101_Bw::BW_270KHZ:  buffer_bandwidth = 270.0f; break;
-        case Lvgl_Ui::System::Cc1101_Bw::BW_325KHZ:  buffer_bandwidth = 325.0f; break;
-        case Lvgl_Ui::System::Cc1101_Bw::BW_406KHZ:  buffer_bandwidth = 406.0f; break;
-        case Lvgl_Ui::System::Cc1101_Bw::BW_464KHZ:  buffer_bandwidth = 464.0f; break;
-        case Lvgl_Ui::System::Cc1101_Bw::BW_541KHZ:  buffer_bandwidth = 541.0f; break;
-        case Lvgl_Ui::System::Cc1101_Bw::BW_650KHZ:  buffer_bandwidth = 650.0f; break;
-        case Lvgl_Ui::System::Cc1101_Bw::BW_812KHZ:  buffer_bandwidth = 812.0f; break;
-        default: break;
+        case Lvgl_Ui::System::Cc1101_Bw::BW_58KHZ:
+            buffer_bandwidth = 58.0f; // 58 kHz
+            break;
+        case Lvgl_Ui::System::Cc1101_Bw::BW_68KHZ:
+            buffer_bandwidth = 68.0f; // 68 kHz
+            break;
+        case Lvgl_Ui::System::Cc1101_Bw::BW_81KHZ:
+            buffer_bandwidth = 81.0f; // 81 kHz
+            break;
+        case Lvgl_Ui::System::Cc1101_Bw::BW_102KHZ:
+            buffer_bandwidth = 102.0f; // 102 kHz
+            break;
+        case Lvgl_Ui::System::Cc1101_Bw::BW_116KHZ:
+            buffer_bandwidth = 116.0f; // 116 kHz
+            break;
+        case Lvgl_Ui::System::Cc1101_Bw::BW_135KHZ:
+            buffer_bandwidth = 135.0f; // 135 kHz
+            break;
+        case Lvgl_Ui::System::Cc1101_Bw::BW_162KHZ:
+            buffer_bandwidth = 162.0f; // 162 kHz
+            break;
+        case Lvgl_Ui::System::Cc1101_Bw::BW_203KHZ:
+            buffer_bandwidth = 203.0f; // 203 kHz
+            break;
+        case Lvgl_Ui::System::Cc1101_Bw::BW_232KHZ:
+            buffer_bandwidth = 232.0f; // 232 kHz
+            break;
+        case Lvgl_Ui::System::Cc1101_Bw::BW_270KHZ:
+            buffer_bandwidth = 270.0f; // 270 kHz
+            break;
+        case Lvgl_Ui::System::Cc1101_Bw::BW_325KHZ:
+            buffer_bandwidth = 325.0f; // 325 kHz
+            break;
+        case Lvgl_Ui::System::Cc1101_Bw::BW_406KHZ:
+            buffer_bandwidth = 406.0f; // 406 kHz
+            break;
+        case Lvgl_Ui::System::Cc1101_Bw::BW_464KHZ:
+            buffer_bandwidth = 464.0f; // 464 kHz
+            break;
+        case Lvgl_Ui::System::Cc1101_Bw::BW_541KHZ:
+            buffer_bandwidth = 541.0f; // 541 kHz
+            break;
+        case Lvgl_Ui::System::Cc1101_Bw::BW_650KHZ:
+            buffer_bandwidth = 650.0f; // 650 kHz
+            break;
+        case Lvgl_Ui::System::Cc1101_Bw::BW_812KHZ:
+            buffer_bandwidth = 812.0f; // 812 kHz
+            break;
+        default:
+            break;
         }
 
         int16_t assert = Cc1101.begin(device_cc1101.params.freq, device_cc1101.params.bit_rate, device_cc1101.params.freq_deviation_khz,
@@ -2548,9 +3198,12 @@ void System_Ui_Callback_Init(void)
 
         assert = Cc1101.startReceive();
         if (assert != RADIOLIB_ERR_NONE)
+        {
             printf("cc1101 startReceive fail (error code: %d)\n", assert);
+        }
 
         Cc1101_Interrupt_Flag = false;
+
         printf("config_cc1101_params finish start cc1101 transmit\n");
         return true;
     };
@@ -2581,18 +3234,26 @@ void System_Ui_Callback_Init(void)
 
         assert = Nrf24l01.startReceive();
         if (assert != RADIOLIB_ERR_NONE)
+        {
             printf("nrf24l01 startReceive fail (error code: %d)\n", assert);
+        }
 
         Nrf24l01_Interrupt_Flag = false;
+
         printf("config_nrf24l01_params finish start nrf24l01 transmit\n");
         return true;
     };
 
     System_Ui->_win_cit_otg_switch_callback = [](bool status)
     {
-        Kode_Bq25896::bq25896_set_otg(Bq25896_Handle,
-            status ? Kode_Bq25896::bq25896_otg_state_t::BQ25896_OTG_ENABLE
-                   : Kode_Bq25896::bq25896_otg_state_t::BQ25896_OTG_DISABLE);
+        if (status == true)
+        {
+            Kode_Bq25896::bq25896_set_otg(Bq25896_Handle, Kode_Bq25896::bq25896_otg_state_t::BQ25896_OTG_ENABLE);
+        }
+        else
+        {
+            Kode_Bq25896::bq25896_set_otg(Bq25896_Handle, Kode_Bq25896::bq25896_otg_state_t::BQ25896_OTG_DISABLE);
+        }
     };
 
 #endif
@@ -2604,17 +3265,22 @@ void Lvgl_Init(void)
 
     lv_init();
 
-    lv_display_t *display = lv_display_create(g_screen_width, g_screen_height);
+    // create a lvgl display
+    lv_display_t *display = lv_display_create(SCREEN_WIDTH, SCREEN_HEIGHT);
+    // associate the mipi panel handle to the display
     lv_display_set_user_data(display, Screen_Mipi_Dpi_Panel);
+    // set color depth
     lv_display_set_color_format(display, LVGL_COLOR_FORMAT);
-
+    // create draw buffer
     printf("allocate separate lvgl draw buffers\n");
-    // Allocate for max screen size so buffer works for either variant
-    size_t draw_buffer_sz = SCREEN_WIDTH_MAX * SCREEN_HEIGHT_MAX * sizeof(lv_color_t);
+    size_t draw_buffer_sz = SCREEN_WIDTH * SCREEN_HEIGHT * sizeof(lv_color_t);
     void *buf1 = heap_caps_malloc(draw_buffer_sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT | MALLOC_CAP_DMA);
     assert(buf1);
+    // void *buf2 = heap_caps_malloc(draw_buffer_sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT | MALLOC_CAP_DMA);
+    // assert(buf2);
+    // initialize LVGL draw buffers
     lv_display_set_buffers(display, buf1, NULL, draw_buffer_sz, LV_DISPLAY_RENDER_MODE_PARTIAL);
-
+    // set the callback which can copy the rendered image to an area of the display
     lv_display_set_flush_cb(display, [](lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
                             {
                                 lv_display_rotation_t rotation = lv_display_get_rotation(disp);
@@ -2630,100 +3296,187 @@ void Lvgl_Init(void)
 #if CONFIG_ENABLE_PPA_SCREEN_ROTATION == true
                                     uint32_t input_img_width = area->x2 - area->x1 + 1;
                                     uint32_t input_img_height = area->y2 - area->y1 + 1;
+
+                                    // 根据旋转角度确定输出尺寸
                                     uint32_t output_img_width = input_img_width;
                                     uint32_t output_img_height = input_img_height;
 
+                                    // 如果是90或270度旋转，宽度和高度需要交换
                                     if (rotation == LV_DISPLAY_ROTATION_90 || rotation == LV_DISPLAY_ROTATION_270)
                                     {
                                         output_img_width = input_img_height;
                                         output_img_height = input_img_width;
                                     }
 
+                                    // 计算实际需要的缓冲区大小
                                     size_t output_buffer_size = output_img_width * output_img_height * (SCREEN_BITS_PER_PIXEL / 8);
                                     uint8_t *output_buffer = (uint8_t *)heap_caps_malloc(output_buffer_size, MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM);
-                                    if (output_buffer == NULL) { printf("failed to allocate rotated buffer\n"); return; }
-
-                                    ppa_srm_oper_config_t srm_config = {
-                                        .in = { .buffer = px_map, .pic_w = input_img_width, .pic_h = input_img_height,
-                                                .block_w = input_img_width, .block_h = input_img_height, .block_offset_x = 0, .block_offset_y = 0,
-#if defined CONFIG_SCREEN_PIXEL_FORMAT_RGB565
-                                                .srm_cm = ppa_srm_color_mode_t::PPA_SRM_COLOR_MODE_RGB565,
-#elif defined CONFIG_SCREEN_PIXEL_FORMAT_RGB888
-                                                .srm_cm = ppa_srm_color_mode_t::PPA_SRM_COLOR_MODE_RGB888,
-#endif
-                                        },
-                                        .out = { .buffer = output_buffer, .buffer_size = ALIGN_UP(output_buffer_size, data_cache_line_size_2),
-                                                 .pic_w = output_img_width, .pic_h = output_img_height, .block_offset_x = 0, .block_offset_y = 0,
-#if defined CONFIG_SCREEN_PIXEL_FORMAT_RGB565
-                                                 .srm_cm = ppa_srm_color_mode_t::PPA_SRM_COLOR_MODE_RGB565,
-#elif defined CONFIG_SCREEN_PIXEL_FORMAT_RGB888
-                                                 .srm_cm = ppa_srm_color_mode_t::PPA_SRM_COLOR_MODE_RGB888,
-#endif
-                                        },
-                                        .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
-                                        .scale_x = 1, .scale_y = 1, .mirror_x = false, .mirror_y = false,
-                                        .rgb_swap = false, .byte_swap = false, .mode = PPA_TRANS_MODE_BLOCKING,
-                                    };
-
-                                    switch (rotation)
+                                    if (output_buffer == NULL)
                                     {
-                                    case LV_DISPLAY_ROTATION_90:  srm_config.rotation_angle = PPA_SRM_ROTATION_ANGLE_90;  break;
-                                    case LV_DISPLAY_ROTATION_180: srm_config.rotation_angle = PPA_SRM_ROTATION_ANGLE_180; break;
-                                    case LV_DISPLAY_ROTATION_270: srm_config.rotation_angle = PPA_SRM_ROTATION_ANGLE_270; break;
-                                    default: break;
+                                        printf("failed to allocate rotated buffer\n");
+                                        return;
                                     }
 
-                                    esp_err_t ret = ppa_do_scale_rotate_mirror(ppa_srm_handle_2, &srm_config);
-                                    if (ret != ESP_OK) { printf("ppa_do_scale_rotate_mirror fail\n"); heap_caps_free(output_buffer); return; }
+                                    ppa_srm_oper_config_t srm_config =
+                                        {
+                                            .in =
+                                                {
+                                                    .buffer = px_map,
+                                                    .pic_w = input_img_width,
+                                                    .pic_h = input_img_height,
+                                                    .block_w = input_img_width,
+                                                    .block_h = input_img_height,
+                                                    .block_offset_x = 0,
+                                                    .block_offset_y = 0,
+#if defined CONFIG_SCREEN_PIXEL_FORMAT_RGB565
+                                                    .srm_cm = ppa_srm_color_mode_t::PPA_SRM_COLOR_MODE_RGB565,
+#elif defined CONFIG_SCREEN_PIXEL_FORMAT_RGB888
+                                                    .srm_cm = ppa_srm_color_mode_t::PPA_SRM_COLOR_MODE_RGB888,
+#else
+#error "unknown macro definition, please select the correct macro definition."
+#endif
+                                                },
 
-                                    int32_t rx1 = offsetx1, ry1 = offsety1, rx2 = offsetx2, ry2 = offsety2;
+                                            .out =
+                                                {
+                                                    .buffer = output_buffer,
+                                                    .buffer_size = ALIGN_UP(output_buffer_size, data_cache_line_size_2),
+                                                    .pic_w = output_img_width,
+                                                    .pic_h = output_img_height,
+                                                    .block_offset_x = 0,
+                                                    .block_offset_y = 0,
+#if defined CONFIG_SCREEN_PIXEL_FORMAT_RGB565
+                                                    .srm_cm = ppa_srm_color_mode_t::PPA_SRM_COLOR_MODE_RGB565,
+#elif defined CONFIG_SCREEN_PIXEL_FORMAT_RGB888
+                                                    .srm_cm = ppa_srm_color_mode_t::PPA_SRM_COLOR_MODE_RGB888,
+#else
+#error "unknown macro definition, please select the correct macro definition."
+#endif
+                                                },
+
+                                            .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
+                                            .scale_x = 1,
+                                            .scale_y = 1,
+                                            .mirror_x = false,
+                                            .mirror_y = false,
+                                            .rgb_swap = false,
+                                            .byte_swap = false,
+                                            .mode = PPA_TRANS_MODE_BLOCKING,
+                                        };
+
                                     switch (rotation)
                                     {
                                     case LV_DISPLAY_ROTATION_90:
-                                        rx1 = offsety1; ry1 = (int32_t)g_screen_height - offsetx2 - 1;
-                                        rx2 = offsety2; ry2 = (int32_t)g_screen_height - offsetx1 - 1;
+                                        srm_config.rotation_angle = PPA_SRM_ROTATION_ANGLE_90;
                                         break;
                                     case LV_DISPLAY_ROTATION_180:
-                                        rx1 = (int32_t)g_screen_width - offsetx2 - 1; ry1 = (int32_t)g_screen_height - offsety2 - 1;
-                                        rx2 = (int32_t)g_screen_width - offsetx1 - 1; ry2 = (int32_t)g_screen_height - offsety1 - 1;
+                                        srm_config.rotation_angle = PPA_SRM_ROTATION_ANGLE_180;
                                         break;
                                     case LV_DISPLAY_ROTATION_270:
-                                        rx1 = (int32_t)g_screen_width - offsety2 - 1; ry1 = offsetx1;
-                                        rx2 = (int32_t)g_screen_width - offsety1 - 1; ry2 = offsetx2;
+                                        srm_config.rotation_angle = PPA_SRM_ROTATION_ANGLE_270;
                                         break;
-                                    default: break;
+                                    default:
+                                        break;
                                     }
 
-                                    rx1 = (rx1 < 0) ? 0 : rx1;
-                                    ry1 = (ry1 < 0) ? 0 : ry1;
-                                    rx2 = (rx2 >= (int32_t)g_screen_width)  ? (int32_t)g_screen_width  - 1 : rx2;
-                                    ry2 = (ry2 >= (int32_t)g_screen_height) ? (int32_t)g_screen_height - 1 : ry2;
-                                    if (rx1 > rx2) { int32_t t = rx1; rx1 = rx2; rx2 = t; }
-                                    if (ry1 > ry2) { int32_t t = ry1; ry1 = ry2; ry2 = t; }
+                                    esp_err_t ret = ppa_do_scale_rotate_mirror(ppa_srm_handle_2, &srm_config);
+                                    if (ret != ESP_OK)
+                                    {
+                                        printf("ppa_do_scale_rotate_mirror fail (error code: 0x%X)\n", ret);
+                                        heap_caps_free(output_buffer);
+                                        return;
+                                    }
 
-                                    esp_lcd_panel_draw_bitmap(panel_handle, rx1, ry1, rx2 + 1, ry2 + 1, output_buffer);
+                                    // 根据旋转角度重新计算坐标
+                                    int32_t rotated_offsetx1 = offsetx1;
+                                    int32_t rotated_offsety1 = offsety1;
+                                    int32_t rotated_offsetx2 = offsetx2;
+                                    int32_t rotated_offsety2 = offsety2;
+
+                                    switch (rotation)
+                                    {
+                                    case LV_DISPLAY_ROTATION_90:
+                                        // 90度旋转：x = original_y, y = SCREEN_HEIGHT - original_x - 1
+                                        rotated_offsetx1 = offsety1;
+                                        rotated_offsety1 = SCREEN_HEIGHT - offsetx2 - 1;
+                                        rotated_offsetx2 = offsety2;
+                                        rotated_offsety2 = SCREEN_HEIGHT - offsetx1 - 1;
+                                        break;
+                                    case LV_DISPLAY_ROTATION_180:
+                                        // 180度旋转：x = SCREEN_WIDTH - original_x - 1, y = SCREEN_HEIGHT - original_y - 1
+                                        rotated_offsetx1 = SCREEN_WIDTH - offsetx2 - 1;
+                                        rotated_offsety1 = SCREEN_HEIGHT - offsety2 - 1;
+                                        rotated_offsetx2 = SCREEN_WIDTH - offsetx1 - 1;
+                                        rotated_offsety2 = SCREEN_HEIGHT - offsety1 - 1;
+                                        break;
+                                    case LV_DISPLAY_ROTATION_270:
+                                        // 270度旋转：x = SCREEN_WIDTH - original_y - 1, y = original_x
+                                        rotated_offsetx1 = SCREEN_WIDTH - offsety2 - 1;
+                                        rotated_offsety1 = offsetx1;
+                                        rotated_offsetx2 = SCREEN_WIDTH - offsety1 - 1;
+                                        rotated_offsety2 = offsetx2;
+                                        break;
+                                    default:
+                                        break;
+                                    }
+
+                                    // 确保旋转后的坐标在屏幕范围内
+                                    rotated_offsetx1 = (rotated_offsetx1 < 0) ? 0 : rotated_offsetx1;
+                                    rotated_offsety1 = (rotated_offsety1 < 0) ? 0 : rotated_offsety1;
+                                    rotated_offsetx2 = (rotated_offsetx2 >= SCREEN_WIDTH) ? SCREEN_WIDTH - 1 : rotated_offsetx2;
+                                    rotated_offsety2 = (rotated_offsety2 >= SCREEN_HEIGHT) ? SCREEN_HEIGHT - 1 : rotated_offsety2;
+
+                                    // 确保 x1 <= x2 且 y1 <= y2
+                                    if (rotated_offsetx1 > rotated_offsetx2)
+                                    {
+                                        int32_t temp = rotated_offsetx1;
+                                        rotated_offsetx1 = rotated_offsetx2;
+                                        rotated_offsetx2 = temp;
+                                    }
+                                    if (rotated_offsety1 > rotated_offsety2)
+                                    {
+                                        int32_t temp = rotated_offsety1;
+                                        rotated_offsety1 = rotated_offsety2;
+                                        rotated_offsety2 = temp;
+                                    }
+
+                                    esp_lcd_panel_draw_bitmap(panel_handle, rotated_offsetx1, rotated_offsety1,
+                                                              rotated_offsetx2 + 1, rotated_offsety2 + 1, output_buffer);
+
                                     heap_caps_free(output_buffer);
 
 #else
                                     lv_area_t rotated_area;
                                     lv_color_format_t cf = lv_display_get_color_format(disp);
+                                    /*Calculate the position of the rotated area*/
                                     rotated_area = *area;
                                     lv_display_rotate_area(disp, &rotated_area);
+                                    /*Calculate the source stride (bytes in a line) from the width of the area*/
                                     uint32_t src_stride = lv_draw_buf_width_to_stride(lv_area_get_width(area), cf);
+                                    /*Calculate the stride of the destination (rotated) area too*/
                                     uint32_t dest_stride = lv_draw_buf_width_to_stride(lv_area_get_width(&rotated_area), cf);
+                                    /*Have a buffer to store the rotated area and perform the rotation*/
+
                                     int32_t src_w = lv_area_get_width(area);
                                     int32_t src_h = lv_area_get_height(area);
-                                    auto rotated_buf = std::make_unique<uint8_t[]>(g_screen_width * g_screen_height * (SCREEN_BITS_PER_PIXEL / 8));
+                                    auto rotated_buf = std::make_unique<uint8_t[]>(SCREEN_WIDTH * SCREEN_HEIGHT * (SCREEN_BITS_PER_PIXEL / 8));
                                     lv_draw_sw_rotate(px_map, rotated_buf.get(), src_w, src_h, src_stride, dest_stride, rotation, cf);
+                                    /*Use the rotated area and rotated buffer from now on*/
                                     area = &rotated_area;
                                     px_map = rotated_buf.get();
-                                    offsetx1 = area->x1; offsetx2 = area->x2;
-                                    offsety1 = area->y1; offsety2 = area->y2;
+
+                                    offsetx1 = area->x1;
+                                    offsetx2 = area->x2;
+                                    offsety1 = area->y1;
+                                    offsety2 = area->y2;
+
                                     esp_lcd_panel_draw_bitmap(panel_handle, offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, px_map);
 #endif
                                 }
                                 else
+                                {
                                     esp_lcd_panel_draw_bitmap(panel_handle, offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, px_map);
+                                }
 
 #if CONFIG_ENABLE_USB_DISPLAY == true
                                 lv_display_flush_ready(disp);
@@ -2731,7 +3484,7 @@ void Lvgl_Init(void)
                             });
 
     lv_indev_t *indev = lv_indev_create();
-    lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER); /*Touchpad should have POINTER type*/
     lv_indev_set_read_cb(indev, my_touchpad_read);
 
 #if defined CONFIG_BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
@@ -2748,21 +3501,25 @@ void Lvgl_Init(void)
         {
             lv_display_t *disp = (lv_display_t *)user_ctx;
             lv_display_flush_ready(disp);
-            return false;
-        },
+            return false; },
         .on_refresh_done = [](esp_lcd_panel_handle_t panel, esp_lcd_dpi_panel_event_data_t *edata, void *user_ctx) -> bool
         {
-            return false;
-        },
+            // static int io_level = 0;
+            // // please note, the real refresh rate should be 2*frequency of this GPIO toggling
+            // gpio_set_level(EXAMPLE_PIN_NUM_REFRESH_MONITOR, io_level);
+            // io_level = !io_level;
+            return false; },
     };
     ESP_ERROR_CHECK(esp_lcd_dpi_panel_register_event_callbacks(Screen_Mipi_Dpi_Panel, &cbs, display));
 #endif
 
     printf("use esp_timer as lvgl tick timer\n");
     const esp_timer_create_args_t lvgl_tick_timer_args = {
-        .callback = [](void *arg) { lv_tick_inc(LVGL_TICK_PERIOD_MS); },
-        .name = "lvgl_tick"
-    };
+        .callback = [](void *arg)
+        {
+            lv_tick_inc(LVGL_TICK_PERIOD_MS);
+        },
+        .name = "lvgl_tick"};
     esp_timer_handle_t lvgl_tick_timer = NULL;
     ESP_ERROR_CHECK(esp_timer_create(&lvgl_tick_timer_args, &lvgl_tick_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(lvgl_tick_timer, LVGL_TICK_PERIOD_MS * 1000));
@@ -2774,33 +3531,41 @@ void Lvgl_Init(void)
 
 void Lvgl_Startup(void)
 {
+    // 创建一个全屏黑色背景
     lv_obj_t *bg = lv_obj_create(NULL);
     lv_obj_set_size(bg, lv_display_get_horizontal_resolution(lv_display_get_default()), lv_display_get_vertical_resolution(lv_display_get_default()));
     lv_obj_set_style_bg_color(bg, lv_color_black(), LV_PART_MAIN);
     lv_obj_set_style_border_width(bg, 0, LV_PART_MAIN);
 
+    // 创建进度条
     Lvgl_Startup_Progress_Bar = lv_bar_create(bg);
-    lv_obj_set_size(Lvgl_Startup_Progress_Bar, lv_pct(70), 10);
+    lv_obj_set_size(Lvgl_Startup_Progress_Bar, lv_pct(70), 10); // 宽度为屏幕70%，高度10像素
     lv_bar_set_range(Lvgl_Startup_Progress_Bar, 0, 100);
-    lv_bar_set_value(Lvgl_Startup_Progress_Bar, 10, LV_ANIM_OFF);
+    lv_bar_set_value(Lvgl_Startup_Progress_Bar, 10, LV_ANIM_OFF); // 进度条初始进度
     lv_obj_set_style_bg_color(Lvgl_Startup_Progress_Bar, lv_color_black(), LV_PART_MAIN);
     lv_obj_set_style_bg_color(Lvgl_Startup_Progress_Bar, lv_color_white(), LV_PART_INDICATOR);
+
     lv_obj_align(Lvgl_Startup_Progress_Bar, LV_ALIGN_CENTER, 0, 15);
 
+    // 创建白色"LILYGO"标签
     lv_obj_t *logo_label = lv_label_create(bg);
     lv_label_set_text(logo_label, "LILYGO");
     lv_obj_set_style_text_color(logo_label, lv_color_white(), LV_PART_MAIN);
-    lv_obj_set_style_text_font(logo_label, &lv_font_montserrat_48, LV_PART_MAIN);
+    lv_obj_set_style_text_font(logo_label, &lv_font_montserrat_48, LV_PART_MAIN); // 可根据需要调整字体
+    // logo放在进度条上方，整体居中
     lv_obj_align_to(logo_label, Lvgl_Startup_Progress_Bar, LV_ALIGN_OUT_TOP_MID, 0, -30);
 
     lv_obj_update_layout(bg);
+
     lv_screen_load(bg);
 }
 
 void Set_Lvgl_Startup_Progress_Bar(uint8_t percentage)
 {
     if (Lvgl_Startup_Progress_Bar != nullptr)
+    {
         lv_bar_set_value(Lvgl_Startup_Progress_Bar, percentage, LV_ANIM_OFF);
+    }
 }
 
 void ES8311_Init(void)
@@ -2821,21 +3586,23 @@ void ES8311_Init(void)
     ES8311->set_master_clock_source(Cpp_Bus_Driver::Es8311::Clock_Source::ADC_DAC_MCLK);
     ES8311->set_clock(Cpp_Bus_Driver::Es8311::Clock_Source::ADC_DAC_MCLK, true);
     ES8311->set_clock(Cpp_Bus_Driver::Es8311::Clock_Source::ADC_DAC_BCLK, true);
+
     ES8311->set_clock_coeff(MCLK_MULTIPLE, SAMPLE_RATE);
+
     ES8311->set_serial_port_mode(Cpp_Bus_Driver::Es8311::Serial_Port_Mode::SLAVE);
+
     ES8311->set_sdp_data_bit_length(Cpp_Bus_Driver::Es8311::Sdp::ADC, Cpp_Bus_Driver::Es8311::Bits_Per_Sample::DATA_16BIT);
     ES8311->set_sdp_data_bit_length(Cpp_Bus_Driver::Es8311::Sdp::DAC, Cpp_Bus_Driver::Es8311::Bits_Per_Sample::DATA_16BIT);
-
     Cpp_Bus_Driver::Es8311::Power_Status ps =
         {
             .contorl =
                 {
-                    .analog_circuits = true,
-                    .analog_bias_circuits = true,
-                    .analog_adc_bias_circuits = true,
-                    .analog_adc_reference_circuits = true,
-                    .analog_dac_reference_circuit = true,
-                    .internal_reference_circuits = false,
+                    .analog_circuits = true,               // 开启模拟电路
+                    .analog_bias_circuits = true,          // 开启模拟偏置电路
+                    .analog_adc_bias_circuits = true,      // 开启模拟ADC偏置电路
+                    .analog_adc_reference_circuits = true, // 开启模拟ADC参考电路
+                    .analog_dac_reference_circuit = true,  // 开启模拟DAC参考电路
+                    .internal_reference_circuits = false,  // 关闭内部参考电路
                 },
             .vmid = Cpp_Bus_Driver::Es8311::Vmid::START_UP_VMID_NORMAL_SPEED_CHARGE,
         };
@@ -2847,19 +3614,33 @@ void ES8311_Init(void)
     ES8311->set_adc_offset_freeze(Cpp_Bus_Driver::Es8311::Adc_Offset_Freeze::DYNAMIC_HPF);
     ES8311->set_adc_hpf_stage2_coeff(10);
     ES8311->set_dac_equalizer(false);
+
     ES8311->set_mic(Cpp_Bus_Driver::Es8311::Mic_Type::ANALOG_MIC, Cpp_Bus_Driver::Es8311::Mic_Input::MIC1P_1N);
     ES8311->set_adc_auto_volume_control(false);
     ES8311->set_adc_gain(Cpp_Bus_Driver::Es8311::Adc_Gain::GAIN_18DB);
     ES8311->set_adc_pga_gain(Cpp_Bus_Driver::Es8311::Adc_Pga_Gain::GAIN_30DB);
+
     ES8311->set_adc_volume(191);
-    ES8311->set_dac_volume(g_settings.volume * 255 / 100);
+    ES8311->set_dac_volume(200);
+
+    // 将ADC的数据自动输出到DAC上
+    // ES8311->set_adc_data_to_dac(true);
 }
 
 bool ICM20948_Init(void)
 {
     Wire1.begin(ICM20948_SDA, ICM20948_SCL);
-    if (ICM20948->init() == false) { printf("icm20948 ag init fail\n"); return false; }
-    if (ICM20948->initMagnetometer() == false) { printf("icm20948 m init fail\n"); return false; }
+    if (ICM20948->init() == false)
+    {
+        printf("icm20948 ag init fail\n");
+        return false;
+    }
+
+    if (ICM20948->initMagnetometer() == false)
+    {
+        printf("icm20948 m init fail\n");
+        return false;
+    }
 
     printf("Position your ICM20948 flat and don't move it - calibrating...\n");
     ICM20948->autoOffsets();
@@ -2868,12 +3649,16 @@ bool ICM20948_Init(void)
     ICM20948->setAccRange(ICM20948_ACC_RANGE_2G);
     ICM20948->setAccDLPF(ICM20948_DLPF_6);
     ICM20948->setMagOpMode(AK09916_CONT_MODE_20HZ);
+
     return true;
 }
 
-void eth_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+/** Event handler for Ethernet events */
+void eth_event_handler(void *arg, esp_event_base_t event_base,
+                       int32_t event_id, void *event_data)
 {
     uint8_t mac_addr[6] = {0};
+    /* we can get the ethernet driver handle from event data */
     esp_eth_handle_t eth_handle = *(esp_eth_handle_t *)event_data;
 
     switch (event_id)
@@ -2881,27 +3666,36 @@ void eth_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id,
     case ETHERNET_EVENT_CONNECTED:
         esp_eth_ioctl(eth_handle, ETH_CMD_G_MAC_ADDR, mac_addr);
         printf("ethernet link up\n");
+        printf("ethernet hw addr %02x:%02x:%02x:%02x:%02x:%02x\n",
+               mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+
         Eth_Info.status.data = "status: link up\nhw addr: " +
-            std::to_string(mac_addr[0]) + ":" + std::to_string(mac_addr[1]) + ":" +
-            std::to_string(mac_addr[2]) + ":" + std::to_string(mac_addr[3]) + ":" +
-            std::to_string(mac_addr[4]) + ":" + std::to_string(mac_addr[5]) + "\n";
+                               std::to_string(mac_addr[0]) + ":" +
+                               std::to_string(mac_addr[1]) + ":" +
+                               std::to_string(mac_addr[2]) + ":" +
+                               std::to_string(mac_addr[3]) + ":" +
+                               std::to_string(mac_addr[4]) + ":" +
+                               std::to_string(mac_addr[5]) + "\n";
         Eth_Info.status.update_flag = true;
         Eth_Info.link_up_flag = true;
         break;
     case ETHERNET_EVENT_DISCONNECTED:
         printf("ethernet link down\n");
+
         Eth_Info.status.data = "status: link down\n";
         Eth_Info.status.update_flag = true;
         Eth_Info.link_up_flag = false;
         break;
     case ETHERNET_EVENT_START:
         printf("ethernet started\n");
+
         Eth_Info.status.data = "status: started\n";
         Eth_Info.status.update_flag = true;
         Eth_Info.link_up_flag = false;
         break;
     case ETHERNET_EVENT_STOP:
         printf("ethernet stopped\n");
+
         Eth_Info.status.data = "status: stopped\n";
         Eth_Info.status.update_flag = true;
         Eth_Info.link_up_flag = false;
@@ -2911,48 +3705,74 @@ void eth_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id,
     }
 }
 
-void got_ip_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+/** Event handler for IP_EVENT_ETH_GOT_IP */
+void got_ip_event_handler(void *arg, esp_event_base_t event_base,
+                          int32_t event_id, void *event_data)
 {
     ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
     const esp_netif_ip_info_t *ip_info = &event->ip_info;
 
-    printf("ethernet get ip address\n~~~~~~~~~~~\n");
-    printf("eth ip: %d.%d.%d.%d\neth mask: %d.%d.%d.%d\neth gw: %d.%d.%d.%d\n~~~~~~~~~~~\n",
-           IP2STR(&ip_info->ip), IP2STR(&ip_info->netmask), IP2STR(&ip_info->gw));
+    printf("ethernet get ip address\n");
+    printf("~~~~~~~~~~~\n");
+    printf("eth ip: %d.%d.%d.%d\n", IP2STR(&ip_info->ip));
+    printf("eth mask: %d.%d.%d.%d\n", IP2STR(&ip_info->netmask));
+    printf("eth gw: %d.%d.%d.%d\n", IP2STR(&ip_info->gw));
+    printf("~~~~~~~~~~~\n");
 
+    // 定义一个足够大的字符数组来存储格式化后的字符串
     char ip_status_data[256];
+
     snprintf(ip_status_data, sizeof(ip_status_data),
-             "ethernet get ip address\neth ip: %d.%d.%d.%d\neth mask: %d.%d.%d.%d\neth gw: %d.%d.%d.%d\n",
-             IP2STR(&ip_info->ip), IP2STR(&ip_info->netmask), IP2STR(&ip_info->gw));
+             "ethernet get ip address\n"
+             "eth ip: %d.%d.%d.%d\n"
+             "eth mask: %d.%d.%d.%d\n"
+             "eth gw: %d.%d.%d.%d\n",
+             IP2STR(&ip_info->ip),
+             IP2STR(&ip_info->netmask),
+             IP2STR(&ip_info->gw));
 
     Eth_Info.connect_ip_status.data = ip_status_data;
+
     Eth_Info.connect_ip_status.update_flag = true;
 }
 
 void Ethernet_Init(void)
 {
+    // Initialize Ethernet driver
     uint8_t eth_port_cnt = 0;
     esp_eth_handle_t *eth_handles;
     ESP_ERROR_CHECK(example_eth_init(&eth_handles, &eth_port_cnt));
 
+    // Initialize TCP/IP network interface aka the esp-netif (should be called only once in application)
     ESP_ERROR_CHECK(esp_netif_init());
+    // Create default event loop that running in background
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     esp_netif_t *eth_netifs[eth_port_cnt];
     esp_eth_netif_glue_handle_t eth_netif_glues[eth_port_cnt];
 
+    // Create instance(s) of esp-netif for Ethernet(s)
     if (eth_port_cnt == 1)
     {
+        // Use ESP_NETIF_DEFAULT_ETH when just one Ethernet interface is used and you don't need to modify
+        // default esp-netif configuration parameters.
         esp_netif_config_t cfg = ESP_NETIF_DEFAULT_ETH();
         eth_netifs[0] = esp_netif_new(&cfg);
         eth_netif_glues[0] = esp_eth_new_netif_glue(eth_handles[0]);
+        // Attach Ethernet driver to TCP/IP stack
         ESP_ERROR_CHECK(esp_netif_attach(eth_netifs[0], eth_netif_glues[0]));
     }
     else
     {
+        // Use ESP_NETIF_INHERENT_DEFAULT_ETH when multiple Ethernet interfaces are used and so you need to modify
+        // esp-netif configuration parameters for each interface (name, priority, etc.).
         esp_netif_inherent_config_t esp_netif_config = ESP_NETIF_INHERENT_DEFAULT_ETH();
-        esp_netif_config_t cfg_spi = { .base = &esp_netif_config, .stack = ESP_NETIF_NETSTACK_DEFAULT_ETH };
-        char if_key_str[10], if_desc_str[10], num_str[3];
+        esp_netif_config_t cfg_spi = {
+            .base = &esp_netif_config,
+            .stack = ESP_NETIF_NETSTACK_DEFAULT_ETH};
+        char if_key_str[10];
+        char if_desc_str[10];
+        char num_str[3];
         for (int i = 0; i < eth_port_cnt; i++)
         {
             itoa(i, num_str, 10);
@@ -2963,24 +3783,130 @@ void Ethernet_Init(void)
             esp_netif_config.route_prio -= i * 5;
             eth_netifs[i] = esp_netif_new(&cfg_spi);
             eth_netif_glues[i] = esp_eth_new_netif_glue(eth_handles[0]);
+            // Attach Ethernet driver to TCP/IP stack
             ESP_ERROR_CHECK(esp_netif_attach(eth_netifs[i], eth_netif_glues[i]));
         }
     }
 
+    // Register user defined event handers
     ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &got_ip_event_handler, NULL));
 
+    // Start Ethernet driver state machine
     for (int i = 0; i < eth_port_cnt; i++)
+    {
         ESP_ERROR_CHECK(esp_eth_start(eth_handles[i]));
+    }
 }
 
-// ============================================================
-// WiFi disabled — Espressif Issue #17889
-// ESP-Hosted SDIO DMA corrupts heap when sharing SDMMC controller
-// with SD card. WiFi functions removed until fix is available.
-// TODO: Implement AT firmware TCP bridge for WiFi connectivity.
-// ============================================================
+void Esp32c6_At_Init(void)
+{
+    // ESP32C6_AT->begin();
 
+    // 开启falsh保存
+    if (ESP32C6_AT->set_flash_save(true) == true)
+    {
+        printf("set_flash_save success\n");
+    }
+    else
+    {
+        printf("set_flash_save fail\n");
+    }
+
+    if (ESP32C6_AT->set_wifi_mode(Cpp_Bus_Driver::Esp_At::Wifi_Mode::STATION) == true)
+    {
+        printf("set_wifi_mode success\n");
+    }
+    else
+    {
+        printf("set_wifi_mode fail\n");
+    }
+
+    std::vector<uint8_t> buffer_wifi_scan;
+    if (ESP32C6_AT->wifi_scan(buffer_wifi_scan) == true)
+    {
+        printf("wifi_scan: \n[%s]\n", buffer_wifi_scan.data());
+    }
+    else
+    {
+        printf("wifi_scan fail\n");
+    }
+
+    std::string ssid = "xinyuandianzi";
+    std::string password = "AA15994823428";
+    if (ESP32C6_AT->set_wifi_connect(ssid, password) == true)
+    {
+        printf("set_wifi_connect success\nconnected to wifi ssid: [%s],password: [%s]\n", ssid.c_str(), password.c_str());
+        Sys_Status.esp32c6.wifi_connect_status = true;
+    }
+    else
+    {
+        printf("set_wifi_connect fail\n");
+        Sys_Status.esp32c6.wifi_connect_status = false;
+    }
+
+    System_Ui->set_wifi_connect_status(Sys_Status.esp32c6.wifi_connect_status);
+
+    Cpp_Bus_Driver::Esp_At::Real_Time rt;
+    if (ESP32C6_AT->get_real_time(rt) == true)
+    {
+        printf("get_real_time success\n");
+        printf("real_time week: [%s] day: [%d] month: [%d] year: [%d] time: [%d:%d:%d] time zone: [%s] china time: [%d:%d:%d]\n",
+               rt.week.c_str(), rt.day, rt.month, rt.year, rt.hour, rt.minute, rt.second, rt.time_zone.c_str(),
+               (rt.hour + 8 + 24) % 24, rt.minute, rt.second);
+
+        Save_Real_Time(rt);
+    }
+    else
+    {
+        printf("get_real_time fail\n");
+
+        // 保存rtc时间
+        Cpp_Bus_Driver::Pcf8563x::Time t;
+        if (PCF8563->get_time(t) == true)
+        {
+            printf("pcf8563 year:[%d] month:[%d] day:[%d] time:[%d:%d:%d] week:[%d]\n", t.year, t.month, t.day,
+                   t.hour, t.minute, t.second, static_cast<uint8_t>(t.week));
+
+            std::string week_str;
+            switch (t.week)
+            {
+            case Cpp_Bus_Driver::Pcf8563x::Week::SUNDAY:
+                week_str = "Sun";
+                break;
+            case Cpp_Bus_Driver::Pcf8563x::Week::MONDAY:
+                week_str = "Mon";
+                break;
+            case Cpp_Bus_Driver::Pcf8563x::Week::TUESDAY:
+                week_str = "Tue";
+                break;
+            case Cpp_Bus_Driver::Pcf8563x::Week::WEDNESDAY:
+                week_str = "Wed";
+                break;
+            case Cpp_Bus_Driver::Pcf8563x::Week::THURSDAY:
+                week_str = "Thu";
+                break;
+            case Cpp_Bus_Driver::Pcf8563x::Week::FRIDAY:
+                week_str = "Fri";
+                break;
+            case Cpp_Bus_Driver::Pcf8563x::Week::SATURDAY:
+                week_str = "Sat";
+                break;
+
+            default:
+                break;
+            }
+
+            System_Ui->_time.week = week_str;
+            System_Ui->_time.year = static_cast<uint16_t>(t.year + 2000);
+            System_Ui->_time.month = t.month;
+            System_Ui->_time.day = t.day;
+            System_Ui->_time.hour = t.hour;
+            System_Ui->_time.minute = t.minute;
+            System_Ui->_time.second = t.second;
+        }
+    }
+}
 #if CONFIG_ENABLE_USB_DISPLAY == true
 bool Usb_Screen_Init(esp_lcd_panel_handle_t *mipi_dpi_panel)
 {
@@ -2992,23 +3918,126 @@ bool Usb_Screen_Init(esp_lcd_panel_handle_t *mipi_dpi_panel)
         printf("esp_lcd_new_panel_usb_display fail\n");
         return false;
     }
+
     return true;
 }
 #else
+void tinyusb_cdc_rx_callback(int itf, cdcacm_event_t *event)
+{
+    /* initialization */
+    size_t rx_size = 0;
+
+    /* read */
+    esp_err_t ret = tinyusb_cdcacm_read(itf, rx_buf, CONFIG_TINYUSB_CDC_RX_BUFSIZE, &rx_size);
+    if (ret == ESP_OK)
+    {
+        app_message_t tx_msg = {
+            .buf_len = rx_size + PREPEND_LENGTH,
+            .itf = static_cast<uint8_t>(itf),
+        };
+
+        memcpy(tx_msg.buf, PREPEND_STRING, PREPEND_LENGTH);
+        memcpy(tx_msg.buf + PREPEND_LENGTH, rx_buf, rx_size);
+        xQueueSend(app_queue, &tx_msg, 0);
+    }
+    else
+    {
+        printf("tinyusb_cdc_rx_callback read error\n");
+    }
+}
+
+void tinyusb_cdc_line_state_changed_callback(int itf, cdcacm_event_t *event)
+{
+    int dtr = event->line_state_changed_data.dtr;
+    int rts = event->line_state_changed_data.rts;
+
+    printf("line state changed on channel %d: dtr:%d, rts:%d\n", itf, dtr, rts);
+}
+
+void Hardware_Usb_Cdc_Init(void)
+{
+    // Create FreeRTOS primitives
+    app_queue = xQueueCreate(5, sizeof(app_message_t));
+    assert(app_queue);
+
+    printf("USB initialization\n");
+    const tinyusb_config_t tusb_cfg = {
+        .device_descriptor = NULL,
+        .string_descriptor = NULL,
+        .external_phy = false,
+#if (TUD_OPT_HIGH_SPEED)
+        .fs_configuration_descriptor = NULL,
+        .hs_configuration_descriptor = NULL,
+        .qualifier_descriptor = NULL,
+#else
+        .configuration_descriptor = NULL,
+#endif // TUD_OPT_HIGH_SPEED
+    };
+
+    ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
+
+    tinyusb_config_cdcacm_t acm_cfg = {
+        .usb_dev = TINYUSB_USBDEV_0,
+        .cdc_port = TINYUSB_CDC_ACM_0,
+        .rx_unread_buf_sz = 64,
+        .callback_rx = &tinyusb_cdc_rx_callback, // the first way to register a callback
+        .callback_rx_wanted_char = NULL,
+        .callback_line_state_changed = NULL,
+        .callback_line_coding_changed = NULL};
+
+    ESP_ERROR_CHECK(tusb_cdc_acm_init(&acm_cfg));
+    /* the second way to register a callback */
+    ESP_ERROR_CHECK(tinyusb_cdcacm_register_callback(
+        TINYUSB_CDC_ACM_0,
+        CDC_EVENT_LINE_STATE_CHANGED,
+        &tinyusb_cdc_line_state_changed_callback));
+
+#if (CONFIG_TINYUSB_CDC_COUNT > 1)
+    acm_cfg.cdc_port = TINYUSB_CDC_ACM_1;
+    ESP_ERROR_CHECK(tusb_cdc_acm_init(&acm_cfg));
+    ESP_ERROR_CHECK(tinyusb_cdcacm_register_callback(
+        TINYUSB_CDC_ACM_1,
+        CDC_EVENT_LINE_STATE_CHANGED,
+        &tinyusb_cdc_line_state_changed_callback));
+#endif
+
+    printf("USB initialization DONE\n");
+}
+
 void hardware_usb_cdc_task(void *arg)
 {
     printf("hardware_usb_cdc_task start\n");
+
     while (1)
     {
         app_message_t msg;
         if (xQueueReceive(app_queue, &msg, portMAX_DELAY))
         {
             if (msg.buf_len)
+            {
+                /* Print received data*/
                 printf("data from channel %d: ", msg.itf);
+
+                for (size_t i = 0; i < msg.buf_len; i++)
+                {
+                    printf("%c", msg.buf[i]);
+                }
+                printf("\n");
+
+                /* write back */
+                tinyusb_cdcacm_write_queue(msg.itf, msg.buf, msg.buf_len);
+                esp_err_t err = tinyusb_cdcacm_write_flush(msg.itf, 0);
+                if (err != ESP_OK)
+                {
+                    printf("CDC ACM write flush error: %s\n", esp_err_to_name(err));
+                }
+            }
         }
+
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
+
 #endif
 
 void camera_video_frame_operation(uint8_t *camera_buf, uint8_t camera_buf_index, uint32_t camera_buf_hes, uint32_t camera_buf_ves,
@@ -3021,54 +4050,89 @@ void camera_video_frame_operation(uint8_t *camera_buf, uint8_t camera_buf_index,
         printf("fps: %f\n", 1000000.0 / ((end_time - start_time) / 50.0));
         start_time = end_time;
         fps_count = 0;
+
         printf("camera_buf_hes: %lu, camera_buf_ves: %lu, camera_buf_len: %d KB\n", camera_buf_hes, camera_buf_ves, camera_buf_len / 1024);
     }
 
-    uint32_t input_img_block_width = (camera_buf_hes - g_screen_width) / 2;
-    uint32_t input_img_width = g_screen_width;
+    uint32_t input_img_block_width = (camera_buf_hes - SCREEN_WIDTH) / 2;
+    uint32_t input_img_block_height = 0;
+    uint32_t input_img_width = SCREEN_WIDTH;
     uint32_t input_img_height = camera_buf_ves;
+
     uint32_t output_img_width = input_img_width;
     uint32_t output_img_height = input_img_height;
 
     size_t output_buffer_size = output_img_width * output_img_height * (SCREEN_BITS_PER_PIXEL / 8);
     uint8_t *output_buffer = (uint8_t *)heap_caps_malloc(output_buffer_size, MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM);
-    if (output_buffer == NULL) { printf("heap_caps_malloc fail\n"); return; }
+    if (output_buffer == NULL)
+    {
+        printf("heap_caps_malloc fail\n");
+        return;
+    }
 
     ppa_srm_oper_config_t srm_config =
         {
             .in =
                 {
-                    .buffer = camera_buf, .pic_w = camera_buf_hes, .pic_h = camera_buf_ves,
-                    .block_w = input_img_width, .block_h = input_img_height,
-                    .block_offset_x = input_img_block_width, .block_offset_y = 0,
+                    .buffer = camera_buf,
+                    .pic_w = camera_buf_hes,
+                    .pic_h = camera_buf_ves,
+                    .block_w = input_img_width,
+                    .block_h = input_img_height,
+                    .block_offset_x = input_img_block_width,
+                    .block_offset_y = input_img_block_height,
 #if (defined CONFIG_CAMERA_TYPE_SC2336) || (defined CONFIG_CAMERA_TYPE_OV2710)
 #if defined CONFIG_SCREEN_PIXEL_FORMAT_RGB565
                     .srm_cm = ppa_srm_color_mode_t::PPA_SRM_COLOR_MODE_RGB565,
 #elif defined CONFIG_SCREEN_PIXEL_FORMAT_RGB888
                     .srm_cm = ppa_srm_color_mode_t::PPA_SRM_COLOR_MODE_RGB888,
+#else
+#error "unknown macro definition, please select the correct macro definition."
 #endif
 #elif defined CONFIG_CAMERA_TYPE_OV5645
                     .srm_cm = ppa_srm_color_mode_t::PPA_SRM_COLOR_MODE_RGB565,
+#else
+#error "unknown macro definition, please select the correct macro definition."
 #endif
                 },
+
             .out =
                 {
-                    .buffer = output_buffer, .buffer_size = ALIGN_UP(output_buffer_size, data_cache_line_size),
-                    .pic_w = output_img_width, .pic_h = output_img_height, .block_offset_x = 0, .block_offset_y = 0,
+                    .buffer = output_buffer,
+                    .buffer_size = ALIGN_UP(output_buffer_size, data_cache_line_size),
+                    .pic_w = output_img_width,
+                    .pic_h = output_img_height,
+                    .block_offset_x = 0,
+                    .block_offset_y = 0,
 #if defined CONFIG_SCREEN_PIXEL_FORMAT_RGB565
                     .srm_cm = ppa_srm_color_mode_t::PPA_SRM_COLOR_MODE_RGB565,
 #elif defined CONFIG_SCREEN_PIXEL_FORMAT_RGB888
                     .srm_cm = ppa_srm_color_mode_t::PPA_SRM_COLOR_MODE_RGB888,
+#else
+#error "unknown macro definition, please select the correct macro definition."
 #endif
                 },
+
             .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
-            .scale_x = 1, .scale_y = 1, .mirror_x = false,
+            .scale_x = 1,
+            .scale_y = 1,
+            .mirror_x = false,
 #if defined SCREEN_ROTATION_DIRECTION_0
-            .mirror_y = screen_is_hi8561(),  // HI8561 needs Y mirror in portrait
+#if defined CONFIG_SCREEN_TYPE_HI8561
+            .mirror_y = true,
+#elif defined CONFIG_SCREEN_TYPE_RM69A10
+            .mirror_y = false,
+#else
+#error "unknown macro definition, please select the correct macro definition."
+#endif
 #elif defined SCREEN_ROTATION_DIRECTION_90
             .mirror_y = false,
+#else
+#error "unknown macro definition, please select the correct macro definition."
 #endif
-            .rgb_swap = false, .byte_swap = false, .mode = PPA_TRANS_MODE_BLOCKING,
+            .rgb_swap = false,
+            .byte_swap = false,
+            .mode = PPA_TRANS_MODE_BLOCKING,
         };
 
     esp_err_t assert = ppa_do_scale_rotate_mirror(ppa_srm_handle, &srm_config);
@@ -3081,8 +4145,8 @@ void camera_video_frame_operation(uint8_t *camera_buf, uint8_t camera_buf_index,
 
     if (System_Ui->get_current_win() == Lvgl_Ui::System::Current_Win::CAMERA)
     {
-        assert = esp_lcd_panel_draw_bitmap(Screen_Mipi_Dpi_Panel, 0, (g_screen_height - output_img_height) / 2,
-                                           output_img_width, output_img_height + ((g_screen_height - output_img_height) / 2),
+        assert = esp_lcd_panel_draw_bitmap(Screen_Mipi_Dpi_Panel, 0, (SCREEN_HEIGHT - output_img_height) / 2,
+                                           output_img_width, output_img_height + ((SCREEN_HEIGHT - output_img_height) / 2),
                                            output_buffer);
         if (assert != ESP_OK)
         {
@@ -3090,6 +4154,11 @@ void camera_video_frame_operation(uint8_t *camera_buf, uint8_t camera_buf_index,
             heap_caps_free(output_buffer);
             return;
         }
+        // _lock_acquire(&lvgl_api_lock);
+        // lv_canvas_set_buffer(System_Ui->_registry.win.camera.canvas, lcd_buffer[camera_buf_index],
+        //                      srm_config.in.block_w, srm_config.in.block_h + (SCREEN_HEIGHT - srm_config.in.block_h) / 2,
+        //                      LCD_COLOR_PIXEL_FORMAT_RGB565);
+        // _lock_release(&lvgl_api_lock);
     }
 
     heap_caps_free(output_buffer);
@@ -3099,306 +4168,509 @@ bool App_Video_Init(void)
 {
     esp_lcd_panel_handle_t mipi_dpi_panel = NULL;
 
-    if (Camera_Init(&mipi_dpi_panel) == false) { printf("Camera_Init fail\n"); return false; }
+    if (Camera_Init(&mipi_dpi_panel) == false)
+    {
+        printf("Camera_Init fail\n");
+        return false;
+    }
 
-    ppa_client_config_t ppa_srm_config = { .oper_type = PPA_OPERATION_SRM };
+    ppa_client_config_t ppa_srm_config =
+        {
+            .oper_type = PPA_OPERATION_SRM,
+        };
     esp_err_t assert = ppa_register_client(&ppa_srm_config, &ppa_srm_handle);
-    if (assert != ESP_OK) { printf("ppa_register_client fail\n"); return false; }
-
+    if (assert != ESP_OK)
+    {
+        printf("ppa_register_client fail (error code: %#X)\n", assert);
+        return false;
+    }
     assert = esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &data_cache_line_size);
-    if (assert != ESP_OK) { printf("esp_cache_get_alignment fail\n"); return false; }
+    if (assert != ESP_OK)
+    {
+        printf("esp_cache_get_alignment fail (error code: %#X)\n", assert);
+        return false;
+    }
 
     assert = app_video_main(SGM38121_IIC_Bus->get_bus_handle());
-    if (assert != ESP_OK) { printf("video_init fail\n"); return false; }
+    if (assert != ESP_OK)
+    {
+        printf("video_init fail (error code: %#X)\n", assert);
+        return false;
+    }
 
 #if (defined CONFIG_CAMERA_TYPE_SC2336) || (defined CONFIG_CAMERA_TYPE_OV2710)
 #if defined CONFIG_SCREEN_PIXEL_FORMAT_RGB565
     video_cam_fd0 = app_video_open(EXAMPLE_CAM_DEV_PATH, video_fmt_t::APP_VIDEO_FMT_RGB565);
+    if (video_cam_fd0 < 0)
+    {
+        printf("video cam open fail (video_cam_fd0: %ld)\n", video_cam_fd0);
+        return false;
+    }
 #elif defined CONFIG_SCREEN_PIXEL_FORMAT_RGB888
     video_cam_fd0 = app_video_open(EXAMPLE_CAM_DEV_PATH, video_fmt_t::APP_VIDEO_FMT_RGB888);
+    if (video_cam_fd0 < 0)
+    {
+        printf("video cam open fail (video_cam_fd0: %ld)\n", video_cam_fd0);
+        return false;
+    }
+#else
+#error "unknown macro definition, please select the correct macro definition."
 #endif
 #elif defined CONFIG_CAMERA_TYPE_OV5645
     video_cam_fd0 = app_video_open(EXAMPLE_CAM_DEV_PATH, video_fmt_t::APP_VIDEO_FMT_RGB565);
+    if (video_cam_fd0 < 0)
+    {
+        printf("video cam open fail (video_cam_fd0: %ld)\n", video_cam_fd0);
+        return false;
+    }
+#else
+#error "unknown macro definition, please select the correct macro definition."
 #endif
-    if (video_cam_fd0 < 0) { printf("video cam open fail\n"); return false; }
 
 #if CONFIG_EXAMPLE_CAM_BUF_COUNT == 2
     assert = esp_lcd_dpi_panel_get_frame_buffer(mipi_dpi_panel, 2, &lcd_buffer[0], &lcd_buffer[1]);
 #else
     assert = esp_lcd_dpi_panel_get_frame_buffer(mipi_dpi_panel, 3, &lcd_buffer[0], &lcd_buffer[1], &lcd_buffer[2]);
 #endif
-    if (assert != ESP_OK) { printf("esp_lcd_dpi_panel_get_frame_buffer fail\n"); return false; }
+    if (assert != ESP_OK)
+    {
+        printf("esp_lcd_dpi_panel_get_frame_buffer fail (error code: %#X)\n", assert);
+        return false;
+    }
+
+    // #if CONFIG_EXAMPLE_USE_MEMORY_MAPPING
+    //     ESP_LOGI(TAG, "Using map buffer");
+    //     // When setting the camera video buffer, it can be written as NULL to automatically allocate the buffer using mapping
+    //     assert = app_video_set_bufs(app_video_set_bufs(video_cam_fd0, EXAMPLE_CAM_BUF_NUM, NULL));
+    //     if (assert != ESP_OK)
+    //     {
+    //         printf("app_video_set_bufs fail (error code: %#X)\n", assert);
+    //         return false;
+    //     }
+    // #elif CONFIG_CAMERA_CAMERA_MIPI_RAW8_1280X720_30FPS
+    //     printf("using user defined buffer\n");
+    //     assert = app_video_set_bufs(video_cam_fd0, CONFIG_EXAMPLE_CAM_BUF_COUNT, (const void **)lcd_buffer);
+    //     if (assert != ESP_OK)
+    //     {
+    //         printf("app_video_set_bufs fail (error code: %#X)\n", assert);
+    //         return false;
+    //     }
+    // #else
+    //     void *camera_buf[EXAMPLE_CAM_BUF_NUM];
+    //     for (int i = 0; i < EXAMPLE_CAM_BUF_NUM; i++)
+    //     {
+    //         camera_buf[i] = heap_caps_aligned_calloc(data_cache_line_size, 1, app_video_get_buf_size(), MALLOC_CAP_SPIRAM);
+    //     }
+    //     assert = app_video_set_bufs(video_cam_fd0, EXAMPLE_CAM_BUF_NUM, (const void **)camera_buf);
+    //     if (assert != ESP_OK)
+    //     {
+    //         printf("app_video_set_bufs fail (error code: %#X)\n", assert);
+    //         return false;
+    //     }
+    // #endif
 
     assert = app_video_set_bufs(video_cam_fd0, CONFIG_EXAMPLE_CAM_BUF_COUNT, (const void **)lcd_buffer);
-    if (assert != ESP_OK) { printf("app_video_set_bufs fail\n"); return false; }
+    if (assert != ESP_OK)
+    {
+        printf("app_video_set_bufs fail (error code: %#X)\n", assert);
+        return false;
+    }
 
     assert = app_video_register_frame_operation_cb(camera_video_frame_operation);
-    if (assert != ESP_OK) { printf("app_video_register_frame_operation_cb fail\n"); return false; }
+    if (assert != ESP_OK)
+    {
+
+        printf("app_video_register_frame_operation_cb fail (error code: %#X)\n", assert);
+        return false;
+    }
 
     assert = app_video_stream_task_start(video_cam_fd0, 0, NULL);
-    if (assert != ESP_OK) { printf("app_video_stream_task_start fail\n"); return false; }
+    if (assert != ESP_OK)
+    {
+        printf("app_video_stream_task_start fail (error code: %#X)\n", assert);
+        return false;
+    }
 
     app_video_stream_task_stop(video_cam_fd0);
+
+    // // Get the initial time for frame rate statistics
+    // start_time = esp_timer_get_time();
+
     return true;
 }
 
-// PPA rotation client — always initialized so runtime rotation toggle works
+#if (CONFIG_ENABLE_PPA_SCREEN_ROTATION == true) && (!defined SCREEN_ROTATION_DIRECTION_0)
 bool Ppa_Screen_Rotation_Init(void)
 {
-    ppa_client_config_t ppa_srm_config = { .oper_type = PPA_OPERATION_SRM };
+    ppa_client_config_t ppa_srm_config =
+        {
+            .oper_type = PPA_OPERATION_SRM,
+        };
     esp_err_t assert = ppa_register_client(&ppa_srm_config, &ppa_srm_handle_2);
-    if (assert != ESP_OK) { printf("ppa_register_client fail\n"); return false; }
-
+    if (assert != ESP_OK)
+    {
+        printf("ppa_register_client fail (error code: %#X)\n", assert);
+        return false;
+    }
     assert = esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &data_cache_line_size_2);
-    if (assert != ESP_OK) { printf("esp_cache_get_alignment fail\n"); return false; }
+    if (assert != ESP_OK)
+    {
+        printf("esp_cache_get_alignment fail (error code: %#X)\n", assert);
+        return false;
+    }
 
+    return true;
+}
+#endif
+
+bool Play_Wav_File_2(const char *file_path)
+{
+    std::ifstream file(file_path, std::ios::binary);
+
+    if (file.is_open() == false)
+    {
+        printf("failed to open wav file: %s\n", file_path);
+        return false;
+    }
+
+    Wav_Header wav_header;
+    if (!file.read(reinterpret_cast<char *>(&wav_header), sizeof(wav_header)))
+    {
+        printf("failed to read wav header\n");
+        file.close();
+        return false;
+    }
+
+    // 分别检查 WAV 文件头的每个部分
+    if (strncmp(wav_header.riff_header, "RIFF", 4) != 0)
+    {
+        printf("invalid wav file format: riff_header is not 'RIFF'\n");
+        // file.close();
+        // return false;
+    }
+    else if (strncmp(wav_header.wave_header, "WAVE", 4) != 0)
+    {
+        printf("invalid wav file format: wave_header is not 'WAVE'\n");
+        // file.close();
+        // return false;
+    }
+    else if (strncmp(wav_header.fmt_header, "fmt ", 4) != 0)
+    {
+        printf("invalid wav file format: fmt_header is not 'fmt '\n");
+        // file.close();
+        // return false;
+    }
+    else if (strncmp(wav_header.data_header, "data", 4) != 0)
+    {
+        printf("invalid wav file format: data_header is not 'data'\n");
+        // file.close();
+        // return false;
+    }
+
+    printf("sample rate: %ld\n", wav_header.sample_rate);
+    printf("channels: %d\n", wav_header.num_channel);
+    printf("bits per sample: %d\n", wav_header.bits_per_sample);
+
+    // 检查采样率、通道数和位深度是否与 I2S 配置匹配 (如果使用 I2S)
+    if (wav_header.sample_rate != SAMPLE_RATE ||
+        wav_header.num_channel != NUM_CHANNEL ||
+        wav_header.bits_per_sample != BITS_PER_SAMPLE)
+    {
+        printf("wav file parameters do not match i2s configuration audio may not play correctly\n");
+        file.close();
+        return false;
+    }
+
+    // 计算播放时间
+    double duration = 0.0;
+    if (wav_header.sample_rate > 0 && wav_header.num_channel > 0 && wav_header.bits_per_sample > 0)
+    {
+        duration = static_cast<double>(wav_header.data_size) / (wav_header.sample_rate * wav_header.num_channel * (wav_header.bits_per_sample / 8.0));
+    }
+
+    printf("duration: %.2f s\n", duration);
+
+    // 读取并播放音频数据
+    std::unique_ptr<char[]> data_buffer = std::make_unique<char[]>(1024);
+
+    if (data_buffer == nullptr)
+    {
+        printf("failed to allocate memory for audio buffer\n");
+        file.close();
+        return false;
+    }
+
+    while (file.good())
+    {
+        file.read(data_buffer.get(), 1024);
+        std::streamsize bytes_read = file.gcount(); // 获取实际读取的字节数
+
+        if (bytes_read > 0)
+        {
+            ES8311->write_data(data_buffer.get(), bytes_read); // 这一行需要根据你的 I2S 驱动实现来修改
+        }
+        // else
+        // {
+        //     break; // 结束循环，如果读取的字节数为 0
+        // }
+    }
+
+    file.close();
     return true;
 }
 
 void System_Startup_Message_Init(void)
 {
-    auto show_msg = [](const char *msg)
+    if (Sys_Status.sgm38121.init_flag == false)
     {
         vTaskDelay(pdMS_TO_TICKS(1000));
-        _lock_acquire(&lvgl_api_lock);
-        System_Ui->create_system_message_box(lv_screen_active(), "device massage", msg);
-        _lock_release(&lvgl_api_lock);
-        while (System_Ui->_registry.system_message_box.occupancy_flag == true)
-            vTaskDelay(pdMS_TO_TICKS(10));
-    };
 
-    if (!Sys_Status.sgm38121.init_flag)  show_msg("sgm38121 init fail");
-    if (!Sys_Status.camera.init_flag)    show_msg("camera init fail");
-    // esp32c6 and wifi checks skipped — WiFi is initialized AFTER this
-    // function returns, so these would always block waiting for dismiss.
+        _lock_acquire(&lvgl_api_lock);
+        System_Ui->create_system_message_box(lv_screen_active(), "device massage", "sgm38121 init fail");
+        _lock_release(&lvgl_api_lock);
+
+        while (System_Ui->_registry.system_message_box.occupancy_flag == true)
+        {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+
+    if (Sys_Status.camera.init_flag == false)
+    {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        _lock_acquire(&lvgl_api_lock);
+        System_Ui->create_system_message_box(lv_screen_active(), "device massage", "camera init fail");
+        _lock_release(&lvgl_api_lock);
+
+        while (System_Ui->_registry.system_message_box.occupancy_flag == true)
+        {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+
+    if (Sys_Status.esp32c6.init_flag == false)
+    {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        _lock_acquire(&lvgl_api_lock);
+        System_Ui->create_system_message_box(lv_screen_active(), "device massage", "esp32c6 init fail");
+        _lock_release(&lvgl_api_lock);
+
+        while (System_Ui->_registry.system_message_box.occupancy_flag == true)
+        {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+
+    if (Sys_Status.esp32c6.wifi_connect_status == false)
+    {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        _lock_acquire(&lvgl_api_lock);
+        System_Ui->create_system_message_box(lv_screen_active(), "system massage", "esp32c6 connect wifi fail");
+        _lock_release(&lvgl_api_lock);
+
+        while (System_Ui->_registry.system_message_box.occupancy_flag == true)
+        {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
 
 #if defined CONFIG_BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
-    if (!Sys_Status.xl9555.init_flag)    show_msg("xl9555 init fail");
-    if (!Sys_Status.tca8418.init_flag)   show_msg("tca8418 init fail");
-    if (!Sys_Status.st25r3916.init_flag) show_msg("st25r3916 init fail");
-    if (!Sys_Status.cc1101.init_flag)    show_msg("cc1101 init fail");
-    if (!Sys_Status.nrf24l01.init_flag)  show_msg("nrf24l01 init fail");
-    if (!Sys_Status.bq25896.init_flag)   show_msg("bq25896 init fail");
-#endif
 
-    if (!Sys_Status.pcf8563.init_flag)   show_msg("pcf8563 init fail");
-    if (!Sys_Status.bq27220.init_flag)   show_msg("bq27220 init fail");
-    if (!Sys_Status.aw86224.init_flag)   show_msg("aw86224 init fail");
-    if (!Sys_Status.es8311.init_flag)    show_msg("es8311 init fail");
-    if (!Sys_Status.icm20948.init_flag)  show_msg("icm20948 init fail");
-    if (!Sys_Status.l76k.init_flag)      show_msg("l76k init fail");
-    if (!Sys_Status.sx1262.init_flag)    show_msg("sx1262 init fail");
-}
-
-typedef enum { APP_EVENT = 0, } app_event_group_t;
-typedef struct { app_event_group_t event_group; } app_event_queue_t;
-
-static void gpio_cb(void *arg)
-{
-    const app_event_queue_t evt_queue = { .event_group = APP_EVENT };
-    BaseType_t xTaskWoken = pdFALSE;
-    if (app_event_queue)
-        xQueueSendFromISR(app_event_queue, &evt_queue, &xTaskWoken);
-    if (xTaskWoken == pdTRUE)
-        portYIELD_FROM_ISR();
-}
-
-#ifdef ENABLE_ENUM_FILTER_CALLBACK
-static bool set_config_cb(const usb_device_desc_t *dev_desc, uint8_t *bConfigurationValue)
-{
-    *bConfigurationValue = (dev_desc->bNumConfigurations > 1) ? 2 : 1;
-    return true;
-}
-#endif
-
-static void usb_host_lib_task(void *arg)
-{
-    ESP_LOGI(TAG, "Installing USB Host Library");
-    usb_host_config_t host_config = {
-        .skip_phy_setup = false,
-        .intr_flags = ESP_INTR_FLAG_LEVEL1,
-#ifdef ENABLE_ENUM_FILTER_CALLBACK
-        .enum_filter_cb = set_config_cb,
-#endif
-    };
-    // Retry USB host install — may fail initially if WiFi SDIO init
-    // hasn't released transient DMA buffers yet.
-    esp_err_t err;
-    for (int attempt = 0; attempt < 10; attempt++) {
-        err = usb_host_install(&host_config);
-        if (err == ESP_OK) break;
-        ESP_LOGW(TAG, "usb_host_install attempt %d failed (0x%x), free internal: %u, retrying...",
-                 attempt + 1, err, heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    if (Sys_Status.xl9555.init_flag == false)
+    {
         vTaskDelay(pdMS_TO_TICKS(1000));
+
+        _lock_acquire(&lvgl_api_lock);
+        System_Ui->create_system_message_box(lv_screen_active(), "device massage", "xl9555 init fail");
+        _lock_release(&lvgl_api_lock);
+
+        while (System_Ui->_registry.system_message_box.occupancy_flag == true)
+        {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
     }
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "usb_host_install failed after retries — ADS-B unavailable");
-        xTaskNotifyGive(arg);
-        vTaskDelete(NULL);
-        return;
-    }
 
-    // Pre-allocate USB transfer buffers NOW, right after host install —
-    // internal DMA RAM is ~94KB and unfragmented here.  If we wait until
-    // rtlsdr_open() (after client register + device enum + tuner init),
-    // the heap is fragmented and the 17KB contiguous DMA block fails.
-    init_adsb_dev();
-
-    xTaskNotifyGive(arg);
-
-    bool has_clients = true;
-    bool has_devices = false;
-    while (has_clients)
+    if (Sys_Status.tca8418.init_flag == false)
     {
-        uint32_t event_flags;
-        ESP_ERROR_CHECK(usb_host_lib_handle_events(portMAX_DELAY, &event_flags));
-        if (event_flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS)
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        _lock_acquire(&lvgl_api_lock);
+        System_Ui->create_system_message_box(lv_screen_active(), "device massage", "tca8418 init fail");
+        _lock_release(&lvgl_api_lock);
+
+        while (System_Ui->_registry.system_message_box.occupancy_flag == true)
         {
-            ESP_LOGI(TAG, "Get FLAGS_NO_CLIENTS");
-            if (ESP_OK == usb_host_device_free_all())
-                has_clients = false;
-            else
-                has_devices = true;
-        }
-        if (has_devices && event_flags & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE)
-        {
-            ESP_LOGI(TAG, "Get FLAGS_ALL_FREE");
-            has_clients = false;
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
-    ESP_LOGI(TAG, "No more clients and devices, uninstall USB Host library");
-    ESP_ERROR_CHECK(usb_host_uninstall());
-    vTaskSuspend(NULL);
-}
 
-// ============================================================
-// rtlsdr_adsb_start — NON-BLOCKING
-// Spawns USB host and class driver tasks, then returns.
-// The blocking event-loop from the original code is gone;
-// BOOT button shutdown is handled by a lightweight watcher task.
-// ============================================================
-
-static void usb_quit_watcher_task(void *arg)
-{
-    app_event_queue_t evt_queue;
-    while (1)
+    if (Sys_Status.st25r3916.init_flag == false)
     {
-        if (xQueueReceive(app_event_queue, &evt_queue, portMAX_DELAY))
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        _lock_acquire(&lvgl_api_lock);
+        System_Ui->create_system_message_box(lv_screen_active(), "device massage", "st25r3916 init fail");
+        _lock_release(&lvgl_api_lock);
+
+        while (System_Ui->_registry.system_message_box.occupancy_flag == true)
         {
-            if (APP_EVENT == evt_queue.event_group)
-            {
-                usb_host_lib_info_t lib_info;
-                ESP_ERROR_CHECK(usb_host_lib_info(&lib_info));
-                if (lib_info.num_devices != 0)
-                    ESP_LOGW(TAG, "Shutdown with attached devices.");
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
 
-                class_driver_client_deregister();
-                vTaskDelay(10);
+    if (Sys_Status.cc1101.init_flag == false)
+    {
+        vTaskDelay(pdMS_TO_TICKS(1000));
 
-                if (s_class_driver_task_hdl) vTaskDelete(s_class_driver_task_hdl);
-                if (s_host_lib_task_hdl)     vTaskDelete(s_host_lib_task_hdl);
+        _lock_acquire(&lvgl_api_lock);
+        System_Ui->create_system_message_box(lv_screen_active(), "device massage", "cc1101 init fail");
+        _lock_release(&lvgl_api_lock);
 
-                gpio_isr_handler_remove(APP_QUIT_PIN);
-                xQueueReset(app_event_queue);
-                ESP_LOGI(TAG, "USB host shut down");
-                vTaskDelete(NULL);
-                return;
-            }
+        while (System_Ui->_registry.system_message_box.occupancy_flag == true)
+        {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+
+    if (Sys_Status.nrf24l01.init_flag == false)
+    {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        _lock_acquire(&lvgl_api_lock);
+        System_Ui->create_system_message_box(lv_screen_active(), "device massage", "nrf24l01 init fail");
+        _lock_release(&lvgl_api_lock);
+
+        while (System_Ui->_registry.system_message_box.occupancy_flag == true)
+        {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+
+    if (Sys_Status.bq25896.init_flag == false)
+    {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        _lock_acquire(&lvgl_api_lock);
+        System_Ui->create_system_message_box(lv_screen_active(), "device massage", "bq25896 init fail");
+        _lock_release(&lvgl_api_lock);
+
+        while (System_Ui->_registry.system_message_box.occupancy_flag == true)
+        {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+#endif
+
+    if (Sys_Status.pcf8563.init_flag == false)
+    {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        _lock_acquire(&lvgl_api_lock);
+        System_Ui->create_system_message_box(lv_screen_active(), "device massage", "pcf8563 init fail");
+        _lock_release(&lvgl_api_lock);
+
+        while (System_Ui->_registry.system_message_box.occupancy_flag == true)
+        {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+
+    if (Sys_Status.bq27220.init_flag == false)
+    {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        _lock_acquire(&lvgl_api_lock);
+        System_Ui->create_system_message_box(lv_screen_active(), "device massage", "bq27220 init fail");
+        _lock_release(&lvgl_api_lock);
+
+        while (System_Ui->_registry.system_message_box.occupancy_flag == true)
+        {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+
+    if (Sys_Status.aw86224.init_flag == false)
+    {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        _lock_acquire(&lvgl_api_lock);
+        System_Ui->create_system_message_box(lv_screen_active(), "device massage", "aw86224 init fail");
+        _lock_release(&lvgl_api_lock);
+
+        while (System_Ui->_registry.system_message_box.occupancy_flag == true)
+        {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+
+    if (Sys_Status.es8311.init_flag == false)
+    {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        _lock_acquire(&lvgl_api_lock);
+        System_Ui->create_system_message_box(lv_screen_active(), "device massage", "es8311 init fail");
+        _lock_release(&lvgl_api_lock);
+
+        while (System_Ui->_registry.system_message_box.occupancy_flag == true)
+        {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+
+    if (Sys_Status.icm20948.init_flag == false)
+    {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        _lock_acquire(&lvgl_api_lock);
+        System_Ui->create_system_message_box(lv_screen_active(), "device massage", "icm20948 init fail");
+        _lock_release(&lvgl_api_lock);
+
+        while (System_Ui->_registry.system_message_box.occupancy_flag == true)
+        {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+
+    if (Sys_Status.l76k.init_flag == false)
+    {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        _lock_acquire(&lvgl_api_lock);
+        System_Ui->create_system_message_box(lv_screen_active(), "device massage", "l76k init fail");
+        _lock_release(&lvgl_api_lock);
+
+        while (System_Ui->_registry.system_message_box.occupancy_flag == true)
+        {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+
+    if (Sys_Status.sx1262.init_flag == false)
+    {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        _lock_acquire(&lvgl_api_lock);
+        System_Ui->create_system_message_box(lv_screen_active(), "device massage", "sx1262 init fail");
+        _lock_release(&lvgl_api_lock);
+
+        while (System_Ui->_registry.system_message_box.occupancy_flag == true)
+        {
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
 }
-
-void rtlsdr_adsb_start(void)
-{
-    ESP_LOGI(TAG, "Starting RTL-SDR ADS-B USB host");
-
-    const gpio_config_t input_pin = {
-        .pin_bit_mask = BIT64(APP_QUIT_PIN),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .intr_type = GPIO_INTR_NEGEDGE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&input_pin));
-    ESP_ERROR_CHECK(gpio_install_isr_service(ESP_INTR_FLAG_LEVEL1));
-    ESP_ERROR_CHECK(gpio_isr_handler_add(APP_QUIT_PIN, gpio_cb, NULL));
-
-    app_event_queue = xQueueCreate(10, sizeof(app_event_queue_t));
-
-    BaseType_t task_created;
-    task_created = xTaskCreatePinnedToCore(usb_host_lib_task,
-                                           "usb_host",
-                                           8192,
-                                           xTaskGetCurrentTaskHandle(),
-                                           HOST_LIB_TASK_PRIORITY,
-                                           &s_host_lib_task_hdl,
-                                           0);
-    assert(task_created == pdTRUE);
-
-    // Wait until the USB host library is installed
-    ulTaskNotifyTake(false, 1000);
-
-    // Pre-allocate USB transfer buffers NOW while internal RAM is still
-    // contiguous.  The class_driver_task + adsb_reader_task + rtlsdr_open()
-    // will fragment memory before they get around to allocating.
-    // init_adsb_dev() is idempotent — if already called, rtlsdr_open() skips it.
-    printf("[MEM] before USB transfer pre-alloc: internal=%u\n",
-           heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-    init_adsb_dev();
-    printf("[MEM] after USB transfer pre-alloc: internal=%u\n",
-           heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-
-    task_created = xTaskCreateWithCaps(class_driver_task, "class",
-                                       16 * 1024, NULL, CLASS_TASK_PRIORITY,
-                                       &s_class_driver_task_hdl, MALLOC_CAP_SPIRAM);
-    assert(task_created == pdTRUE);
-    vTaskDelay(10);
-
-    // Lightweight watcher — handles BOOT button press to cleanly shut down USB
-    xTaskCreateWithCaps(usb_quit_watcher_task, "usb_quit", 2048, NULL, 1, NULL, MALLOC_CAP_SPIRAM);
-
-    ESP_LOGI(TAG, "RTL-SDR ADS-B tasks started");
-}
-
-extern "C" void *g_usb_dma_reservation;
 
 extern "C" void app_main(void)
 {
-    printf("Hello world!\n");
+    printf("Ciallo\n");
 
-    // Initialize NVS flash and load settings
-    esp_err_t nvs_err = nvs_flash_init();
-    if (nvs_err != ESP_OK) {
-        printf("[NVS] Init failed (0x%x), erasing and reinitializing...\n", nvs_err);
-        nvs_flash_erase();
-        nvs_err = nvs_flash_init();
-        if (nvs_err != ESP_OK) {
-            printf("[NVS] Still failed after erase (0x%x) — settings won't persist\n", nvs_err);
-        }
-    }
-    settings_load();
-    meshy_channels_load();
-    meshy_channels_ensure_identity();
-    settings_apply_timezone();
-    printf("[SETTINGS] Loaded: tz=%+d:%02d%s brightness=%d meshy=%s adsb=%s\n",
-           g_settings.tz_offset_h, g_settings.tz_offset_m,
-           g_settings.dst_enabled ? " DST" : "",
-           g_settings.brightness,
-           g_settings.meshy_enabled ? "on" : "off",
-           g_settings.adsb_enabled ? "on" : "off");
-    printf("[MEM] boot start: internal=%u PSRAM=%u\n",
-           heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-           heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-
-    // Reserve a contiguous block of DMA-capable internal RAM NOW, before
-    // peripheral init fragments the heap.  This block will be freed in
-    // init_adsb_dev() right before usb_host_transfer_alloc() needs it,
-    // guaranteeing a contiguous hole for the 17KB USB bulk transfer buffer.
-    g_usb_dma_reservation = heap_caps_malloc(20480, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    if (g_usb_dma_reservation) {
-        printf("[USB] Reserved 20KB DMA block at %p for USB transfer\n", g_usb_dma_reservation);
-    } else {
-        printf("[USB] WARNING: failed to reserve DMA block\n");
-    }
+#if CONFIG_ENABLE_USB_DISPLAY == true
+#else
+    Hardware_Usb_Cdc_Init();
+#endif
 
     XL9535->begin();
 
@@ -3418,6 +4690,7 @@ extern "C" void app_main(void)
     XL9535->pin_write(XL9535_ESP32C6_EN, Cpp_Bus_Driver::Xl95x5::Value::LOW);
 
     XL9535->pin_write(XL9535_ESP32P4_VCCA_POWER_EN, Cpp_Bus_Driver::Xl95x5::Value::LOW);
+
     XL9535->pin_write(XL9535_5_0_V_POWER_EN, Cpp_Bus_Driver::Xl95x5::Value::HIGH);
     XL9535->pin_write(XL9535_3_3_V_POWER_EN, Cpp_Bus_Driver::Xl95x5::Value::LOW);
     vTaskDelay(pdMS_TO_TICKS(200));
@@ -3426,6 +4699,7 @@ extern "C" void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(200));
     XL9535->pin_write(XL9535_5_0_V_POWER_EN, Cpp_Bus_Driver::Xl95x5::Value::HIGH);
     XL9535->pin_write(XL9535_3_3_V_POWER_EN, Cpp_Bus_Driver::Xl95x5::Value::LOW);
+
     vTaskDelay(pdMS_TO_TICKS(200));
 
     XL9535->pin_write(XL9535_SCREEN_RST, Cpp_Bus_Driver::Xl95x5::Value::HIGH);
@@ -3440,57 +4714,16 @@ extern "C" void app_main(void)
 
     XL9535->pin_mode(XL9535_ETHERNET_RST, Cpp_Bus_Driver::Xl95x5::Mode::OUTPUT);
     XL9535->pin_write(XL9535_ETHERNET_RST, Cpp_Bus_Driver::Xl95x5::Value::HIGH);
-
-    // --- Runtime screen detection via I2C probe ---
-    // Use raw i2c_master_probe() instead of driver begin() for detection,
-    // because GT9895->begin() doesn't reliably return false on probe failure
-    // (LilyGo driver logs error but returns true). Raw probe just sends
-    // address byte and checks for ACK — no side effects, no false positives.
-    {
-        GT9895_IIC_Bus->set_bus_handle(XL9535_IIC_Bus->get_bus_handle());
-        HI8561_T_IIC_Bus->set_bus_handle(XL9535_IIC_Bus->get_bus_handle());
-
-        i2c_master_bus_handle_t i2c_bus = XL9535_IIC_Bus->get_bus_handle();
-
-        // Probe GT9895 touch IC address (0x5D) — present only on AMOLED variant
-        esp_err_t probe_result = i2c_master_probe(i2c_bus, 0x5D, 50);
-        if (probe_result == ESP_OK) {
-            // AMOLED variant — GT9895 responded
-            GT9895->begin();
-            g_screen_type = SCREEN_TYPE_RM69A10;
-            g_screen_width = RM69A10_SCREEN_WIDTH;
-            g_screen_height = RM69A10_SCREEN_HEIGHT;
-        } else {
-            // LCD variant — no GT9895, must be HI8561
-            HI8561_T->begin();
-            g_screen_type = SCREEN_TYPE_HI8561;
-            g_screen_width = HI8561_SCREEN_WIDTH;
-            g_screen_height = HI8561_SCREEN_HEIGHT;
-        }
-        printf("[SCREEN] Detected: %s (probe 0x5D: %s)\n",
-               screen_type_name(), probe_result == ESP_OK ? "ACK" : "NACK");
-
-        // Update UI layout dimensions to match detected screen
-#if defined SCREEN_ROTATION_DIRECTION_0
-        System_Ui->set_screen_size(g_screen_width, g_screen_height);
-#elif defined SCREEN_ROTATION_DIRECTION_90
-        System_Ui->set_screen_size(g_screen_height, g_screen_width);
-#endif
-    }
-
-    // Kill SD card power immediately — resets the card's internal state
-    // machine if a previous hard reset left it stuck mid-transaction.
-    // Power stays off through the rest of peripheral init (~5 seconds),
-    // giving caps plenty of time to drain.  Re-enabled just before mount.
-    XL9535->pin_mode(XL9535_SD_EN, Cpp_Bus_Driver::Xl95x5::Mode::OUTPUT);
-    XL9535->pin_write(XL9535_SD_EN, Cpp_Bus_Driver::Xl95x5::Value::HIGH);  // power OFF
-
     Ethernet_Init();
 
-    // HI8561 uses PWM for backlight; RM69A10 uses MIPI DSI brightness command
-    if (screen_is_hi8561()) {
-        HI8561_T->create_pwm(HI8561_SCREEN_BL, ledc_channel_t::LEDC_CHANNEL_0, 2000);
-    }
+#if defined CONFIG_SCREEN_TYPE_HI8561
+    // 这个必须放在以太网后面
+    HI8561_T->create_pwm(HI8561_SCREEN_BL, ledc_channel_t::LEDC_CHANNEL_0, 2000);
+
+#elif defined CONFIG_SCREEN_TYPE_RM69A10
+#else
+#error "unknown macro definition, please select the correct macro definition."
+#endif
 
     if (SGM38121->begin() == false)
     {
@@ -3523,15 +4756,15 @@ extern "C" void app_main(void)
     SGM38121->set_channel_status(Cpp_Bus_Driver::Sgm38121::Channel::AVDD_1, Cpp_Bus_Driver::Sgm38121::Status::ON);
     SGM38121->set_channel_status(Cpp_Bus_Driver::Sgm38121::Channel::AVDD_2, Cpp_Bus_Driver::Sgm38121::Status::ON);
 #else
-#error "unknown macro definition"
+#error "unknown macro definition, please select the correct macro definition."
 #endif
 
+    // bsp_init_refresh_monitor_io();
+
     Init_Ldo_Channel_Power(3, 1830);
+
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    // App_Video_Init must run BEFORE Screen_Init — camera creates its own
-    // MIPI-CSI panel and must complete before the DSI panel is configured.
-    // This matches the stock LILYGO init order.
     if (App_Video_Init() == false)
     {
         printf("App_Video_Init fail\n");
@@ -3543,71 +4776,74 @@ extern "C" void app_main(void)
         Sys_Status.camera.init_flag = true;
     }
 
-    // Always init PPA rotation engine — needed for runtime rotation toggle
+#if (CONFIG_ENABLE_PPA_SCREEN_ROTATION == true) && (!defined SCREEN_ROTATION_DIRECTION_0)
     if (Ppa_Screen_Rotation_Init() == false)
+    {
         printf("Ppa_Screen_Rotation_init fail\n");
+    }
     else
+    {
         printf("Ppa_Screen_Rotation_init success\n");
+    }
+#endif
 
 #if CONFIG_ENABLE_USB_DISPLAY == true
     Usb_Screen_Init(&Screen_Mipi_Dpi_Panel);
 #else
-    Screen_Init_Runtime(&Screen_Mipi_Dpi_Panel);
+    Screen_Init(&Screen_Mipi_Dpi_Panel);
 #endif
 
-    // Stock LilyGO init sequence: Screen_Init() → esp_lcd_panel_init() only.
-    // Do NOT call esp_lcd_panel_reset() or esp_lcd_panel_disp_on_off() here —
-    // reset wipes the DSI lane config and panel commands that Screen_Init() sent.
     esp_err_t assert = esp_lcd_panel_init(Screen_Mipi_Dpi_Panel);
-    if (assert != ESP_OK) printf("esp_lcd_panel_init fail (error code: %#X)\n", assert);
-
-    // Touch driver already initialized in screen detection above
-
-    // ESP32C6_AT->begin() is intentionally skipped — we use ESP-Hosted
-    // protocol instead of AT commands for WiFi. Calling AT begin() would
-    // put the C6 into AT mode and conflict with ESP-Hosted transport.
-    Sys_Status.esp32c6.init_flag = true;  // ESP-Hosted inits automatically
-
-    // Re-enable SD card power — card has been off since early in boot,
-    // so its state machine is fully reset.
-    XL9535->pin_write(XL9535_SD_EN, Cpp_Bus_Driver::Xl95x5::Value::LOW);   // power ON
-    vTaskDelay(pdMS_TO_TICKS(100));  // let card power up and stabilize
-
-    bool sd_mounted = Sd_Spi_Init(SD_BASE_PATH, 3);
-    if (!sd_mounted)
-        printf("Sd_Spi_Init fail -- wallpaper resources unavailable\n");
-    else
-        esp_register_shutdown_handler(sd_safe_shutdown);
-
-    // ---------------------------------------------------------------
-    // RTL-SDR / ADS-B USB host — started as early as possible after
-    // SD mount so ADS-B logging begins ASAP.  USB host has no LVGL
-    // or peripheral task dependency.  The 17KB DMA bulk transfer
-    // buffer allocates cleanly here with ~189KB internal RAM free.
-    // ---------------------------------------------------------------
-    printf("[MEM] before USB host: internal=%u PSRAM=%u\n",
-           heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-           heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-    if (g_settings.adsb_enabled) {
-        rtlsdr_adsb_start();
-    } else {
-        printf("[SETTINGS] ADS-B disabled — USB host not started\n");
+    if (assert != ESP_OK)
+    {
+        printf("esp_lcd_panel_init fail (error code: %#X)\n", assert);
     }
 
-    // ---------------------------------------------------------------
-    // Now init LVGL and the startup screen.
-    // ---------------------------------------------------------------
+#if defined CONFIG_SCREEN_TYPE_HI8561
+    HI8561_T_IIC_Bus->set_bus_handle(XL9535_IIC_Bus->get_bus_handle());
+
+    HI8561_T->begin();
+
+#elif defined CONFIG_SCREEN_TYPE_RM69A10
+
+    GT9895_IIC_Bus->set_bus_handle(XL9535_IIC_Bus->get_bus_handle());
+
+    GT9895->begin();
+
+#else
+#error "unknown macro definition, please select the correct macro definition."
+#endif
+
+    // SDMMC_HOST_SLOT_1必须要先于SDMMC_HOST_SLOT_0初始化
+
+    if (ESP32C6_AT->begin() == false)
+    {
+        printf("esp32c6 init fail\n");
+        Sys_Status.esp32c6.init_flag = false;
+    }
+    else
+    {
+        printf("esp32c6 init success\n");
+        Sys_Status.esp32c6.init_flag = true;
+    }
+
+    XL9535->pin_mode(XL9535_SD_EN, Cpp_Bus_Driver::Xl95x5::Mode::OUTPUT);
+    XL9535->pin_write(XL9535_SD_EN, Cpp_Bus_Driver::Xl95x5::Value::LOW);
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    if (Sdmmc_Init(SD_BASE_PATH) == false)
+    {
+        printf("Sdmmc_Init fail\n");
+    }
+
+    // if (Sdspi_Init(SD_BASE_PATH) == false)
+    // {
+    //     printf("Sdspi_Init fail\n");
+    // }
+
     Lvgl_Init();
     Lvgl_Startup();
-    // Allocate lvgl_ui_task stack from PSRAM to avoid exhausting internal RAM.
-    // Internal RAM is needed by USB host, DMA, and the DSI framebuffer.
-    printf("[MEM] before LVGL task: internal=%u\n", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-    BaseType_t task_ret = xTaskCreateWithCaps(lvgl_ui_task, "lvgl_ui_task",
-        64 * 1024, NULL, 1, NULL, MALLOC_CAP_SPIRAM);
-    if (task_ret != pdPASS) {
-        printf("ERROR: lvgl_ui_task create failed (%d) -- falling back to internal RAM\n", task_ret);
-        xTaskCreate(lvgl_ui_task, "lvgl_ui_task", 32 * 1024, NULL, 1, NULL);
-    }
+    xTaskCreate(lvgl_ui_task, "lvgl_ui_task", 100 * 1024, NULL, 1, NULL);
 
 #if defined CONFIG_BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
     if (XL9555->begin() == false)
@@ -3624,7 +4860,7 @@ extern "C" void app_main(void)
     XL9555->pin_mode(XL9555_LED_1, Cpp_Bus_Driver::Xl95x5::Mode::OUTPUT);
     XL9555->pin_mode(XL9555_LED_2, Cpp_Bus_Driver::Xl95x5::Mode::OUTPUT);
     XL9555->pin_mode(XL9555_LED_3, Cpp_Bus_Driver::Xl95x5::Mode::OUTPUT);
-    XL9555->pin_write(XL9555_LED_1, Cpp_Bus_Driver::Xl95x5::Value::HIGH);
+    XL9555->pin_write(XL9555_LED_1, Cpp_Bus_Driver::Xl95x5::Value::HIGH); // 关闭led
     XL9555->pin_write(XL9555_LED_2, Cpp_Bus_Driver::Xl95x5::Value::HIGH);
     XL9555->pin_write(XL9555_LED_3, Cpp_Bus_Driver::Xl95x5::Value::HIGH);
 
@@ -3637,7 +4873,10 @@ extern "C" void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(10));
 
     TCA8418->create_gpio_interrupt(TCA8418_INT, Cpp_Bus_Driver::Tool::Interrupt_Mode::FALLING,
-                                   [](void *arg) -> IRAM_ATTR void { TCA8418_Interrupt_Flag = true; });
+                                   [](void *arg) -> IRAM_ATTR void
+                                   {
+                                       TCA8418_Interrupt_Flag = true;
+                                   });
 
     if (TCA8418->begin() == false)
     {
@@ -3652,6 +4891,7 @@ extern "C" void app_main(void)
     TCA8418->set_keypad_scan_window(0, 0, TCA8418_KEYPAD_SCAN_WIDTH, TCA8418_KEYPAD_SCAN_HEIGHT);
     TCA8418->set_irq_pin_mode(Cpp_Bus_Driver::Tca8418::Irq_Mask::KEY_EVENTS);
     TCA8418->clear_irq_flag(Cpp_Bus_Driver::Tca8418::Irq_Flag::KEY_EVENTS);
+
     TCA8418->create_pwm(KEYBOARD_BL, ledc_channel_t::LEDC_CHANNEL_1, 20000);
     TCA8418->start_pwm_gradient_time(30, 1000);
 
@@ -3673,24 +4913,48 @@ extern "C" void app_main(void)
 
     XL9555->pin_mode(XL9555_T_MIXRF_CC1101_RF_SWITCH_0, Cpp_Bus_Driver::Xl95x5::Mode::OUTPUT);
     XL9555->pin_mode(XL9555_T_MIXRF_CC1101_RF_SWITCH_1, Cpp_Bus_Driver::Xl95x5::Mode::OUTPUT);
+
     ESP32P4->pin_mode(T_MIXRF_CC1101_BUSY, Cpp_Bus_Driver::Tool::Pin_Mode::INPUT, Cpp_Bus_Driver::Tool::Pin_Status::PULLDOWN);
+
     ESP32P4->create_gpio_interrupt(T_MIXRF_CC1101_INT, Cpp_Bus_Driver::Tool::Interrupt_Mode::RISING,
-                                   [](void *arg) -> IRAM_ATTR void { Cc1101_Interrupt_Flag = true; });
+                                   [](void *arg) -> IRAM_ATTR void
+                                   {
+                                       Cc1101_Interrupt_Flag = true;
+                                   });
 
     Cc1101_SPI_Bus->_bus_init_flag = true;
     int16_t assert_2 = Cc1101.begin();
-    Sys_Status.cc1101.init_flag = (assert_2 == RADIOLIB_ERR_NONE);
-    printf("cc1101 init %s\n", Sys_Status.cc1101.init_flag ? "success" : "fail");
+    if (assert_2 == RADIOLIB_ERR_NONE)
+    {
+        Sys_Status.cc1101.init_flag = true;
+        printf("cc1101 init success\n");
+    }
+    else
+    {
+        Sys_Status.cc1101.init_flag = false;
+        printf("cc1101 init fail (error code: %d)\n", assert_2);
+    }
 
     System_Ui->set_config_rf_params(System_Ui->_device_cc1101);
 
     ESP32P4->create_gpio_interrupt(T_MIXRF_NRF24L01_INT, Cpp_Bus_Driver::Tool::Interrupt_Mode::FALLING,
-                                   [](void *arg) -> IRAM_ATTR void { Nrf24l01_Interrupt_Flag = true; });
+                                   [](void *arg) -> IRAM_ATTR void
+                                   {
+                                       Nrf24l01_Interrupt_Flag = true;
+                                   });
 
     Nrf24l01_SPI_Bus->_bus_init_flag = true;
     assert_2 = Nrf24l01.begin();
-    Sys_Status.nrf24l01.init_flag = (assert_2 == RADIOLIB_ERR_NONE);
-    printf("nrf24l01 init %s\n", Sys_Status.nrf24l01.init_flag ? "success" : "fail");
+    if (assert_2 == RADIOLIB_ERR_NONE)
+    {
+        Sys_Status.nrf24l01.init_flag = true;
+        printf("nrf24l01 init success\n");
+    }
+    else
+    {
+        Sys_Status.nrf24l01.init_flag = false;
+        printf("nrf24l01 init fail (error code: %d)\n", assert_2);
+    }
 
     System_Ui->set_config_rf_params(System_Ui->_device_nrf24l01);
 
@@ -3704,25 +4968,31 @@ extern "C" void app_main(void)
     {
         Sys_Status.bq25896.init_flag = true;
         printf("bq25896 init success\n");
+
+        // 禁用看门狗后不能读取看门狗寄存器状态，否者看门狗禁用会失效
         Kode_Bq25896::bq25896_set_watchdog_timer(Bq25896_Handle, Kode_Bq25896::bq25896_watchdog_t::BQ25896_WATCHDOG_DISABLE);
+
         Kode_Bq25896::bq25896_set_adc_conversion(Bq25896_Handle, Kode_Bq25896::bq25896_adc_conv_state_t::BQ25896_ADC_CONV_START);
-        Kode_Bq25896::bq25896_set_adc_conversion_rate(Bq25896_Handle, Kode_Bq25896::bq25896_adc_conv_rate_t::BQ25896_ADC_CONV_RATE_CONTINUOUS);
+        Kode_Bq25896::bq25896_set_adc_conversion_rate(Bq25896_Handle, Kode_Bq25896::bq25896_adc_conv_rate_t ::BQ25896_ADC_CONV_RATE_CONTINUOUS);
+
+        // Kode_Bq25896::bq25896_set_otg(Bq25896_Handle, Kode_Bq25896::bq25896_otg_state_t::BQ25896_OTG_ENABLE);
     }
+
 #endif
 
 #if CONFIG_ENABLE_USB_DISPLAY == true
 #else
-    if (screen_is_hi8561()) {
-        HI8561_T->start_pwm_gradient_time(g_settings.brightness, 500);
-    } else {
-        uint8_t target = g_settings.brightness * 255 / 100;
-        for (uint8_t i = 0; i < target; i += 5)
-        {
-            set_rm69a10_brightness(Screen_Mipi_Dpi_Panel, i);
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-        set_rm69a10_brightness(Screen_Mipi_Dpi_Panel, target);
+#if defined CONFIG_SCREEN_TYPE_HI8561
+    HI8561_T->start_pwm_gradient_time(100, 500);
+#elif defined CONFIG_SCREEN_TYPE_RM69A10
+    for (uint8_t i = 0; i < 255; i += 5)
+    {
+        set_rm69a10_brightness(Screen_Mipi_Dpi_Panel, i);
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
+#else
+#error "unknown macro definition, please select the correct macro definition."
+#endif
 #endif
 
     PCF8563_IIC_Bus->set_bus_handle(XL9535_IIC_Bus->get_bus_handle());
@@ -3742,25 +5012,9 @@ extern "C" void app_main(void)
     Set_Lvgl_Startup_Progress_Bar(20);
     _lock_release(&lvgl_api_lock);
 
-    // ICM20948 init runs here before other I2C peripherals
-    Wire1._bus->set_bus_handle(SGM38121_IIC_Bus->get_bus_handle());
-    if (ICM20948_Init() == false)
-    {
-        printf("icm20948 init fail\n");
-        Sys_Status.icm20948.init_flag = false;
-    }
-    else
-    {
-        printf("icm20948 init success\n");
-        printf("[MEM] after ICM20948: internal=%u\n", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-        Sys_Status.icm20948.init_flag = true;
-    }
-
-    // ESP-Hosted WiFi + SNTP time sync — moved to end of boot
-    // to avoid SDIO DMA heap corruption during peripheral init.
-
-    // Start HTTP file server — task waits for STA netif to get an IP
-    // (also moved to end of boot, after WiFi init)
+    // ESP32C6复位模式
+    // XL9535->pin_mode(XL9535_ESP32C6_EN, Cpp_Bus_Driver::Xl95x5::Mode::OUTPUT);
+    Esp32c6_At_Init();
 
     _lock_acquire(&lvgl_api_lock);
     Set_Lvgl_Startup_Progress_Bar(40);
@@ -3779,6 +5033,7 @@ extern "C" void app_main(void)
         Sys_Status.bq27220.init_flag = true;
     }
 
+    // 设置的电池容量会在没有电池插入的时候自动还原为默认值
     BQ27220->set_design_capacity(1000);
     BQ27220->set_temperature_mode(Cpp_Bus_Driver::Bq27220xxxx::Temperature_Mode::EXTERNAL_NTC);
     BQ27220->set_sleep_current_threshold(50);
@@ -3799,6 +5054,9 @@ extern "C" void app_main(void)
         printf("aw86224 init success\n");
         Sys_Status.aw86224.init_flag = true;
     }
+    // printf("AW86224 input voltage: %.06f V\n", AW86224->get_input_voltage());
+
+    // RAM播放
     AW86224->init_ram_mode(Cpp_Bus_Driver::aw862xx_haptic_ram_12k_0809_170, sizeof(Cpp_Bus_Driver::aw862xx_haptic_ram_12k_0809_170));
 
     _lock_acquire(&lvgl_api_lock);
@@ -3808,37 +5066,70 @@ extern "C" void app_main(void)
     ES8311_IIC_Bus->set_bus_handle(SGM38121_IIC_Bus->get_bus_handle());
     ES8311_Init();
 
+    // if (Play_Wav_File_2(SD_FILE_PATH_MUSIC) == false)
+    // {
+    //     printf("Play_Wav_File fail\n");
+    // }
+    // else
+    // {
+    //     printf("Play_Wav_File complete\n");
+    // }
+
     _lock_acquire(&lvgl_api_lock);
     Set_Lvgl_Startup_Progress_Bar(70);
     _lock_release(&lvgl_api_lock);
 
-    // ICM20948 init already done above
+    Wire1._bus->set_bus_handle(SGM38121_IIC_Bus->get_bus_handle());
+    if (ICM20948_Init() == false)
+    {
+        printf("icm20948 init fail\n");
+        Sys_Status.icm20948.init_flag = false;
+    }
+    else
+    {
+        printf("icm20948 init success\n");
+        Sys_Status.icm20948.init_flag = true;
+    }
 
     _lock_acquire(&lvgl_api_lock);
     Set_Lvgl_Startup_Progress_Bar(80);
     _lock_release(&lvgl_api_lock);
 
+    // XL9535->pin_mode(XL9535_GPS_WAKE_UP, Cpp_Bus_Driver::Xl95x5::Mode::OUTPUT);
     XL9535->pin_write(XL9535_GPS_WAKE_UP, Cpp_Bus_Driver::Xl95x5::Value::HIGH);
     if (L76K->begin() == false)
     {
         L76K_Uart_Bus->set_baud_rate(115200);
-        Sys_Status.l76k.init_flag = (L76K->begin() == true);
+
+        if (L76K->begin() == false)
+        {
+            printf("l76k init fail\n");
+            Sys_Status.l76k.init_flag = false;
+        }
+        else
+        {
+            printf("l76k init success\n");
+            Sys_Status.l76k.init_flag = true;
+        }
     }
     else
     {
+        printf("l76k init success\n");
         Sys_Status.l76k.init_flag = true;
+
         L76K->set_baud_rate(Cpp_Bus_Driver::L76k::Baud_Rate::BR_115200_BPS);
     }
-    printf("l76k init %s (baud: %ld)\n", Sys_Status.l76k.init_flag ? "success" : "fail", L76K->get_baud_rate());
+    printf("get_baud_rate:%ld\n", L76K->get_baud_rate());
     L76K->set_update_frequency(Cpp_Bus_Driver::L76k::Update_Freq::FREQ_5HZ);
     L76K->clear_rx_buffer_data();
-    L76K->sleep(false);  // Keep GPS awake — ADS-B needs continuous receiver position
+    L76K->sleep(true);
 
     _lock_acquire(&lvgl_api_lock);
     Set_Lvgl_Startup_Progress_Bar(90);
     _lock_release(&lvgl_api_lock);
 
     XL9535->pin_mode(XL9535_SX1262_DIO1, Cpp_Bus_Driver::Xl95x5::Mode::INPUT);
+    // LORA复位
     XL9535->pin_mode(XL9535_SX1262_RST, Cpp_Bus_Driver::Xl95x5::Mode::OUTPUT);
     XL9535->pin_write(XL9535_SX1262_RST, Cpp_Bus_Driver::Xl95x5::Value::HIGH);
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -3848,12 +5139,11 @@ extern "C" void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(10));
 
     XL9535->pin_mode(XL9535_SKY13453_VCTL, Cpp_Bus_Driver::Xl95x5::Mode::OUTPUT);
-    XL9535->pin_mode(XL9535_SX1262_DIO1, Cpp_Bus_Driver::Xl95x5::Mode::INPUT);
 
+    XL9535->pin_mode(XL9535_SX1262_DIO1, Cpp_Bus_Driver::Xl95x5::Mode::INPUT);
 #if defined CONFIG_BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
     SX1262_SPI_Bus->_bus_init_flag = true;
 #endif
-
     if (SX1262->begin(10000000) == false)
     {
         printf("sx1262 begin fail\n");
@@ -3867,106 +5157,80 @@ extern "C" void app_main(void)
 
     System_Ui->set_config_rf_params(System_Ui->_device_sx1262);
 
-    // Initialize Meshy (Meshtastic) — pass hardware pointers, then start
-    // after SX1262 is configured. This reconfigures the radio for Meshtastic
-    // parameters (MediumFast, slot 45, 913.375 MHz).
-    meshy_set_hw(SX1262.get(), XL9535.get());
-    if (g_settings.meshy_enabled) {
-        meshy_start();
-    } else {
-        printf("[SETTINGS] Meshtastic disabled — radio not started\n");
-    }
-
     _lock_acquire(&lvgl_api_lock);
     Set_Lvgl_Startup_Progress_Bar(100);
     _lock_release(&lvgl_api_lock);
 
     _lock_acquire(&lvgl_api_lock);
-    System_Ui->begin(false);  // wallpaper disabled — no images on SD card
+    System_Ui->begin();
     _lock_release(&lvgl_api_lock);
 
-    // ADS-B aircraft display is now handled by the on-device ADS-B app
-    // (init_win_adsb in lvgl_ui.cpp). The old home-screen table is removed.
-
-    // ── Task stack placement strategy ──
-    // All application task stacks are in PSRAM. ESP-IDF peripheral drivers
-    // (I2S, I2C, SPI, UART) manage their own DMA buffers internally — the
-    // task stack is never passed directly to DMA hardware.
-    //
-    // Only usb_host_lib_task remains on internal RAM (ESP-IDF USB host
-    // requirement). class_driver_task was migrated to PSRAM since USB
-    // bulk transfers use a separately allocated DMA buffer (g_usb_dma_reservation).
-    //
-    // Internal RAM budget: ~100KB available at task creation. With all app
-    // stacks in PSRAM, ~70KB+ remains free for fopen(), mutexes, runtime allocs.
-
-    // ── PSRAM stacks (audio/network — drivers manage DMA internally) ──
-    xTaskCreateWithCaps(device_speaker_task,     "device_speaker_task",     32 * 1024, NULL, 3, &Speaker_Task_Handle, MALLOC_CAP_SPIRAM);
-    xTaskCreateWithCaps(device_microphone_task,  "device_microphone_task",  4 * 1024, NULL, 3, &Microphone_Task_Handle, MALLOC_CAP_SPIRAM);
-    xTaskCreateWithCaps(device_ethernet_task,    "device_ethernet_task",    4 * 1024, NULL, 3, &Ethernet_Task_Handle, MALLOC_CAP_SPIRAM);
-    xTaskCreateWithCaps(iis_transmission_data_stream_task, "iis_tx_task",  4 * 1024, NULL, 4, &Iis_Transmission_Data_Stream_Task, MALLOC_CAP_SPIRAM);
-
-    // ── PSRAM stacks (I2C — driver manages DMA internally) ──
-    xTaskCreateWithCaps(device_vibration_task,      "vibration_task",      4 * 1024, NULL, 2, &Vibration_Task_Handle, MALLOC_CAP_SPIRAM);
-    xTaskCreateWithCaps(device_imu_task,            "imu_task",            4 * 1024, NULL, 3, &Imu_Task_Handle, MALLOC_CAP_SPIRAM);
-    xTaskCreateWithCaps(device_battery_health_task, "battery_health_task", 8 * 1024, NULL, 3, NULL, MALLOC_CAP_SPIRAM);
-    xTaskCreateWithCaps(device_rtc_task,            "rtc_task",            4 * 1024, NULL, 3, NULL, MALLOC_CAP_SPIRAM);
-
-    // ── PSRAM stacks (UART / no hardware) ──
-    xTaskCreateWithCaps(device_gps_task,  "gps_task",  8 * 1024, NULL, 3, &Gps_Task_Handle, MALLOC_CAP_SPIRAM);
-    xTaskCreateWithCaps(device_at_task,   "at_task",   4 * 1024, NULL, 3, &At_Task_Handle, MALLOC_CAP_SPIRAM);
-
-    // ── PSRAM stacks (app/UI display tasks — no DMA from stack) ──
-    xTaskCreateWithCaps(device_adsb_app_task,    "adsb_app_task",    8 * 1024, NULL, 3, &Adsb_App_Task_Handle, MALLOC_CAP_SPIRAM);
-    xTaskCreateWithCaps(device_meshy_app_task,   "meshy_app_task",   8 * 1024, NULL, 3, &Meshy_App_Task_Handle, MALLOC_CAP_SPIRAM);
-    xTaskCreateWithCaps(device_scope_app_task,   "scope_app_task",  16 * 1024, NULL, 3, &Scope_App_Task_Handle, MALLOC_CAP_SPIRAM);
-
-    // Apply manual receiver position if configured (GPS will override when it gets a fix)
-    if (g_settings.adsb_manual_pos &&
-        (fabs(g_settings.adsb_manual_lat) > 0.1 || fabs(g_settings.adsb_manual_lon) > 0.1)) {
-        adsb_set_receiver_pos(g_settings.adsb_manual_lat, g_settings.adsb_manual_lon, 0.0, 0, 99.9, 0);
-        printf("[SETTINGS] Manual receiver position: %.4f, %.4f\n",
-               g_settings.adsb_manual_lat, g_settings.adsb_manual_lon);
-    }
-
+#if CONFIG_ENABLE_USB_DISPLAY == true
+#else
+    xTaskCreate(hardware_usb_cdc_task, "hardware_usb_cdc_task", 4 * 1024, NULL, 3, NULL);
+#endif
+    xTaskCreate(device_vibration_task, "device_vibration_task", 4 * 1024, NULL, 2, &Vibration_Task_Handle);
+    xTaskCreate(device_speaker_task, "device_speaker_task", 4 * 1024, NULL, 3, &Speaker_Task_Handle);
+    xTaskCreate(device_microphone_task, "device_microphone_task", 4 * 1024, NULL, 3, &Microphone_Task_Handle);
+    xTaskCreate(device_imu_task, "device_imu_task", 4 * 1024, NULL, 3, &Imu_Task_Handle);
+    xTaskCreate(device_battery_health_task, "device_battery_health_task", 8 * 1024, NULL, 3, NULL);
+    xTaskCreate(device_gps_task, "device_gps_task", 8 * 1024, NULL, 3, &Gps_Task_Handle);
+    xTaskCreate(device_ethernet_task, "device_ethernet_task", 4 * 1024, NULL, 3, &Ethernet_Task_Handle);
+    xTaskCreate(device_rtc_task, "device_rtc_task", 4 * 1024, NULL, 3, NULL);
+    xTaskCreate(device_at_task, "device_at_task", 4 * 1024, NULL, 3, &At_Task_Handle);
+    // xTaskCreate(esp32p4_sleep_task, "esp32p4_sleep_task", 4 * 1024, NULL, 3, &Sleep_Task_Handle);
+    xTaskCreate(device_rf_task, "device_rf_task", 4 * 1024, NULL, 3, &Rf_Task_Handle);
+    xTaskCreate(iis_transmission_data_stream_task, "iis_transmission_data_stream_task", 4 * 1024, NULL, 4, &Iis_Transmission_Data_Stream_Task);
 #if defined CONFIG_BOARD_TYPE_T_DISPLAY_P4_KEYBOARD
-    xTaskCreateWithCaps(device_nfc_task, "device_nfc_task", 8 * 1024, NULL, 3, &Nfc_Task_Handle, MALLOC_CAP_SPIRAM);
+    xTaskCreate(device_nfc_task, "device_nfc_task", 8 * 1024, NULL, 3, &Nfc_Task_Handle);
 #endif
 
+    // 等待lvgl刷新完成
     while (lv_display_flush_is_last(lv_display_get_default()) == false)
+    {
         vTaskDelay(pdMS_TO_TICKS(10));
+    }
 
     printf("system ui init finish\n");
-
-    // Start persistent trail recording — 1Hz esp_timer, runs in background from boot
-    // so trails are available when user opens Scope later
-    scope_trail_init();
-
-    // Scan SD card for music tracks
-    music_player_init();
-    music_player_scan();
-
-    // Apply saved brightness and init screen timeout
-    g_last_touch_ms = esp_log_timestamp();
-
-    // Enable double-tap wake/sleep if configured
-    if (g_settings.double_tap_wake) {
-        ICM20948_Imu_Mode = Imu_Mode::DOUBLE_TAP_WAKE;
-        if (Imu_Task_Handle) vTaskResume(Imu_Task_Handle);
-    }
-    printf("[MEM] after UI + tasks: internal=%u\n", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     System_Ui->set_vibration();
 
     System_Startup_Message_Init();
 
-    // Start serial console (Ctrl+C for command mode)
-    serial_console_init();
+    //     while (1)
+    //     {
+    //         if (esp_log_timestamp() > Cycle_Time)
+    //         {
+    // #if defined CONFIG_SCREEN_TYPE_HI8561
+    //             Cpp_Bus_Driver::Hi8561_Touch::Touch_Point tp;
 
-    // ---------------------------------------------------------------
-    // WiFi disabled — Espressif Issue #17889 (SDMMC controller
-    // shared between ESP-Hosted SDIO Slot 1 and SD card Slot 0
-    // causes heap corruption from concurrent DMA).
-    // TODO: Implement AT firmware TCP bridge, or re-enable when
-    // Espressif ships the fix.
-    // ---------------------------------------------------------------
+    //             if (HI8561_T->get_multiple_touch_point(tp) == true)
+    //             {
+    //                 printf("touch finger: %d edge touch flag: %d\n", tp.finger_count, tp.edge_touch_flag);
+
+    //                 for (uint8_t i = 0; i < tp.info.size(); i++)
+    //                 {
+    //                     printf("touch num:[%d] x: %d y: %d p: %d\n", i + 1, tp.info[i].x, tp.info[i].y, tp.info[i].pressure_value);
+    //                 }
+    //             }
+    // #elif defined CONFIG_SCREEN_TYPE_RM69A10
+    //             Cpp_Bus_Driver::Gt9895::Touch_Point tp;
+
+    //             if (GT9895->get_multiple_touch_point(tp) == true)
+    //             {
+    //                 printf("touch finger: %d edge touch flag: %d\n", tp.finger_count, tp.edge_touch_flag);
+
+    //                 for (uint8_t i = 0; i < tp.info.size(); i++)
+    //                 {
+    //                     printf("touch num:[%d] id:[%d] x: %d y: %d p: %d\n", i + 1, tp.info[i].finger_id, tp.info[i].x, tp.info[i].y, tp.info[i].pressure_value);
+    //                 }
+    //             }
+    // #else
+    // #error "unknown macro definition, please select the correct macro definition."
+    // #endif
+
+    //             Cycle_Time = esp_log_timestamp() + 1000;
+    //         }
+
+    //         vTaskDelay(pdMS_TO_TICKS(10));
+    //     }
 }

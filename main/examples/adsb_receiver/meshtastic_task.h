@@ -65,6 +65,7 @@ typedef struct {
     // Timestamp (boot-relative ms)
     uint32_t rx_time_ms;
     uint16_t rx_count;                // number of times this packet was received
+    bool     is_pki;                  // true = PKI direct message (not channel)
 } meshy_msg_t;
 
 // ─── Known node entry ────────────────────────────────────────────────────────
@@ -162,6 +163,18 @@ int meshy_format_nodes(char *buf, int bufsize);
  * Returns number of messages written.
  */
 int meshy_format_messages(char *buf, int bufsize);
+
+/**
+ * Close the Meshy SD log (flush + mark closed).
+ * Call before unmounting SD card (e.g. entering USB MSC mode).
+ */
+void meshy_sd_close(void);
+
+/**
+ * Close current log and create a fresh one with a new timestamp.
+ * Call after remounting SD card (e.g. exiting USB MSC mode).
+ */
+void meshy_sd_create_new(void);
 
 #ifdef __cplusplus
 }

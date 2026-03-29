@@ -1,0 +1,334 @@
+diff --git a/src/bus/iis/hardware_iis.cpp b/src/bus/iis/hardware_iis.cpp
+index 7471f22..222fb62 100644
+--- a/src/bus/iis/hardware_iis.cpp
++++ b/src/bus/iis/hardware_iis.cpp
+@@ -25,6 +25,7 @@ namespace Cpp_Bus_Driver
+         i2s_chan_config_t chan_config = I2S_CHANNEL_DEFAULT_CONFIG(_port, I2S_ROLE_MASTER);
+         // 自动清除DMA缓冲区中的旧数据
+         chan_config.auto_clear = true;
++        chan_config.dma_desc_num = 6;
+ 
+         if (_data_mode == Data_Mode::INPUT_OUTPUT)
+         {
+diff --git a/src/bus/iis/hardware_iis.h b/src/bus/iis/hardware_iis.h
+index d2eab7a..843e4a7 100644
+--- a/src/bus/iis/hardware_iis.h
++++ b/src/bus/iis/hardware_iis.h
+@@ -60,6 +60,32 @@ namespace Cpp_Bus_Driver
+ 
+         bool begin(i2s_mclk_multiple_t mclk_multiple, uint32_t sample_rate_hz, i2s_data_bit_width_t data_bit_width) override;
+ 
++        // Reconfigure I2S clock for a new rate without tearing down channels.
++        // Caller must also update the codec (e.g. ES8311::set_clock_coeff).
++        bool set_clock_rate(uint32_t rate_hz) {
++            if (rate_hz == _sample_rate_hz) return true;  // no change
++
++            if (_chan_tx_handle) i2s_channel_disable(_chan_tx_handle);
++            if (_chan_rx_handle) i2s_channel_disable(_chan_rx_handle);
++
++            i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(rate_hz);
++            clk_cfg.mclk_multiple = (i2s_mclk_multiple_t)_mclk_multiple;
++
++            esp_err_t ret = ESP_OK;
++            if (_chan_tx_handle)
++                ret = i2s_channel_reconfig_std_clock(_chan_tx_handle, &clk_cfg);
++            if (ret == ESP_OK && _chan_rx_handle)
++                ret = i2s_channel_reconfig_std_clock(_chan_rx_handle, &clk_cfg);
++
++            if (_chan_tx_handle) i2s_channel_enable(_chan_tx_handle);
++            if (_chan_rx_handle) i2s_channel_enable(_chan_rx_handle);
++
++            if (ret == ESP_OK) _sample_rate_hz = rate_hz;
++            return ret == ESP_OK;
++        }
++
++        uint32_t get_clock_rate() const { return _sample_rate_hz; }
++
+         size_t read(void *data, size_t byte) override;
+         size_t write(const void *data, size_t byte) override;
+ 
+diff --git a/src/bus/spi/hardware_spi.cpp b/src/bus/spi/hardware_spi.cpp
+index ce880fa..e470285 100644
+--- a/src/bus/spi/hardware_spi.cpp
++++ b/src/bus/spi/hardware_spi.cpp
+@@ -1,12 +1,16 @@
+ /*
+- * @Description: None
+- * @Author: LILYGO_L
++ * @Description: Hardware SPI with persistent DMA bounce buffer
++ * @Author: LILYGO_L (DMA fix by Off by One / ADS-B Scope)
+  * @Date: 2025-02-13 15:04:49
+- * @LastEditTime: 2026-01-05 17:13:13
++ * @LastEditTime: 2026-03-20 00:00:00
+  * @License: GPL 3.0
+  */
+ #include "hardware_spi.h"
+ 
++#if defined DEVELOPMENT_FRAMEWORK_ESPIDF
++#include "esp_heap_caps.h"
++#endif
++
+ namespace Cpp_Bus_Driver
+ {
+     bool Hardware_Spi::begin(int32_t freq_hz, int32_t cs)
+@@ -56,6 +60,36 @@ namespace Cpp_Bus_Driver
+ 
+ #if defined DEVELOPMENT_FRAMEWORK_ESPIDF
+ 
++        // ── Pre-allocate persistent DMA bounce buffers ────────────
++        if (_dma_tx_buf == nullptr)
++        {
++            _dma_tx_buf = static_cast<uint8_t *>(
++                heap_caps_malloc(DMA_BUF_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
++            if (_dma_tx_buf == nullptr)
++            {
++                assert_log(Log_Level::BUS, __FILE__, __LINE__,
++                    "DMA TX buffer alloc failed (%u bytes)\n", DMA_BUF_SIZE);
++                return false;
++            }
++        }
++
++        if (_dma_rx_buf == nullptr)
++        {
++            _dma_rx_buf = static_cast<uint8_t *>(
++                heap_caps_malloc(DMA_BUF_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
++            if (_dma_rx_buf == nullptr)
++            {
++                assert_log(Log_Level::BUS, __FILE__, __LINE__,
++                    "DMA RX buffer alloc failed (%u bytes)\n", DMA_BUF_SIZE);
++                heap_caps_free(_dma_tx_buf);
++                _dma_tx_buf = nullptr;
++                return false;
++            }
++        }
++
++        assert_log(Log_Level::INFO, __FILE__, __LINE__,
++            "SPI DMA bounce buffers pre-allocated (%u bytes each)\n", DMA_BUF_SIZE);
++
+         if (_bus_init_flag == false)
+         {
+             const spi_bus_config_t bus_config =
+@@ -63,8 +97,8 @@ namespace Cpp_Bus_Driver
+                     .mosi_io_num = _mosi,
+                     .miso_io_num = _miso,
+                     .sclk_io_num = _sclk,
+-                    .quadwp_io_num = -1, // WP引脚不设置，这个引脚配置Quad SPI的时候才有用
+-                    .quadhd_io_num = -1, // HD引脚不设置，这个引脚配置Quad SPI的时候才有用
++                    .quadwp_io_num = -1,
++                    .quadhd_io_num = -1,
+                     .data4_io_num = -1,
+                     .data5_io_num = -1,
+                     .data6_io_num = -1,
+@@ -92,22 +126,22 @@ namespace Cpp_Bus_Driver
+                 {
+                     .command_bits = 0,
+                     .address_bits = 0,
+-                    .dummy_bits = 0, // 无虚拟位
++                    .dummy_bits = 0,
+                     .mode = _mode,
+-                    .clock_source = _clock_source, // 时钟源
+-                    .duty_cycle_pos = 128,         // 50% 占空比
+-                    .cs_ena_pretrans = 1,          // 在数据传输开始之前，片选信号（CS）应该提前多少个SPI位周期被激活
+-                    .cs_ena_posttrans = 1,         // 在数据传输结束后，片选信号（CS）应该保持激活状态多少个SPI位周期
++                    .clock_source = _clock_source,
++                    .duty_cycle_pos = 128,
++                    .cs_ena_pretrans = 1,
++                    .cs_ena_posttrans = 1,
+                     .clock_speed_hz = freq_hz,
+-                    .input_delay_ns = 0, // 无输入延迟
++                    .input_delay_ns = 0,
+ #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+                     .sample_point = spi_sampling_point_t::SPI_SAMPLING_POINT_PHASE_0,
+ #endif
+                     .spics_io_num = cs,
+-                    .flags = _flags, // 标志，可以填入SPI_DEVICE_BIT_LSBFIRST等信息
++                    .flags = _flags,
+                     .queue_size = 1,
+-                    .pre_cb = NULL,  // 无传输前回调
+-                    .post_cb = NULL, // 无传输后回调
++                    .pre_cb = NULL,
++                    .post_cb = NULL,
+                 };
+             esp_err_t assert = spi_bus_add_device(_port, &device_config, &_spi_device);
+             if (assert != ESP_OK)
+@@ -136,6 +170,16 @@ namespace Cpp_Bus_Driver
+     bool Hardware_Spi::write(const void *data, size_t byte)
+     {
+ #if defined DEVELOPMENT_FRAMEWORK_ESPIDF
++        if (byte > DMA_BUF_SIZE)
++        {
++            assert_log(Log_Level::BUS, __FILE__, __LINE__,
++                "SPI write exceeds DMA buffer (%u > %u)\n", byte, DMA_BUF_SIZE);
++            return false;
++        }
++
++        // Bounce through pre-allocated DMA buffer
++        memcpy(_dma_tx_buf, data, byte);
++
+         spi_transaction_t buffer =
+             {
+                 .flags = static_cast<uint32_t>(NULL),
+@@ -147,7 +191,7 @@ namespace Cpp_Bus_Driver
+                 .override_freq_hz = 0,
+ #endif
+                 .user = (void *)0,
+-                .tx_buffer = data,
++                .tx_buffer = _dma_tx_buf,
+                 .rx_buffer = NULL,
+             };
+ 
+@@ -176,6 +220,13 @@ namespace Cpp_Bus_Driver
+     bool Hardware_Spi::read(void *data, size_t byte)
+     {
+ #if defined DEVELOPMENT_FRAMEWORK_ESPIDF
++        if (byte > DMA_BUF_SIZE)
++        {
++            assert_log(Log_Level::BUS, __FILE__, __LINE__,
++                "SPI read exceeds DMA buffer (%u > %u)\n", byte, DMA_BUF_SIZE);
++            return false;
++        }
++
+         spi_transaction_t buffer =
+             {
+                 .flags = static_cast<uint32_t>(NULL),
+@@ -188,7 +239,7 @@ namespace Cpp_Bus_Driver
+ #endif
+                 .user = (void *)0,
+                 .tx_buffer = NULL,
+-                .rx_buffer = data,
++                .rx_buffer = _dma_rx_buf,
+             };
+ 
+         esp_err_t assert = spi_device_polling_transmit(_spi_device, &buffer);
+@@ -198,6 +249,9 @@ namespace Cpp_Bus_Driver
+             return false;
+         }
+ 
++        // Copy out from DMA buffer to caller
++        memcpy(data, _dma_rx_buf, byte);
++
+         return true;
+ #elif defined DEVELOPMENT_FRAMEWORK_ARDUINO_NRF
+         uint8_t buffer[byte] = {0};
+@@ -217,6 +271,16 @@ namespace Cpp_Bus_Driver
+     bool Hardware_Spi::write_read(const void *write_data, void *read_data, size_t data_byte)
+     {
+ #if defined DEVELOPMENT_FRAMEWORK_ESPIDF
++        if (data_byte > DMA_BUF_SIZE)
++        {
++            assert_log(Log_Level::BUS, __FILE__, __LINE__,
++                "SPI write_read exceeds DMA buffer (%u > %u)\n", data_byte, DMA_BUF_SIZE);
++            return false;
++        }
++
++        // Bounce TX through pre-allocated DMA buffer
++        memcpy(_dma_tx_buf, write_data, data_byte);
++
+         spi_transaction_t buffer =
+             {
+                 .flags = static_cast<uint32_t>(NULL),
+@@ -228,8 +292,8 @@ namespace Cpp_Bus_Driver
+                 .override_freq_hz = 0,
+ #endif
+                 .user = (void *)0,
+-                .tx_buffer = write_data,
+-                .rx_buffer = read_data,
++                .tx_buffer = _dma_tx_buf,
++                .rx_buffer = _dma_rx_buf,
+             };
+ 
+         esp_err_t assert = spi_device_polling_transmit(_spi_device, &buffer);
+@@ -239,6 +303,9 @@ namespace Cpp_Bus_Driver
+             return false;
+         }
+ 
++        // Copy RX out from DMA buffer to caller
++        memcpy(read_data, _dma_rx_buf, data_byte);
++
+         return true;
+ #elif defined DEVELOPMENT_FRAMEWORK_ARDUINO_NRF
+         _spi_handle->beginTransaction(_spi_settings);
+@@ -252,4 +319,4 @@ namespace Cpp_Bus_Driver
+         return false;
+ #endif
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/src/bus/spi/hardware_spi.h b/src/bus/spi/hardware_spi.h
+index d67b925..3352d51 100644
+--- a/src/bus/spi/hardware_spi.h
++++ b/src/bus/spi/hardware_spi.h
+@@ -1,8 +1,8 @@
+ /*
+- * @Description: None
+- * @Author: LILYGO_L
++ * @Description: Hardware SPI with persistent DMA bounce buffer
++ * @Author: LILYGO_L (DMA fix by Off by One / ADS-B Scope)
+  * @Date: 2024-12-16 17:47:28
+- * @LastEditTime: 2026-01-15 09:31:09
++ * @LastEditTime: 2026-03-20 00:00:00
+  * @License: GPL 3.0
+  */
+ #pragma once
+@@ -30,6 +30,22 @@ namespace Cpp_Bus_Driver
+ 
+         bool _bus_init_flag = false;
+         bool _device_init_flag = false;
++
++        // ── Persistent DMA bounce buffer ──────────────────────────
++        // ESP-IDF's SPI master allocates+frees an internal DMA bounce
++        // buffer on EVERY transaction when the caller's buffer is not
++        // DMA-capable (stack, PSRAM, etc.).  At ~20 txns/sec from the
++        // SX1262 LoRa radio, this fragments internal RAM until
++        // allocation fails (~83 s on the T-Display-P4).
++        //
++        // Fix: pre-allocate a single DMA-capable buffer pair at
++        // begin() and memcpy through them on every transaction.
++        //
++        // Sized for worst-case SX1262 write_buffer(255):
++        //   2 (cmd+offset) + 255 (payload) = 257, rounded to 512.
++        static constexpr size_t DMA_BUF_SIZE = 512;
++        uint8_t *_dma_tx_buf = nullptr;
++        uint8_t *_dma_rx_buf = nullptr;
+ #elif defined DEVELOPMENT_FRAMEWORK_ARDUINO_NRF
+         BitOrder _bit_order;
+ #endif
+diff --git a/src/config.h b/src/config.h
+index 5460a2c..ed41566 100644
+--- a/src/config.h
++++ b/src/config.h
+@@ -66,7 +66,7 @@
+ 
+ #include "tool.h"
+ 
+-#define CPP_BUS_DRIVER_LOG_LEVEL_DEBUG
++// #define CPP_BUS_DRIVER_LOG_LEVEL_DEBUG  // disabled — suppresses raw NMEA sentence dump
+ #define CPP_BUS_DRIVER_LOG_LEVEL_INFO
+ #define CPP_BUS_DRIVER_LOG_LEVEL_BUS
+ #define CPP_BUS_DRIVER_LOG_LEVEL_CHIP
+diff --git a/src/tool.cpp b/src/tool.cpp
+index c3b2e10..96b19ae 100644
+--- a/src/tool.cpp
++++ b/src/tool.cpp
+@@ -7,6 +7,10 @@
+  */
+ #include "tool.h"
+ 
++// Declared in serial_console.h (main component) — returns false when console
++// is in CMD mode, so we suppress verbose bus driver output.
++extern "C" bool serial_console_log_enabled(void);
++
+ namespace Cpp_Bus_Driver
+ {
+     void Tool::assert_log(Log_Level level, const char *file_name, size_t line_number, const char *format, ...)
+@@ -14,6 +18,9 @@ namespace Cpp_Bus_Driver
+ #if defined CPP_BUS_DRIVER_LOG_LEVEL_BUS || defined CPP_BUS_DRIVER_LOG_LEVEL_CHIP || \
+     defined CPP_BUS_DRIVER_LOG_LEVEL_INFO || defined CPP_BUS_DRIVER_LOG_LEVEL_DEBUG
+ 
++        // Suppress verbose output when serial console is in CMD mode
++        if (!serial_console_log_enabled()) return;
++
+         switch (level)
+         {
+ #if defined CPP_BUS_DRIVER_LOG_LEVEL_DEBUG

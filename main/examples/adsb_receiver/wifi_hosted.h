@@ -1,0 +1,332 @@
+/**
+ * wifi_hosted.h — WiFi connectivity via ESP-Hosted (C6 over SDIO).
+ *
+ * The ESP32-C6 runs the ESP-Hosted "network_adapter" slave firmware,
+ * communicating with the P4 over SDMMC Slot 1 (GPIOs 14-19).
+ * This module wraps the standard ESP-IDF WiFi APIs — esp_hosted +
+ * esp_wifi_remote make the transport transparent.
+ *
+ * Architecture:
+ *   - C6 is held in reset (XL9535_ESP32C6_EN = LOW) until wifi_hosted_init()
+ *   - ESP-Hosted manages the SDIO transport automatically
+ *   - Standard esp_wifi_* APIs work once initialized
+ *   - SNTP time sync starts automatically on WiFi connect
+ *
+ * Prerequisites:
+ *   - SD card must be on SPI (not SDMMC) to avoid DMA conflict (Issue #17889)
+ *   - C6 must be pre-flashed with ESP-Hosted SPI slave firmware
+ *   - idf_component.yml must include esp_hosted and esp_wifi_remote
+ *
+ * sdkconfig entries (add to sdkconfig.defaults):
+ *   CONFIG_ESP_WIFI_REMOTE_ENABLED=y
+ *   CONFIG_ESP_HOSTED_ENABLED=y
+ *   CONFIG_ESP_HOSTED_TRANSPORT_SDIO=y
+ *   CONFIG_ESP_HOSTED_SDIO_SLOT=1
+ *   CONFIG_ESP_HOSTED_SDIO_CLK_GPIO=18
+ *   CONFIG_ESP_HOSTED_SDIO_CMD_GPIO=19
+ *   CONFIG_ESP_HOSTED_SDIO_D0_GPIO=14
+ *   CONFIG_ESP_HOSTED_SDIO_D1_GPIO=15
+ *   CONFIG_ESP_HOSTED_SDIO_D2_GPIO=16
+ *   CONFIG_ESP_HOSTED_SDIO_D3_GPIO=17
+ *
+ * Part of ADS-B Scope — T-Display-P4.
+ */
+#pragma once
+
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include "esp_log.h"
+#include "esp_err.h"
+#include "esp_event.h"
+#include "esp_wifi.h"
+#include "esp_netif.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+
+// Time manager — must be included before event handler uses esp_sntp / NTP functions
+#include "time_manager.h"
+
+// XL9535 GPIO expander pin control (from your project)
+// These must be provided by the caller or linked from main.cpp
+extern "C" void xl9535_c6_enable(bool enable);   // drive XL9535_ESP32C6_EN
+extern "C" void xl9535_c6_wakeup(void);           // pulse XL9535_ESP32C6_WAKE_UP
+
+static const char *WIFI_TAG = "WIFI";
+
+// ─── Configuration ───────────────────────────────────────────────────────────
+
+// WiFi credentials — stored in NVS in production, hardcoded for dev
+#ifndef WIFI_SSID
+#define WIFI_SSID     ""       // set via menuconfig or NVS
+#endif
+#ifndef WIFI_PASS
+#define WIFI_PASS     ""
+#endif
+
+// NTP config lives in time_manager.h / device_settings
+
+// Event group bits
+#define WIFI_CONNECTED_BIT   BIT0
+#define WIFI_FAIL_BIT        BIT1
+
+// Max reconnect attempts before giving up (-1 = infinite)
+#define WIFI_MAX_RETRIES     10
+
+// ─── State ───────────────────────────────────────────────────────────────────
+
+static EventGroupHandle_t s_wifi_event_group = NULL;
+static int s_wifi_retry_count = 0;
+static volatile bool s_wifi_initialized = false;
+static volatile bool s_wifi_connected = false;
+static volatile bool s_wifi_paused = false;
+static esp_netif_t *s_sta_netif = NULL;
+
+// WiFi credentials (runtime configurable)
+static char s_wifi_ssid[33] = WIFI_SSID;
+static char s_wifi_pass[65] = WIFI_PASS;
+
+// ─── Event Handler ───────────────────────────────────────────────────────────
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                                int32_t event_id, void *event_data)
+{
+    if (event_base == WIFI_EVENT) {
+        switch (event_id) {
+            case WIFI_EVENT_STA_START:
+                ESP_LOGI(WIFI_TAG, "STA started, connecting...");
+                esp_wifi_connect();
+                break;
+
+            case WIFI_EVENT_STA_DISCONNECTED: {
+                s_wifi_connected = false;
+                wifi_event_sta_disconnected_t *d =
+                    (wifi_event_sta_disconnected_t *)event_data;
+                ESP_LOGW(WIFI_TAG, "Disconnected (reason=%d)", d->reason);
+
+                if (s_wifi_paused) break; // don't reconnect if intentionally paused
+
+                if (WIFI_MAX_RETRIES < 0 || s_wifi_retry_count < WIFI_MAX_RETRIES) {
+                    s_wifi_retry_count++;
+                    ESP_LOGI(WIFI_TAG, "Reconnect attempt %d/%d",
+                             s_wifi_retry_count, WIFI_MAX_RETRIES);
+                    vTaskDelay(pdMS_TO_TICKS(1000 * s_wifi_retry_count)); // backoff
+                    esp_wifi_connect();
+                } else {
+                    ESP_LOGE(WIFI_TAG, "Max retries reached");
+                    xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+                }
+                break;
+            }
+
+            case WIFI_EVENT_STA_CONNECTED:
+                ESP_LOGI(WIFI_TAG, "Associated with AP");
+                break;
+
+            default:
+                break;
+        }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(WIFI_TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        s_wifi_retry_count = 0;
+        s_wifi_connected = true;
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+
+        // Start NTP on every (re)connect — time_manager handles dedup
+        if (!esp_sntp_enabled()) {
+            time_manager_start_ntp();
+        }
+    }
+}
+
+// ─── Time Manager Integration ────────────────────────────────────────────────
+// NTP start/stop managed by time_manager.h (included at top of this file).
+
+// ─── Public API ──────────────────────────────────────────────────────────────
+
+/**
+ * Set WiFi credentials at runtime (before or after init).
+ * If called after init, takes effect on next reconnect.
+ */
+static inline void wifi_hosted_set_credentials(const char *ssid, const char *password) {
+    strncpy(s_wifi_ssid, ssid, sizeof(s_wifi_ssid) - 1);
+    s_wifi_ssid[sizeof(s_wifi_ssid) - 1] = '\0';
+    strncpy(s_wifi_pass, password, sizeof(s_wifi_pass) - 1);
+    s_wifi_pass[sizeof(s_wifi_pass) - 1] = '\0';
+}
+
+/**
+ * Initialize WiFi via ESP-Hosted.
+ * Powers on the C6, starts ESP-Hosted SDIO transport, connects to AP.
+ *
+ * Blocks until connected or max retries exceeded.
+ * Returns ESP_OK on success.
+ *
+ * Call AFTER SD card is mounted on SPI (not SDMMC).
+ */
+static inline esp_err_t wifi_hosted_init(void) {
+    if (s_wifi_initialized) {
+        ESP_LOGW(WIFI_TAG, "Already initialized");
+        return ESP_OK;
+    }
+
+    if (s_wifi_ssid[0] == '\0') {
+        ESP_LOGW(WIFI_TAG, "No SSID configured — skipping WiFi init");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(WIFI_TAG, "=== Initializing WiFi (ESP-Hosted over SDIO) ===");
+
+    // ── 1. Power on the C6 ──
+    ESP_LOGI(WIFI_TAG, "Enabling ESP32-C6...");
+    xl9535_c6_enable(true);
+    vTaskDelay(pdMS_TO_TICKS(100));  // C6 boot time
+
+    // ── 2. Initialize networking stack ──
+    ESP_ERROR_CHECK(esp_netif_init());
+    // Note: esp_event_loop_create_default() may already be called in main
+    // — ignore ESP_ERR_INVALID_STATE if so
+    esp_err_t err = esp_event_loop_create_default();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(WIFI_TAG, "Event loop create failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    s_sta_netif = esp_netif_create_default_wifi_sta();
+
+    // ── 3. Initialize WiFi (ESP-Hosted transport is configured via sdkconfig) ──
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    // ── 4. Register event handlers ──
+    s_wifi_event_group = xEventGroupCreate();
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+
+    // ── 5. Configure and start ──
+    wifi_config_t wifi_config = {};
+    strncpy((char *)wifi_config.sta.ssid, s_wifi_ssid, sizeof(wifi_config.sta.ssid));
+    strncpy((char *)wifi_config.sta.password, s_wifi_pass, sizeof(wifi_config.sta.password));
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    wifi_config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    s_wifi_initialized = true;
+    s_wifi_paused = false;
+    ESP_LOGI(WIFI_TAG, "WiFi started — connecting in background");
+
+    // Non-blocking: connection happens asynchronously via event handler.
+    // IP_EVENT → starts NTP. No 30s boot delay.
+    // Caller can poll wifi_hosted_is_connected() if needed.
+    return ESP_OK;
+}
+
+/**
+ * Pause WiFi — graceful teardown for SD SDMMC mode swap.
+ * Disconnects, stops WiFi, powers down C6.
+ * Call wifi_hosted_resume() to restart.
+ */
+extern "C" void wifi_hosted_pause(void) {
+    if (!s_wifi_initialized || s_wifi_paused) return;
+
+    ESP_LOGI(WIFI_TAG, "Pausing WiFi...");
+    s_wifi_paused = true;
+
+    time_manager_stop_ntp();
+    esp_wifi_disconnect();
+    esp_wifi_stop();
+
+    // Power down C6 to fully release SDIO bus
+    xl9535_c6_enable(false);
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    s_wifi_connected = false;
+    ESP_LOGI(WIFI_TAG, "WiFi paused, C6 powered down");
+}
+
+/**
+ * Resume WiFi after a pause.
+ * Powers on C6 and reconnects.
+ */
+extern "C" void wifi_hosted_resume(void) {
+    if (!s_wifi_initialized || !s_wifi_paused) return;
+
+    ESP_LOGI(WIFI_TAG, "Resuming WiFi...");
+
+    // Power on C6
+    xl9535_c6_enable(true);
+    vTaskDelay(pdMS_TO_TICKS(200));  // C6 boot time
+
+    s_wifi_paused = false;
+    s_wifi_retry_count = 0;
+
+    esp_wifi_start();  // will trigger STA_START → connect
+    ESP_LOGI(WIFI_TAG, "WiFi resuming, reconnecting...");
+}
+
+/**
+ * Full WiFi shutdown — deinit everything.
+ * After this, wifi_hosted_init() must be called again.
+ */
+static inline void wifi_hosted_deinit(void) {
+    if (!s_wifi_initialized) return;
+
+    ESP_LOGI(WIFI_TAG, "Deinitializing WiFi...");
+    s_wifi_paused = true; // prevent reconnect attempts
+
+    time_manager_stop_ntp();
+
+    esp_wifi_disconnect();
+    esp_wifi_stop();
+    esp_wifi_deinit();
+
+    if (s_sta_netif) {
+        esp_netif_destroy_default_wifi(s_sta_netif);
+        s_sta_netif = NULL;
+    }
+
+    xl9535_c6_enable(false);
+
+    if (s_wifi_event_group) {
+        vEventGroupDelete(s_wifi_event_group);
+        s_wifi_event_group = NULL;
+    }
+
+    s_wifi_initialized = false;
+    s_wifi_connected = false;
+    s_wifi_paused = false;
+    ESP_LOGI(WIFI_TAG, "WiFi deinitialized");
+}
+
+/**
+ * Check if WiFi is currently connected.
+ */
+extern "C" bool wifi_hosted_is_active(void) {
+    return s_wifi_initialized && !s_wifi_paused;
+}
+
+static inline bool wifi_hosted_is_connected(void) {
+    return s_wifi_connected;
+}
+
+/**
+ * Get the current IP address as a string.
+ * Returns "0.0.0.0" if not connected.
+ */
+static inline const char *wifi_hosted_get_ip(void) {
+    static char ip_str[16] = "0.0.0.0";
+    if (s_sta_netif && s_wifi_connected) {
+        esp_netif_ip_info_t ip_info;
+        if (esp_netif_get_ip_info(s_sta_netif, &ip_info) == ESP_OK) {
+            snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&ip_info.ip));
+        }
+    }
+    return ip_str;
+}
