@@ -49,7 +49,7 @@ A self-contained HTML file that connects to the receiver over WebSerial and plot
 
 Features:
 - Dark radar-scope aesthetic with Leaflet/CartoDB dark tiles
-- Aircraft icons with correct heading rotation and position trails
+- Aircraft icons with correct heading rtion and position trails
 - Range rings at 10, 25, and 50 nm
 - GNSS receiver status and SD card logging status display
 - Aircraft detail panel on selection (click icon or label, multi-select with Cmd/Ctrl+click)
@@ -60,7 +60,7 @@ Features:
 - Meshy panel with live message feed, node map overlay, position tracking, text/join/position/telemetry filters, PKI DM detection with "DM" badge, dedup with multi-reception expansion, and shift+click range selection for node analysis
 - SD card file browser over serial (list, download, replay, delete)
 - CSV replay with timeline scrubber and variable speed (0.25×–32×), supporting both ADS-B and Meshy CSV files simultaneously
-- OTA firmware flashing via esptool-js (WebSerial)
+- Firmware flashing via esptool-js (WebSerial)
 - Firmware version checking against `latest.version.json` with update badge
 - Google Analytics integration (G-T71ZHWG166) loaded at end of body for offline resilience
 - Auto-reconnect after flash
