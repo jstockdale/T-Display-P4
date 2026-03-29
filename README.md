@@ -15,7 +15,7 @@
 
 This project turns a LILYGO T-Display-P4 development board into a portable ADS-B receiver, Meshtastic-compatible mesh radio, and (yes, really) an mp3 player 🎵. An RTL-SDR dongle connected via USB Host receives 1090 MHz transponder signals, which are decoded in real-time on the ESP32-P4. The onboard SX1262 LoRa radio runs a Meshtastic-compatible mesh network for off-grid messaging. Decoded aircraft and mesh messages are displayed on the built-in touchscreen, logged to SD card, and can be viewed live via the companion web app, ADS-B Scope.
 
-![Screenshot of ADS-B Scope](adsb_scope.png)
+![Screenshots of on device interface](adsb_screenshots.png)
 
 ### What works today
 
@@ -44,6 +44,8 @@ This project turns a LILYGO T-Display-P4 development board into a portable ADS-B
 ## ADS-B Scope
 
 A self-contained HTML file that connects to the receiver over WebSerial and plots aircraft on a live map.
+
+![Screenshot of ADS-B Scope](adsb_scope.png)
 
 **Live version:** [adsb-scope.offx1.com](https://adsb-scope.offx1.com)
 
