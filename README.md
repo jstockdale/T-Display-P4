@@ -2,7 +2,7 @@
  * @Description: ADS-B Receiver on LILYGO T-Display-P4
  * @Author: John Stockdale / Off by One (fork of LILYGO_L original)
  * @Date: 2025-06-13 15:12:02
- * @LastEditTime: 2026-03-29
+ * @LastEditTime: 2026-04-09
  * @License: GPL 3.0
 -->
 <h1 align="center">ADS-B Scope – T-Display-P4</h1>
@@ -21,27 +21,33 @@ This project turns a LILYGO T-Display-P4 development board into a portable ADS-B
 
 - **On-device ADS-B display** – touchscreen UI with aircraft table (ICAO, callsign, altitude, speed, heading, distance, message count), stats panel (message rate, GPS, nearest aircraft, UTC time), draggable divider between panels, 4-way screen rotation toggle (persists across app visits)
 - **On-device radar scope** – canvas-drawn aircraft positions with range rings, historical trails with per-segment altitude/speed coloring, pan/zoom, aircraft selection, and helicopter silhouette icons for rotorcraft
-- **Aircraft database** – 587K-record database on SD card (`aircraft.db`, built from OpenSky data) with PSRAM-cached lookups. Enriches aircraft with registration, type, manufacturer, model, owner, operator, and aircraft class (landplane/helicopter/amphibian/gyrocopter/tilt-rotor)
+- **Aircraft database** – 587K-record database on SD card (`aircraft.db`, built from OpenSky data) with PSRAM-cached lookups. Enriches aircraft with registration, type, manufacturer, model, owner, operator, and aircraft class (landplane/helicopter/amphibian/gyrocopter/tilt-rotor). Downloadable via CDN from the webapp with CRC32-verified serial transfer.
 - **Helicopter icons** – aircraft class from the database drives distinct map icons: top-down rotorcraft silhouette (body + tail boom + rotor blades) on both the webapp and LVGL scope, rotated to heading
 - **Unified firmware** – single binary supports both HI8561 LCD (540×1168) and RM69A10 AMOLED (568×1232) display variants via runtime I2C probe detection at boot
 - **Real-time ADS-B reception** – 15–30 messages/second, 12–30+ simultaneous aircraft tracked
+- **Adaptive gain** – automatic RTL-SDR tuner gain control with two-phase algorithm: fast convergence (P1) and steady-state tracking (P2). Signal quality gating prevents nighttime death spirals. Manual override via webapp gain popover or serial command. Gain state (steady/converging/manual) displayed in webapp.
 - **~30 nm range** from Oakland, CA with a 7" telescopic antenna on RTL-SDR
-- **USB hot-plug** – RTL-SDR can be connected/disconnected at any time; firmware detects disconnect (10 consecutive read errors), frees stuck USB transfer, and re-initializes cleanly on reconnect
+- **USB hot-plug** – RTL-SDR can be connected/disconnected at any time; firmware detects disconnect (10 consecutive read errors), frees stuck USB transfer, and re-initializes cleanly on reconnect. EP0 STALL recovery handles flaky USB connections.
 - **Three-state RTL-SDR status** – status bar and CIT page distinguish between disconnected (grey), connected (green), and error (red) states
 - **SD card CSV logging** – UTC timestamps, raw Mode-S hex, decoded fields (ICAO, callsign, altitude, speed, heading, vertical rate, position, squawk), receiver GPS metadata (sats, HDOP). PSRAM-buffered writes with periodic flush for clean filesystem state.
+- **AXI DMA fence** – SDHOST IDMAC (ESP-Hosted WiFi SDIO) and GDMA-AXI (GP-SPI SD card) share the AXI interconnect; a silicon bus arbitration bug can corrupt FAT structures. All SD file I/O is serialized through `sd_io_take()/sd_io_give()` which acquires the ESP-Hosted SDIO DMA lock, preventing concurrent DMA on the shared bus.
 - **SD card hot-remove recovery** – consecutive flush failure counter detects card removal, unmounts dead filesystem, and retries remount every 30 seconds. Card reinsertion resumes logging automatically with fresh log files.
 - **USB Mass Storage mode** – on-device UI and serial command (`msc`) to expose the SD card to a connected computer as a USB drive. Pauses ADS-B and Meshy logging, shows transfer stats, and resumes normal operation on disconnect.
+- **Serial file transfer** – `recv` command implements CRC32-verified chunked file transfer over USB Serial JTAG. Base64-encoded, 32KB chunks with resume support. CHUNK v1.1 header enables instant truncation detection. `verify_crc32` command provides incremental file verification with progress reporting.
+- **OTA firmware update** – `ota_updater.c` downloads firmware from HTTP, streams to SD, verifies SHA256, flashes to OTA partition. Rollback detection with failure marker on SD. Can be triggered via MQTT.
+- **MQTT cloud telemetry** – `mqtt_feeder.c` publishes aircraft positions, receiver stats, and gain state over MQTT for remote monitoring. Supports OTA update commands.
 - **Meshy mesh networking** – compatible TX/RX on the SX1262 LoRa radio with channel encryption, PKI direct message decryption, node discovery, position/telemetry display, MQTT gateway forwarding, TX echo in message history, packet ID dedup, and configurable hop limit (1–7, default 5).
 - **Music player** – SD card MP3 playback via the ES8311 DAC with ID3 tag parsing, cover art display, 512 KB PSRAM readahead buffer, stereo-to-mono downmix, and gapless track scanning. Because every SIGINT platform needs a jukebox 🎶🐱
-- **WiFi via ESP-Hosted** – ESP32-C6 coprocessor provides WiFi 6 connectivity over SDMMC Slot 1. SD card runs on SPI3 to avoid the SDMMC DMA conflict (Espressif Issue #17889). NTP time sync when connected.
-- **Time manager** – coordinates GPS, NTP, and RTC time sources. GPS is primary (650ms serial delay compensation), NTP provides initial time before GPS fix, RTC is write-only backup. System clock stays in `[boot+elapsed]` format until a verified source provides time.
+- **WiFi via ESP-Hosted** – ESP32-C6 coprocessor provides WiFi 6 connectivity over SDMMC Slot 1. SD card runs on SPI3 to avoid the SDMMC DMA conflict (Espressif Issue #17889). NTP time sync when connected. Graceful fallback with goto-based error unwinding if C6 is unresponsive — system continues without WiFi.
+- **Time manager** – coordinates GPS, NTP, and RTC time sources with priority and accuracy tracking. GPS is primary (650ms serial delay compensation), NTP provides initial time before GPS fix, RTC seeds POSIX clock at boot for TLS cert validation. System clock stays in `[boot+elapsed]` format until a verified source provides time.
 - **GPS timezone with DST** – L76K GNSS (5 Hz) sets the system clock; timezone determined from GPS coordinates using a compiled 0.1° grid covering 61 regions with 12 DST rules; syncs the PCF8563 RTC with local time
 - **GPS position validation** – direction string check rejects corrupt NMEA data; jump rejection (>2°) with 3-fix forgiveness catches sign flips while allowing real movement during GPS loss
 - **Screenshots** – capture device screen as PNG to SD card via serial command or webapp button. Atomic framebuffer snapshot under LVGL lock (~1ms copy, ~1.3s encode). Base64 transfer over serial for download via webapp.
 - **Persistent settings** – all device and radio settings stored in NVS with version-migrated blob, validated on load, deferred writes from LVGL via internal-RAM helper task (PSRAM stack safe)
-- **Serial console** – interactive command mode (Ctrl+C) with file management, WiFi/NTP config, USB MSC control, screenshot capture, status, version query; ADS-B output buffered and replayed on return to log mode
-- **ADS-B Scope** – WebSerial-based live map viewer with firmware flashing, CSV replay, file browser, Meshy message panel, aircraft database detail cards, helicopter icons ([adsb-scope.offx1.com](https://adsb-scope.offx1.com))
-- **SD card reliability** – power-cycled on boot via XL9535 GPIO to reset card state machine after hard resets; boot counter and device registry in `/sdcard/adsb_scope.cfg`
+- **Serial console** – interactive command mode (Ctrl+C) with file management, WiFi/NTP config, USB MSC control, screenshot capture, file transfer (`recv`, `verify_crc32`), gain control, MQTT config, status, version query; ADS-B output buffered and replayed on return to log mode. Console task pinned to core 1 with priority boost during file transfers to maintain full ADS-B throughput on core 0.
+- **ADS-B Scope** – WebSerial-based live map viewer with firmware flashing, CSV replay, file browser, Meshy message panel, aircraft database detail cards, helicopter icons, 3D aircraft view, gain control popover, MQTT integration ([adsb-scope.offx1.com](https://adsb-scope.offx1.com))
+- **SD card reliability** – power-cycled on boot via XL9535 GPIO to reset card state machine after hard resets; AXI DMA fence prevents WiFi SDIO bus contention; boot counter and device registry in `/sdcard/adsb_scope.cfg`
+- **Task priority architecture** – 6-tier FreeRTOS priority scheme: audio DMA (6), serial transfer boost (5), USB host/RTL-SDR (4), GPS/console (3), periodic tasks (2), LVGL rendering (1). Console pinned to core 1 so file transfers don't preempt ADS-B decoding on core 0.
 - **Status bar** – dynamic icons for GPS (sat count + fix status), ADS-B (aircraft count + connection state), SD card (mounted/logging/USB), and battery level with automatic spacing based on rendered text width
 
 ### Known limitations
@@ -61,11 +67,15 @@ A self-contained HTML file that connects to the receiver over WebSerial and plot
 Features:
 - Dark radar-scope aesthetic with Leaflet/CartoDB dark tiles
 - Aircraft icons with correct heading rotation and position trails (unlimited length)
+- Three.js 3D aircraft view with labeled markers, altitude-scaled positions, and smooth camera controls
 - Helicopter silhouette icons for rotorcraft (from aircraft database class field)
 - Aircraft detail cards with registration, type, manufacturer, model, owner, operator from aircraft database
+- Aircraft database CDN download with CRC32-verified serial upload and on-device verification
 - Range rings at 10, 25, and 50 nm
 - Receiver position trail (dashed green polyline showing movement history)
 - GNSS receiver status, device UTC clock (live/stale indicator), and SD card logging status (separate ADS-B and Meshy indicators)
+- Adaptive gain control popover: auto/manual mode toggle, real-time gain slider, dual-range error band editor with presets, gain state display (steady/converging/manual) with color-coded LED
+- MQTT integration for remote data streaming (aircraft positions, stats, gain state)
 - Aircraft detail panel on selection (click icon or label, multi-select with Cmd/Ctrl+click)
 - Sortable aircraft table with drag-resizable panel, message count column, and keyboard navigation (arrow keys, shift-select, escape)
 - Detail card bottom position tracks panel height dynamically
@@ -115,6 +125,10 @@ ntp               show/set NTP server and poll interval
 time              show time source status (GPS, NTP, RTC)
 screenshot        save device screen as PNG to SD card
 screenshot send   send last screenshot as base64 over serial
+recv <path> <sz>  receive file over serial (base64, CRC32-verified, resume)
+verify_crc32 <path> <hex>  verify file CRC32 on SD card
+gain              show/set RTL-SDR tuner gain (auto, manual, value)
+mqtt              MQTT config (on, off, status, server, port, topic)
 mount             mount SD card
 unmount           safely unmount SD card
 reboot            software reset
@@ -172,7 +186,7 @@ The firmware includes an SD card MP3 player using the onboard ES8311 DAC and NS4
 
 ### ADS-B log
 
-Logged to `/sdcard/adsb_YYYY-MM-DDTHHMMSSZ.csv` (or `adsb_bootNNNNNNNN.csv` before GPS fix, where the number is a persistent boot counter from `/sdcard/adsb_scope.cfg`):
+Logged to `/sdcard/logs/adsb_YYYY-MM-DDTHHMMSSZ.csv` (or `adsb_bootNNNNNNNN.csv` before GPS fix, where the number is a persistent boot counter from `/sdcard/adsb_scope.cfg`):
 
 ```
 timestamp_utc,raw_msg,icao,callsign,altitude_ft,speed_kt,heading_deg,vrate_fpm,lat,lon,squawk,rx_lat,rx_lon,range_km,bearing_deg,rx_sats,rx_hdop
@@ -183,18 +197,21 @@ Timestamps are ISO-8601 UTC with millisecond resolution. Raw Mode-S hex is the s
 
 ### Meshy log
 
-Logged to `/sdcard/mesh_YYYY-MM-DDTHHMMSSZ.csv` with timestamps, RSSI, SNR, hop count, port type, decoded payload, position, telemetry, and PKI flag.
+Logged to `/sdcard/logs/mesh_YYYY-MM-DDTHHMMSSZ.csv` with timestamps, RSSI, SNR, hop count, port type, decoded payload, position, telemetry, and PKI flag.
 
 ## SD Card Layout
 
 ```
 /sdcard/
 ├── adsb_scope.cfg          # Boot counter + device registry (auto-managed)
-├── adsb_*.csv              # ADS-B flight logs
-├── mesh_*.csv              # Meshtastic message logs
-├── screenshot_*.png        # Device screenshots
 ├── data/
 │   └── aircraft.db         # Aircraft database (ADSBDB02 format, ~27 MB)
+├── logs/
+│   ├── adsb_*.csv          # ADS-B flight logs
+│   └── mesh_*.csv          # Meshtastic message logs
+├── firmware/
+│   └── ota.bin             # OTA firmware update (downloaded, SHA256-verified)
+├── screenshot_*.png        # Device screenshots
 └── music/
     ├── README.md           # Music player documentation
     └── *.mp3               # MP3 files with ID3 tags and embedded cover art
@@ -231,27 +248,33 @@ All ADS-B firmware source is in `main/examples/lvgl_9_ui/`:
 
 | File | Description |
 |---|---|
-| `main.cpp` | Boot, peripheral init, GPS task (with position validation), LVGL UI, task orchestration, screen detection, USB pre-alloc, settings persistence, WiFi init, time manager, MSC/screenshot wrappers, memory checkpoints |
-| `class_driver.c / .h` | USB host, RTL-SDR reader task, aircraft table, SD logging with hot-remove recovery, aircraft DB ICAO log emission, stats with error state |
-| `mode-s.c / .h` | Mode S decoder (from dump1090/libmodes) |
-| `serial_console.c / .h` | Interactive console with command mode, PSRAM replay buffer, shared `log_format_timestamp`, WiFi/NTP/MSC/screenshot commands |
+| `main.cpp` | Boot, peripheral init, GPS task (with position validation), LVGL UI, task orchestration (6-tier priority scheme), screen detection, USB pre-alloc, settings persistence, WiFi init, time manager, MSC/screenshot wrappers, memory checkpoints, AXI DMA fence (`sd_io_take/give`) |
+| `class_driver.c / .h` | USB host, RTL-SDR reader task, aircraft table, adaptive gain algorithm (P1/P2 with signal quality gating), SD logging with hot-remove recovery, aircraft DB ICAO log emission, stats with error/gain state |
+| `mode-s.c / .h` | Mode S decoder (from dump1090/libmodes) with preamble/CRC/signal statistics for adaptive gain feedback |
+| `serial_console.c` | Interactive console with command mode, PSRAM replay buffer, shared `log_format_timestamp`, WiFi/NTP/MSC/screenshot commands, `recv` file transfer (CHUNK v1.1 protocol), `verify_crc32` with progress, gain control, MQTT config. Task pinned to core 1 with priority boost during transfers. |
 | `lvgl_ui.cpp / .h` | LVGL UI: ADS-B app, radar scope (with helicopter icons), Meshy app (with preview bar + haptic keyboard), music player, settings panels (WiFi, USB MSC), status bar, CIT tests, rotation persistence |
-| `esp_libusb.c / .h` | USB-to-librtlsdr shim, idempotent init, early DMA pre-alloc |
-| `librtlsdr.c` | RTL-SDR driver (adapted from osmocom) |
-| `device_settings.h` | Settings struct (1024-byte NVS blob), version-migrated load/save, validation, deferred NVS write via internal-RAM task |
+| `esp_libusb.c / .h` | USB-to-librtlsdr shim, idempotent init, early DMA pre-alloc, EP0 STALL recovery |
+| `librtlsdr.c` | RTL-SDR driver (adapted from osmocom) with dongle identification, EEPROM read, bias tee support |
+| `tuner_r82xx.c` | R820T/R828D tuner driver with Blog V4/V4L band switching and bias tee GPIO control |
+| `device_settings.h` | Settings struct (1024-byte NVS blob), version-migrated load/save, validation, deferred NVS write via internal-RAM task. Includes gain, MQTT, and OTA settings. |
 | `meshtastic_task.cpp / .h` | Meshy FreeRTOS tasks: SX1262 RX polling, TX queue with echo, CSMA/CA, node table, message history, SD CSV logging with hot-remove recovery |
 | `meshtastic_radio.h` | `MeshSession` class: channel encrypt/decrypt, packet build, PKI decrypt, hop limit, ok_to_mqtt |
 | `meshtastic_pb.h` | Meshtastic protobuf encoder/decoder: Data, User, Position, Telemetry, bitfield (ok_to_mqtt) |
 | `meshtastic_crypto.h` | AES-CTR channel encryption, X25519 ECDH, XChaCha20-Poly1305 PKI, SHA-256 KDF (mbedtls) |
 | `meshy_channels.h` | Channel store (NVS), PSK management, node identity, PKI keypair generation/persistence |
-| `aircraft_db.h` | Aircraft database lookup module (header-only, PSRAM cache + SD bucket file, ADSBDB02 versioned format) |
-| `music_player.cpp / .h` | MP3 player: minimp3 decode, ES8311 DAC output, stereo-to-mono downmix, ID3 parsing, cover art, 512 KB PSRAM readahead |
+| `aircraft_db.h` | Aircraft database lookup module (header-only, PSRAM cache + SD bucket file, ADSBDB02 versioned format). All SD access wrapped in `sd_io_take/give`. |
+| `music_player.cpp / .h` | MP3 player: minimp3 decode, ES8311 DAC output, stereo-to-mono downmix, ID3 parsing, cover art, 512 KB PSRAM readahead. All SD access wrapped in `sd_io_take/give`. |
+| `mqtt_feeder.c / .h` | MQTT cloud telemetry: publishes aircraft positions, receiver stats, gain state. Supports OTA trigger commands. |
+| `ota_updater.c / .h` | OTA firmware update: HTTP download to SD, SHA256 verification, dual OTA partition flash, rollback detection with failure marker. All SD access wrapped in `sd_io_take/give`. |
+| `sd_logger.c / .h` | SD card logging module: flush coordination, dirty flag tracking, bus failure detection, hot-remove recovery. DMA fence handled automatically via `sd_io_take`. |
+| `sd_http_server.c` | HTTP server for SD card file serving over WiFi. Directory listing and file download with `sd_io_take/give`. |
+| `sd_forensics.py` | SD card forensics tool: FAT analysis, cluster chain validation, raw sector dump |
 | `emoji_draw.h` | LVGL canvas text renderer with manual word-wrap and clip optimization |
 | `screenshot.h` | Atomic framebuffer snapshot to PNG on SD card, base64 serial transfer |
 | `sd_msc_mode.h` | USB Mass Storage mode: SPI→SDMMC mode switch, TinyUSB MSC, transfer stats, safe enter/exit sequencing |
 | `sd_config.h` | SD card boot counter and device registry (`/sdcard/adsb_scope.cfg`) |
-| `wifi_hosted.h` | WiFi via ESP-Hosted (C6 over SDMMC Slot 1), credential management, pause/resume |
-| `time_manager.h` | Time source coordinator: GPS primary, NTP secondary, RTC write-only backup |
+| `wifi_hosted.h` | WiFi via ESP-Hosted (C6 over SDMMC Slot 1), credential management, pause/resume, graceful fallback with goto-based error unwinding if C6 is unresponsive |
+| `time_manager.h` | Time source coordinator: GPS primary, NTP secondary, RTC boot seed for TLS. Priority and accuracy tracking per source. |
 | `tz_lookup.c / .h` | GPS coordinate → timezone offset with DST |
 | `timezone_data.h` | Generated 0.1° grid (61 regions, 12 DST rules) |
 | `generate_tz_data.py` | Timezone data generator script |
@@ -259,7 +282,7 @@ All ADS-B firmware source is in `main/examples/lvgl_9_ui/`:
 | `prepare_music.py` | Prepares MP3 files: TLEN duration tag, Unicode normalization, album art resize |
 | `screen_detect.h` | Runtime screen type detection (HI8561 vs RM69A10) |
 | `t_display_p4_driver.cpp / .h` | Runtime MIPI DSI panel creation for both display variants |
-| `adsb_scope.htm` | ADS-B Scope companion web app (single-file HTML, v1.0.6) |
+| `adsb_scope.htm` | ADS-B Scope companion web app (single-file HTML, v1.0.8) |
 
 ## Architecture
 
@@ -267,8 +290,9 @@ All ADS-B firmware source is in `main/examples/lvgl_9_ui/`:
 RTL-SDR (1090 MHz, 2 MS/s IQ)
     │ USB bulk transfer (17KB DMA buffer, pre-allocated at boot)
     ▼
-ESP32-P4 USB Host Driver (class_driver.c)
+ESP32-P4 USB Host Driver (class_driver.c) [Priority 4, Core 0]
     │ magnitude → Mode-S demodulator (mode-s.c)
+    │ Adaptive gain: signal stats → P1 (fast) / P2 (steady-state) algorithm
     ▼
 Aircraft Table (256 slots, 60s expiry)
     │
@@ -277,11 +301,18 @@ Aircraft Table (256 slots, 60s expiry)
     ├──→ On-device LVGL display (lvgl_ui.cpp, aircraft table + stats panel)
     ├──→ On-device radar scope (lvgl_ui.cpp, canvas with helicopter icons)
     ├──→ Serial output (serial_console.c, buffered during CMD mode)
-    └──→ SD card CSV log (PSRAM buffer, periodic flush, hot-remove recovery)
+    ├──→ SD card CSV log (PSRAM buffer, periodic flush, hot-remove recovery)
+    └──→ MQTT telemetry (mqtt_feeder.c, aircraft positions + stats + gain)
+
+AXI DMA Fence (sd_io_take / sd_io_give in main.cpp)
+    │ Serializes ALL SD card file I/O with ESP-Hosted SDIO DMA lock
+    │ Prevents silicon-level AXI bus arbitration bug (SDHOST IDMAC vs GDMA-AXI)
+    └──→ Every SD caller (class_driver, meshtastic, music, HTTP, OTA, aircraft_db)
 
 Aircraft Database (aircraft_db.h)
     │ /sdcard/data/aircraft.db (ADSBDB02, 65K buckets, 587K records)
     │ Background loader → 512KB PSRAM header → 512-entry cache
+    │ CDN download via webapp → serial transfer (recv) → CRC32 verify
     └──→ Lookup by ICAO24 → reg, typecode, mfr, model, owner, op, class
 
 SX1262 LoRa Radio (913.125 MHz MediumFast default)
@@ -314,12 +345,18 @@ L76K GPS (UART, 5 Hz NMEA)
     └──→ PCF8563 RTC (local time, every 60s, write-only)
 
 ESP32-C6 Coprocessor (WiFi 6 via ESP-Hosted, SDMMC Slot 1)
-    │
-    └──→ NTP sync → Time manager (secondary source)
+    │ Graceful fallback if C6 unresponsive — system continues without WiFi
+    ├──→ NTP sync → Time manager (secondary source)
+    └──→ MQTT → mqtt_feeder.c (cloud telemetry, OTA commands)
 
 Time Manager (time_manager.h)
     │ Coordinates GPS, NTP, RTC — single settimeofday authority
+    │ RTC seeds POSIX clock at boot for TLS cert validation
     └──→ System clock (stays in [boot+elapsed] until verified source)
+
+OTA Updater (ota_updater.c)
+    │ HTTP download → SD card → SHA256 verify → flash OTA partition
+    └──→ Rollback detection with failure marker on SD
 
 USB Mass Storage (sd_msc_mode.h)
     │ Stop RTL-SDR → close logs → unmount SPI → remount SDMMC → TinyUSB MSC
@@ -329,18 +366,26 @@ SD Card Recovery (class_driver.c, meshtastic_task.cpp)
     │ 5 consecutive flush failures → unmount → retry remount every 30s
     └──→ Card reinsertion resumes logging with fresh files
 
+Task Priority Architecture (6 tiers, dual-core)
+    │ Core 0: USB host (4) + class_driver (4) — ADS-B data path
+    │ Core 1: console (3, boosted to 5 during recv) — serial + file transfer
+    │ Floating: GPS (3), speaker (3), periodic tasks (2), LVGL (1)
+    └──→ iis_tx (6) — audio DMA, highest priority, usually suspended
+
 Runtime Screen Detection (screen_detect.h)
     │ I2C probe: GT9895 (0x5D) → AMOLED, else → LCD
     ▼
 Screen_Init_Runtime (t_display_p4_driver.cpp)
     │ MIPI DSI panel creation with variant-specific timing
     ▼
-LVGL Display (g_screen_width × g_screen_height)
+LVGL Display (g_screen_width × g_screen_height) [Priority 1]
 
-Serial Console (serial_console.c)
+Serial Console (serial_console.c) [Priority 3, Core 1]
     │
     ├──→ LOG mode: streaming ADS-B/GNSS output
-    ├──→ CMD mode: file management, WiFi/NTP, MSC, screenshot, status
+    ├──→ CMD mode: file management, WiFi/NTP, MSC, screenshot, gain, MQTT
+    ├──→ recv: CRC32-verified file transfer (CHUNK v1.1, priority 5 during xfer)
+    ├──→ verify_crc32: incremental file CRC32 with progress reporting
     └──→ Replay buffer: 500 lines in PSRAM, flushed on return to LOG
 ```
 
@@ -464,6 +509,8 @@ cd build && esptool.py --chip esp32p4 merge_bin -o ../release.bin \
 ### Configuration Notes
 
 - `CONFIG_HEAP_POISONING_LIGHT=y` – enabled for heap corruption debugging
+- `CONFIG_FREERTOS_HZ=1000` – 1ms tick resolution (was 100 Hz / 10ms). Required for responsive spin-when-active strategy in serial recv.
+- `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG_RX_BUF_SIZE=16384` – 16 KB USB Serial JTAG RX ring buffer. Sized to survive 14ms task preemption gaps at USB bulk transfer speeds.
 - ESP-Hosted enabled via `wifi_hosted.h` — C6 connects over SDMMC Slot 1, SD card uses SPI3
 - `CPP_BUS_DRIVER_LOG_LEVEL_DEBUG` is commented out in `config.h` to suppress raw NMEA dumps
 - `sdkconfig` retains `CONFIG_SCREEN_TYPE_HI8561=y` for compile-time header constants; runtime detection overrides all display-dependent behavior
@@ -480,9 +527,18 @@ cd build && esptool.py --chip esp32p4 merge_bin -o ../release.bin \
 8. **PKI DM field testing** – verify XChaCha20-Poly1305 with real Meshtastic DMs from other devices
 9. **Meshy rebroadcast** – implement relay behavior for Router/ClientMute roles
 10. **Clock sync indicators** – on-device display of GPS-synced vs NTP-synced status
+11. **Multi-chunk recv sessions** – stream chunks without returning to command mode between each; would cut ~10 minutes overhead from 27MB transfers
+12. **Webapp retry on RECV_ERR** – currently gives up on first error; should retry the failed chunk N times before declaring failure
+13. **Webapp CHUNK v1.1 header** – send `CHUNK <size>` before base64 data (firmware is ready, backward compatible)
+14. **Strip recv debug diagnostics** – remove `[recv] phase1/phase2` diagnostic output once transfer is proven reliable long-term
+15. **mqtt_feeder forward declaration warning** – minor compiler warning to clean up
+16. **Monitor SD card health post-DMA-fence** – long-term validation that AXI bus contention fix eliminates FAT corruption
+33. ~~AXI DMA corruption~~ – fixed: DMA fence in `sd_io_take/give` serializes GP-SPI SD card with ESP-Hosted WiFi SDIO DMA on shared AXI interconnect
+34. ~~Serial file transfer~~ – done: `recv` command with CRC32-verified chunked transfer, resume, CHUNK v1.1 truncation detection, `verify_crc32` with progress
+35. ~~Task priority inversion~~ – fixed: usb_host_lib was priority 2 below class_driver at 3; restructured to 6-tier scheme with USB data path at priority 4
 14. ~~Restore WiFi~~ – done: ESP-Hosted over SDMMC Slot 1, SD card moved to SPI3 to avoid DMA conflict
 15. ~~On-device radar scope~~ – done: canvas-drawn aircraft with range rings, trails, pan/zoom, helicopter icons, per-segment coloring
-16. ~~Seed POSIX clock from RTC at boot~~ – resolved differently: system stays in `[boot+elapsed]` until GPS or NTP provides verified time; RTC is write-only
+16. ~~Seed POSIX clock from RTC at boot~~ – resolved differently: system stays in `[boot+elapsed]` until GPS or NTP provides verified time; RTC seeds POSIX for TLS
 17. ~~SD card graceful handling~~ – done: consecutive flush failure counter → unmount → periodic remount retry; card reinsertion resumes logging
 18. ~~Fix screen~~ – fixed: root cause was `esp_lcd_panel_reset()` called after `Screen_Init()` wiping DSI lane config
 19. ~~Fix USB DMA heap corruption~~ – fixed: early pre-alloc of 17KB bulk transfer buffer before heap fragmentation
