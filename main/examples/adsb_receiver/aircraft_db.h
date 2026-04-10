@@ -36,6 +36,10 @@
 extern "C" {
 #endif
 
+// SD I/O mutex + DMA fence — protects SPI bus from AXI contention
+extern bool sd_io_take(uint32_t timeout_ms);
+extern void sd_io_give(void);
+
 // ─── Result struct ──────────────────────────────────────────────────────────
 
 typedef struct {
@@ -184,24 +188,20 @@ static bool acdb_sd_lookup(uint32_t icao, aircraft_db_entry_t *out) {
     acdb_bucket_t *bkt = &s_acdb_header[bucket_id];
     if (bkt->count == 0) return false;
 
-    FILE *f = fopen(ACDB_PATH, "rb");
-    if (!f) return false;
-
-    // Read the entire bucket into a stack/PSRAM buffer
-    // Seek to bucket offset and read
-    fseek(f, bkt->offset, SEEK_SET);
-
-    // Calculate how much data to read — we don't know exact size,
-    // but can estimate from count. Read generously (capped).
-    // Average ~48 bytes/record, so count*64 is safe upper bound.
     int read_size = bkt->count * 64;
     if (read_size > ACDB_BUCKET_BUF) read_size = ACDB_BUCKET_BUF;
 
     uint8_t *buf = (uint8_t *)heap_caps_malloc(read_size, MALLOC_CAP_SPIRAM);
-    if (!buf) { fclose(f); return false; }
+    if (!buf) return false;
 
+    // Hold sd_io only for the SD access — parse from PSRAM after release
+    if (!sd_io_take(200)) { heap_caps_free(buf); return false; }
+    FILE *f = fopen(ACDB_PATH, "rb");
+    if (!f) { sd_io_give(); heap_caps_free(buf); return false; }
+    fseek(f, bkt->offset, SEEK_SET);
     int got = fread(buf, 1, read_size, f);
     fclose(f);
+    sd_io_give();
 
     // Linear scan for matching icao_lo
     // Record format v2: icao_lo(1) + ac_class(1) + 6 null-terminated strings
@@ -327,9 +327,20 @@ static void acdb_loader_task(void *arg) {
         return;
     }
 
-    // Read header from SD
+    // Read header from SD — hold sd_io only for the file access
+    if (!sd_io_take(5000)) {
+        ESP_LOGW(ACDB_TAG, "SD busy — cannot load database");
+        heap_caps_free(s_acdb_header);
+        heap_caps_free(s_acdb_cache);
+        s_acdb_header = NULL;
+        s_acdb_cache = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
     FILE *f = fopen(ACDB_PATH, "rb");
     if (!f) {
+        sd_io_give();
         ESP_LOGW(ACDB_TAG, "Database file not found: %s", ACDB_PATH);
         heap_caps_free(s_acdb_header);
         heap_caps_free(s_acdb_cache);
@@ -346,6 +357,7 @@ static void acdb_loader_task(void *arg) {
         ESP_LOGE(ACDB_TAG, "Bad magic: \"%s\" (expected \"%s\") — wrong DB version?",
                  magic, ACDB_MAGIC);
         fclose(f);
+        sd_io_give();
         heap_caps_free(s_acdb_header);
         heap_caps_free(s_acdb_cache);
         s_acdb_header = NULL;
@@ -357,6 +369,7 @@ static void acdb_loader_task(void *arg) {
     // Read bucket header (immediately after magic)
     size_t read = fread(s_acdb_header, 1, ACDB_HEADER_SIZE, f);
     fclose(f);
+    sd_io_give();
 
     if (read != ACDB_HEADER_SIZE) {
         ESP_LOGE(ACDB_TAG, "Header read: %u / %u bytes", (unsigned)read, ACDB_HEADER_SIZE);

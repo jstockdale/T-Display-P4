@@ -8,10 +8,14 @@
 #include "sd_config.h"
 #include "device_settings.h"
 #include "aircraft_db.h"
+#include "mqtt_feeder.h"
+#include "rtlsdr_i2c.h"
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <errno.h>
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
@@ -20,13 +24,22 @@
 #include "lvgl.h"
 
 // GPS fix epoch — set in GPS task on first quality fix.
-// Used to gate log line timestamps ([boot+X] vs ISO) and SD log renames.
-extern volatile time_t g_gps_fix_epoch;
+// Trusted time check — true when GPS, NTP, or PPS has synced (not just RTC boot seed).
+// Used to gate CSV timestamp format and SD log renames.
+extern bool time_manager_is_trusted_fn(void);
+// SD I/O mutex — defined in main.cpp, serializes file I/O across tasks
+extern bool sd_io_take(uint32_t timeout_ms);
+extern void sd_io_give(void);
 
 #define RTLSDR_BUF_LEN        (16384 + 512)
 #define CLIENT_NUM_EVENT_MSG  5
 #define CPR_MAX_AGE_US        10000000LL   // 10 seconds
 #define CPR_CACHE_SIZE        256
+#define CPR_JUMP_FLOOR_NM     10.0         // minimum threshold (handles GPS jitter, CPR quantization)
+#define CPR_JUMP_RATE_NM_S    1.0          // ~3600 kt — faster than any transponder-equipped aircraft
+#define CPR_SUSPECT_GIVE_UP   5            // consecutive suspect events → reset has_position
+#define CPR_CONSENSUS_COUNT   3            // agreeing globals needed to override bad good_pos
+#define CPR_CONSENSUS_NM      10.0         // max spread between agreeing candidates
 #define AIRCRAFT_TABLE_SIZE   256
 #define AIRCRAFT_MAX_AGE_US   60000000LL   // 60 seconds
 
@@ -58,6 +71,113 @@ static volatile float    s_msg_rate = 0.0f;       // messages per second
 static volatile int64_t  s_msg_window_start = 0;  // start of current rate window
 static volatile bool     s_rtlsdr_connected = false;
 static volatile bool     s_rtlsdr_error = false;  // device seen but transfer buffer failed
+
+// ============================================================
+// Adaptive tuner gain — throughput-optimized two-phase
+// ============================================================
+// R820T valid gain steps in tenths of dB (from datasheet)
+static const uint16_t R820T_GAINS[] = {
+    0, 9, 14, 27, 37, 77, 87, 125, 144, 157,
+    166, 197, 207, 229, 254, 280, 297, 328, 338,
+    364, 372, 386, 402, 421, 434, 439, 445, 480, 496
+};
+#define R820T_GAIN_COUNT (sizeof(R820T_GAINS) / sizeof(R820T_GAINS[0]))
+#define GAIN_FLOOR_IDX      11     // 19.7 dB — never go below this
+#define GAIN_MIN_SAMPLES    10     // need enough decoded messages to evaluate
+
+// Phase 1 (fast convergence): eval every 10s or 200 msgs
+#define GAIN_P1_PERIOD_US   10000000LL
+#define GAIN_P1_MSG_COUNT   200
+#define GAIN_P1_STABLE_WIN  3      // consecutive stable windows → converged
+#define GAIN_WARMUP_US      10000000LL  // 10s decoder warmup before first eval
+
+// Phase 2 (steady-state): eval every 60s
+#define GAIN_P2_PERIOD_US   60000000LL
+#define GAIN_P2_EMA_ALPHA   0.3f   // EMA smoothing factor
+#define GAIN_P2_COOLDOWN    2      // skip 2 windows after gain change (120s settle)
+#define GAIN_P2_THROUGHPUT_DROP 0.15f // >15% pos_rate drop = bad step (beyond traffic noise)
+
+// Thresholds — the target band is user-configurable via settings.
+// Derived thresholds maintain fixed offsets from the band edges.
+// SEVERE is absolute (ADC clipping), not relative to the band.
+#define GAIN_ERR_SEVERE     0.67f  // phase 2 emergency — fall back to phase 1
+
+// Signal quality gates — prevent gain reductions when signals are already weak.
+// Based on preamble signal metric (avg of 4 preamble peaks per CRC-ok message):
+//   Clipping regime: sig > 10000 (e.g., 13411 at 49.6 dB)
+//   Good range:      sig 5000–20000 (aircraft in range, ADC not saturated)
+//   Weak range:      sig < 5000 (distant/departing aircraft, barely decoding)
+// High error + weak signals = noise or no traffic, NOT ADC saturation.
+#define GAIN_MIN_SIG_FOR_CLIPPING  8000  // P2 emergency: must see strong signals to claim clipping
+#define GAIN_MIN_SIG_FOR_DOWN      5000  // P1/P2: don't reduce gain if signals weaker than this
+#define GAIN_MIN_OK_FOR_STATS      3     // need ≥3 CRC-ok messages for reliable signal metrics
+static inline float gain_err_high(void) { extern device_settings_t g_settings; return g_settings.gain_err_high / 100.0f; }
+static inline float gain_err_low(void)  { extern device_settings_t g_settings; return g_settings.gain_err_low / 100.0f; }
+static inline float gain_err_very_high(void) { return gain_err_high() + 0.05f; }  // clear soft floor
+static inline float gain_err_very_low(void)  { return gain_err_low() - 0.20f; }   // clear soft ceiling
+
+// Soft ceiling (can't step above)
+#define GAIN_CEILING_CLEAR_WIN 5   // 5 consecutive low-error windows to clear ceiling
+#define GAIN_CEILING_MAX_WIN   20  // hard time cap: 20 windows (20 min) then auto-clear
+#define GAIN_CEILING_STRIKES   2   // require 2 failed probes before setting ceiling
+
+// Soft floor (can't step below)
+#define GAIN_FLOOR_CLEAR_WIN   5   // 5 consecutive high-error windows to clear floor
+#define GAIN_FLOOR_MAX_WIN     20  // hard time cap: 20 windows (20 min) then auto-clear
+#define GAIN_FLOOR_STRIKES     2   // require 2 failed probes before setting floor
+
+// ── Core state ──
+static volatile int      s_gain_idx = R820T_GAIN_COUNT - 1;
+static volatile bool     s_gain_pending = false;  // deferred gain apply — set by external callers
+static volatile bool     s_gain_auto = true;
+static volatile int64_t  s_gain_last_eval = 0;
+
+// ── Phase state ──
+static volatile int      s_gain_phase = 1;     // 1=fast, 2=steady
+static volatile int      s_gain_stable_count = 0; // consecutive windows without gain change
+static volatile float    s_gain_p1_prev_pos_rate = 0.0f; // previous window pos_rate for phase 1 comparison
+static volatile uint32_t s_gain_p1_prev_ok = 0;          // previous window ok (good CRC) count
+static volatile bool     s_gain_p1_last_was_up = false;   // true if last phase 1 action was a step-up
+static volatile int      s_gain_p1_up_suppress = 0;       // >0 = suppress step-ups (failed step-up cooldown)
+static volatile bool     s_gain_warmup = true;             // true until first eval completes
+
+// ── Per-window position update counter (incremented in on_msg) ──
+static volatile uint32_t s_gain_win_pos = 0;
+
+// ── Phase 2: EMA-smoothed metrics ──
+static volatile float    s_gain_err_ema = 0.0f;     // error rate EMA
+static volatile float    s_gain_pos_rate_ema = 0.0f; // position updates/sec EMA (primary metric)
+static volatile float    s_gain_error_rate = 0.0f;   // exposed to stats API
+
+// ── Signal quality metrics (last window, exposed to stats API) ──
+static volatile uint32_t s_gain_avg_signal = 0;      // avg preamble signal level (CRC-ok msgs)
+static volatile uint32_t s_gain_avg_delta = 0;        // avg bit delta / SNR proxy (CRC-ok msgs)
+
+// ── Phase 2: throughput comparison ──
+static volatile float    s_gain_pre_step_pos_rate = 0.0f; // snapshot before gain change
+static volatile uint32_t s_gain_pre_step_signal = 0;      // avg_signal snapshot before gain change
+static volatile int      s_gain_cooldown = 0;
+static volatile int      s_gain_step_dir = 0;  // +1=stepped up, -1=stepped down, 0=none
+#define GAIN_P2_SIG_CHANGE_THRESH 0.40f // >40% signal change = traffic shifted, not gain damage
+
+// ── Soft ceiling ──
+static volatile int      s_gain_ceiling = R820T_GAIN_COUNT; // one past max = no ceiling
+static volatile int      s_gain_low_err_count = 0;
+static volatile int      s_gain_ceiling_strikes = 0;  // failed probes since last ceiling clear
+static volatile int      s_gain_ceiling_age = 0;       // windows since ceiling was set
+
+// ── Soft floor ──
+static volatile int      s_gain_floor = -1;            // -1 = no floor (GAIN_FLOOR_IDX is hard limit)
+static volatile int      s_gain_high_err_count = 0;
+static volatile int      s_gain_floor_strikes = 0;     // failed probes since last floor clear
+static volatile int      s_gain_floor_age = 0;          // windows since floor was set
+
+// ── Historical throughput profile (EMA of pos_rate per gain step) ──
+#define GAIN_PROFILE_ALPHA    0.1f  // slow EMA — profile reflects hours, not minutes
+#define GAIN_PROFILE_MIN_WIN  3     // need at least 3 windows before trusting a profile entry
+#define GAIN_PROFILE_MIN_DELTA 0.25f // profile must be at least 0.25/s better (prevents noise probes)
+static float    s_gain_profile[R820T_GAIN_COUNT];      // EMA pos_rate at each level
+static uint16_t s_gain_profile_samples[R820T_GAIN_COUNT]; // windows observed at each level
 
 // ============================================================
 // CPR cache with timestamps — linear-probed hash table
@@ -156,6 +276,52 @@ static int cpr_decode(cpr_cache_t *c) {
     return 1;
 }
 
+// Local CPR decode: decode a single CPR frame against a known reference position.
+// Works when we already have a valid position from a previous global decode.
+// The aircraft must be within ~180 nm of the reference — always true for recent positions.
+static double fmod_pos(double a, double b) {
+    double r = fmod(a, b);
+    return r < 0 ? r + b : r;
+}
+
+static int cpr_decode_local(double ref_lat, double ref_lon, int raw_lat, int raw_lon,
+                            int fflag, double *out_lat, double *out_lon) {
+    double d_lat = fflag ? (360.0 / 59.0) : (360.0 / 60.0);
+    double cprlat = raw_lat / 131072.0;
+    double cprlon = raw_lon / 131072.0;
+
+    // Latitude
+    int j = (int)floor(ref_lat / d_lat) +
+            (int)floor(0.5 + fmod_pos(ref_lat, d_lat) / d_lat - cprlat);
+    double rlat = d_lat * (j + cprlat);
+
+    // Sanity check latitude
+    if (rlat < -90 || rlat > 90) return 0;
+
+    // Longitude
+    int nl = NL(rlat);
+    int ni = fflag ? ((nl - 1) > 1 ? (nl - 1) : 1) : (nl > 1 ? nl : 1);
+    double d_lon = 360.0 / ni;
+
+    int m = (int)floor(ref_lon / d_lon) +
+            (int)floor(0.5 + fmod_pos(ref_lon, d_lon) / d_lon - cprlon);
+    double rlon = d_lon * (m + cprlon);
+
+    if (rlon >= 180) rlon -= 360;
+    if (rlon < -180) rlon += 360;
+
+    // Sanity: reject if decoded position is >50 nm from reference
+    // (local decode is valid within ~180 nm, but 50 nm catches errors early)
+    double dlat = rlat - ref_lat;
+    double dlon = (rlon - ref_lon) * cos(ref_lat * M_PI / 180.0);
+    double dist_nm = sqrt(dlat * dlat + dlon * dlon) * 60.0;
+    if (dist_nm > 50.0) return 0;
+
+    *out_lat = rlat;
+    *out_lon = rlon;
+    return 1;
+}
+
 // ============================================================
 // Aircraft state table
 // ============================================================
@@ -173,6 +339,14 @@ typedef struct {
     int64_t last_seen;
     int active;
     uint32_t msg_count;
+    // Position validation
+    double good_lat, good_lon;  // last accepted (non-suspect) position
+    int64_t good_pos_ts;        // timestamp of last good position
+    int position_suspect;       // 1 = current lat/lon may be wrong, awaiting recovery
+    int suspect_count;          // consecutive suspect events (give up after N)
+    // Consensus recovery: track agreeing global decodes during suspect mode
+    double suspect_lat, suspect_lon;  // last candidate during recovery
+    int suspect_agree;                // consecutive globals agreeing with each other
 } aircraft_t;
 
 static aircraft_t aircraft_table[AIRCRAFT_TABLE_SIZE];
@@ -209,6 +383,23 @@ static void aircraft_expire(void) {
         if (aircraft_table[i].active &&
             (now - aircraft_table[i].last_seen) > AIRCRAFT_MAX_AGE_US)
             aircraft_table[i].active = 0;
+}
+
+// Check if a candidate position is a plausible jump from the last known good position.
+// Returns 1 if plausible, 0 if implausible.
+static int cpr_jump_check(aircraft_t *ac, double cand_lat, double cand_lon, int64_t now) {
+    if (!ac->good_pos_ts) return 1;  // no reference — first position, always accept
+
+    double elapsed_s = (double)(now - ac->good_pos_ts) / 1000000.0;
+    if (elapsed_s < 0.1) elapsed_s = 0.1;  // avoid division by zero
+
+    double max_nm = CPR_JUMP_FLOOR_NM + elapsed_s * CPR_JUMP_RATE_NM_S;
+
+    double dlat = cand_lat - ac->good_lat;
+    double dlon = (cand_lon - ac->good_lon) * cos(ac->good_lat * M_PI / 180.0);
+    double dist_nm = sqrt(dlat * dlat + dlon * dlon) * 60.0;
+
+    return dist_nm <= max_nm;
 }
 
 // ============================================================
@@ -257,6 +448,9 @@ void adsb_set_bias_tee(bool on) {
 static void haversine(double lat1, double lon1, double lat2, double lon2,
                       double *out_dist_km, double *out_bearing_deg);
 
+// Max range — updated by adsb_get_stats(), referenced by gain logs
+static volatile double s_max_range_nm = 0.0;
+
 adsb_stats_t adsb_get_stats(void) {
     adsb_stats_t stats = {0};
     stats.total_messages = s_total_messages;
@@ -278,12 +472,15 @@ adsb_stats_t adsb_get_stats(void) {
     }
     stats.active_aircraft = count;
 
-    // Find nearest aircraft
+    // Find nearest and farthest aircraft
     stats.nearest_icao = 0;
     stats.nearest_dist_nm = 0;
+    stats.farthest_dist_nm = 0;
+    stats.farthest_icao = 0;
     receiver_pos_t rx = adsb_get_receiver_pos();
     if (rx.fix_valid && aircraft_mutex) {
         double best_dist = 1e9;
+        double worst_dist = 0;
         xSemaphoreTake(aircraft_mutex, portMAX_DELAY);
         for (int i = 0; i < AIRCRAFT_TABLE_SIZE; i++) {
             if (!aircraft_table[i].active) continue;
@@ -301,11 +498,767 @@ adsb_stats_t adsb_get_stats(void) {
                     stats.nearest_callsign[8] = '\0';
                 }
             }
+            if (dist_km > worst_dist) {
+                worst_dist = dist_km;
+                stats.farthest_icao = aircraft_table[i].icao;
+                stats.farthest_dist_nm = dist_km * 0.539957;
+            }
         }
         xSemaphoreGive(aircraft_mutex);
     }
 
+    stats.gain_tenths = R820T_GAINS[s_gain_idx];
+    stats.gain_auto = s_gain_auto;
+    stats.gain_phase = s_gain_phase;
+    stats.crc_error_rate = s_gain_error_rate;
+    stats.pos_rate = s_gain_pos_rate_ema;
+    stats.avg_signal = s_gain_avg_signal;
+    stats.avg_delta = s_gain_avg_delta;
+    s_max_range_nm = stats.farthest_dist_nm;
+
+    /* Build human-readable dongle model string for UI/MQTT */
+    stats.dongle_model[0] = '\0';
+    if (rtldev) {
+        rtlsdr_get_dongle_info(rtldev, stats.dongle_model, sizeof(stats.dongle_model),
+                               NULL, NULL);
+    } else {
+        snprintf(stats.dongle_model, sizeof(stats.dongle_model), "not connected");
+    }
+
     return stats;
+}
+
+// ── Gain control ──────────────────────────────────────────────────────────
+
+// Find the closest valid R820T gain index for a given tenths-of-dB value
+static int gain_find_idx(uint16_t tenths) {
+    int best = 0;
+    int best_diff = abs((int)tenths - (int)R820T_GAINS[0]);
+    for (int i = 1; i < (int)R820T_GAIN_COUNT; i++) {
+        int diff = abs((int)tenths - (int)R820T_GAINS[i]);
+        if (diff < best_diff) { best_diff = diff; best = i; }
+    }
+    return best;
+}
+
+// Apply the current gain index to the hardware
+static void gain_apply(void) {
+    if (rtldev) {
+        rtlsdr_set_tuner_gain(rtldev, R820T_GAINS[s_gain_idx]);
+    }
+}
+
+// Set gain mode and value from external callers (serial console, settings)
+void adsb_set_gain(int mode, uint16_t gain_tenths) {
+    if (mode == 0) {
+        // Auto (adaptive) — restart from phase 1
+        s_gain_auto = true;
+        s_gain_phase = 1;
+        s_gain_stable_count = 0;
+        s_gain_p1_prev_pos_rate = 0.0f;
+        s_gain_p1_prev_ok = 0;
+        s_gain_p1_last_was_up = false;
+        s_gain_p1_up_suppress = 0;
+        s_gain_warmup = true;
+        s_gain_err_ema = 0.0f;
+        s_gain_pos_rate_ema = 0.0f;
+        s_gain_cooldown = 0;
+        s_gain_step_dir = 0;
+        s_gain_ceiling = R820T_GAIN_COUNT;
+        s_gain_low_err_count = 0;
+        s_gain_ceiling_strikes = 0;
+        s_gain_ceiling_age = 0;
+        s_gain_floor = -1;
+        s_gain_high_err_count = 0;
+        s_gain_floor_strikes = 0;
+        s_gain_floor_age = 0;
+        s_gain_win_pos = 0;
+        memset((void *)s_gain_profile, 0, sizeof(s_gain_profile));
+        memset((void *)s_gain_profile_samples, 0, sizeof(s_gain_profile_samples));
+        s_gain_idx = R820T_GAIN_COUNT - 1; // start at max
+        s_gain_pending = true;  // deferred — USB task will apply
+        g_settings.adsb_gain_mode = 0;
+        char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+        serial_console_print("%sGAIN: Switched to adaptive gain (starting at %.1f dB, phase 1)\n",
+                             _ts, R820T_GAINS[s_gain_idx] / 10.0);
+    } else {
+        // Manual (fixed)
+        s_gain_auto = false;
+        s_gain_idx = gain_find_idx(gain_tenths);
+        g_settings.adsb_gain_mode = 1;
+        g_settings.adsb_gain_tenths = R820T_GAINS[s_gain_idx];
+        s_gain_pending = true;  // deferred — USB task will apply
+        char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+        serial_console_print("%sGAIN: Set manual gain: %.1f dB (step %d/%d)\n",
+                             _ts, R820T_GAINS[s_gain_idx] / 10.0,
+                             s_gain_idx, (int)R820T_GAIN_COUNT - 1);
+    }
+    g_settings_save_pending = true;
+}
+
+// Restart adaptive gain from current level — re-enters P1 without resetting to max.
+// Clears ceiling/floor/EMA (stale environmental context) but keeps the current gain
+// setting. Use after antenna changes or environment shifts.
+void adsb_gain_restart(void) {
+    if (!s_gain_auto) return;  // only meaningful in auto mode
+
+    int old_idx = s_gain_idx;  // preserve current gain
+    s_gain_phase = 1;
+    s_gain_stable_count = 0;
+    s_gain_p1_prev_pos_rate = 0.0f;
+    s_gain_p1_prev_ok = 0;
+    s_gain_p1_last_was_up = false;
+    s_gain_p1_up_suppress = 0;
+    s_gain_warmup = false;  // no warmup — decoder is already running
+    s_gain_err_ema = 0.0f;
+    s_gain_pos_rate_ema = 0.0f;
+    s_gain_cooldown = 0;
+    s_gain_step_dir = 0;
+    s_gain_ceiling = R820T_GAIN_COUNT;
+    s_gain_low_err_count = 0;
+    s_gain_ceiling_strikes = 0;
+    s_gain_ceiling_age = 0;
+    s_gain_floor = -1;
+    s_gain_high_err_count = 0;
+    s_gain_floor_strikes = 0;
+    s_gain_floor_age = 0;
+    s_gain_win_pos = 0;
+    // Keep gain profile — historical data is still useful
+    // Keep s_gain_idx — don't reset to max
+
+    char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+    serial_console_print("%sGAIN: Restart from %.1f dB — re-entering phase 1\n",
+                         _ts, R820T_GAINS[old_idx] / 10.0);
+}
+
+// Target dB reductions for phase 1 proportional response (in tenths of dB).
+// These are consistent power reductions regardless of where we are in the
+// non-uniform R820T gain table.  dB is logarithmic: 3 dB = ½ power.
+#define GAIN_DB_DROP_EXTREME  60   // >90% error: ~6 dB (power ÷ 4)
+#define GAIN_DB_DROP_SEVERE   45   // 80-90%: ~4.5 dB (power ÷ 2.8)
+#define GAIN_DB_DROP_MODERATE 30   // 60-80%: ~3 dB (power ÷ 2)
+#define GAIN_DB_DROP_MILD     15   // 50-60%: ~1.5 dB (power ÷ 1.4)
+
+// Phase 2 step-up dB targets — graduated by how far below target band
+#define GAIN_DB_RAISE_MILD     10  // 30-40% EMA: +1.0 dB
+#define GAIN_DB_RAISE_MODERATE 15  // 20-30% EMA: +1.5 dB
+#define GAIN_DB_RAISE_STRONG   25  // 10-20% EMA: +2.5 dB
+#define GAIN_DB_RAISE_FULL     30  // ≤10% EMA:   +3.0 dB
+
+// Find the gain index closest to (current - reduction_tenths), clamped to floor.
+// Returns the index whose gain value is nearest to the target without going
+// below GAIN_FLOOR_IDX.  Always moves at least 1 step if above floor.
+static int gain_idx_for_db_drop(int current_idx, int reduction_tenths) {
+    int target_val = R820T_GAINS[current_idx] - reduction_tenths;
+    if (target_val < (int)R820T_GAINS[GAIN_FLOOR_IDX]) target_val = R820T_GAINS[GAIN_FLOOR_IDX];
+
+    int best_idx = GAIN_FLOOR_IDX;
+    int best_dist = abs((int)R820T_GAINS[GAIN_FLOOR_IDX] - target_val);
+    for (int i = GAIN_FLOOR_IDX + 1; i < current_idx; i++) {
+        int dist = abs((int)R820T_GAINS[i] - target_val);
+        if (dist < best_dist) {
+            best_dist = dist;
+            best_idx = i;
+        }
+    }
+    // Ensure we always move at least 1 step
+    if (best_idx >= current_idx && current_idx > GAIN_FLOOR_IDX) {
+        best_idx = current_idx - 1;
+    }
+    return best_idx;
+}
+
+// Find the gain index closest to (current + raise_tenths), clamped to max.
+// Returns the index whose gain value is nearest to the target without going
+// above R820T_GAIN_COUNT-1.  Always moves at least 1 step if below max.
+static int gain_idx_for_db_raise(int current_idx, int raise_tenths) {
+    int max_idx = (int)R820T_GAIN_COUNT - 1;
+    int target_val = R820T_GAINS[current_idx] + raise_tenths;
+    if (target_val > (int)R820T_GAINS[max_idx]) target_val = R820T_GAINS[max_idx];
+
+    int best_idx = max_idx;
+    int best_dist = abs((int)R820T_GAINS[max_idx] - target_val);
+    for (int i = current_idx + 1; i < max_idx; i++) {
+        int dist = abs((int)R820T_GAINS[i] - target_val);
+        if (dist < best_dist) {
+            best_dist = dist;
+            best_idx = i;
+        }
+    }
+    // Ensure we always move at least 1 step
+    if (best_idx <= current_idx && current_idx < max_idx) {
+        best_idx = current_idx + 1;
+    }
+    return best_idx;
+}
+
+// Throughput-optimized adaptive gain evaluation
+// Primary metric: position updates per second (the actual useful output)
+// Phase 1: graduated dB-targeted response — consistent power reductions
+//   >90%: -6 dB, 80-90%: -4.5 dB, 67-80%: -3 dB, 50-67%: -1.5 dB (throughput-gated)
+//   Target band: 40-50% error. Below 40%: step up (accelerated if confirmed).
+// Phase 2: EMA smoothing, graduated dB-targeted step-ups, probe-and-compare
+//   Emergency brake at >67% EMA → fall back to phase 1
+static void gain_evaluate(mode_s_t *st) {
+    uint32_t ok   = st->stat_crc_ok;
+    uint32_t fail = st->stat_crc_fail;
+    uint32_t total = ok + fail;
+    uint32_t pos  = s_gain_win_pos;
+
+    // Read signal quality metrics (accumulated for CRC-ok messages only)
+    uint32_t avg_signal = ok > 0 ? (uint32_t)(st->stat_signal_sum / ok) : 0;
+    uint32_t avg_delta  = ok > 0 ? (uint32_t)(st->stat_delta_sum / ok) : 0;
+
+    // Reset counters for next window
+    st->stat_crc_ok = 0;
+    st->stat_crc_fail = 0;
+    st->stat_preambles = 0;
+    st->stat_signal_sum = 0;
+    st->stat_delta_sum = 0;
+    s_gain_win_pos = 0;
+
+    // ── Minimum message guards ──
+    if (total == 0) {
+        // Zero messages: might be deaf, or just no traffic.
+        // P1: step up — try to find signal. P2: hold — we were working, wait it out.
+        if (s_gain_phase == 1 && s_gain_idx + 1 < (int)R820T_GAIN_COUNT
+            && s_gain_idx + 1 < s_gain_ceiling) {
+            s_gain_idx++;
+            s_gain_stable_count = 0;
+            gain_apply();
+            char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+            serial_console_print("%sGAIN: [P1] Up: %.1f dB (no messages — increasing sensitivity)\n",
+                                 _ts, R820T_GAINS[s_gain_idx] / 10.0);
+        }
+        return;
+    }
+    if (total < GAIN_MIN_SAMPLES) return;  // too few messages for reliable evaluation
+
+    float err_rate = (float)fail / (float)total;
+
+    // Compute window duration for rate calculations
+    int64_t now = esp_timer_get_time();
+    float win_secs = (float)(now - s_gain_last_eval) / 1000000.0f;
+    if (win_secs < 1.0f) win_secs = 1.0f;  // avoid division by zero
+    float pos_rate = (float)pos / win_secs;
+
+    int old_idx = s_gain_idx;
+
+    // Store signal quality for stats API
+    s_gain_avg_signal = avg_signal;
+    s_gain_avg_delta = avg_delta;
+
+    if (s_gain_phase == 1) {
+        // ══════════════════════════════════════════════════════════
+        // Phase 1: Fast convergence — dB-targeted proportional response
+        // Uses consistent power reductions regardless of non-uniform gain table.
+        // >90%: -6 dB (power ÷ 4)
+        // 80-90%: -4.5 dB (power ÷ 2.8)
+        // 67-80%: -3 dB (power ÷ 2)
+        // 50-67%: -1.5 dB (gentle, with throughput check)
+        // 40-50%: target range — sweet spot for coverage (~45% ideal)
+        // <40%: step up — confirmed step-ups accelerate to +1.5 dB
+        //        step-ups that hurt throughput → hold (overshot)
+        // Converge: 3 consecutive windows without a gain change
+        // ══════════════════════════════════════════════════════════
+        s_gain_error_rate = err_rate;
+        bool changed = false;
+        if (s_gain_p1_up_suppress > 0) s_gain_p1_up_suppress--;
+
+        // Signal quality gate: only reduce gain if we have enough CRC-ok
+        // messages with strong signal levels to confirm ADC saturation.
+        // Weak/absent signals + high error = noise or no traffic.
+        bool can_reduce = (ok >= GAIN_MIN_OK_FOR_STATS
+                           && avg_signal >= GAIN_MIN_SIG_FOR_DOWN);
+
+        if (err_rate > 0.90f && s_gain_idx > GAIN_FLOOR_IDX && can_reduce) {
+            // Near-total garbage — drop ~6 dB (power ÷ 4)
+            int new_idx = gain_idx_for_db_drop(s_gain_idx, GAIN_DB_DROP_EXTREME);
+            s_gain_idx = new_idx;
+            changed = true;
+            s_gain_p1_last_was_up = false;
+            s_gain_p1_up_suppress = 0;
+            gain_apply();
+            char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+            serial_console_print("%sGAIN: [P1] Down: %.1f → %.1f dB (−%.1f dB, err=%.0f%%, pos=%.1f/s, ok=%lu, sig=%lu delta=%lu)\n",
+                                 _ts, R820T_GAINS[old_idx] / 10.0, R820T_GAINS[s_gain_idx] / 10.0,
+                                 (R820T_GAINS[old_idx] - R820T_GAINS[s_gain_idx]) / 10.0,
+                                 err_rate * 100, pos_rate, (unsigned long)ok,
+                                 (unsigned long)avg_signal, (unsigned long)avg_delta);
+        } else if (err_rate > 0.80f && s_gain_idx > GAIN_FLOOR_IDX && can_reduce) {
+            // Severe clipping — drop ~4.5 dB (power ÷ 2.8)
+            int new_idx = gain_idx_for_db_drop(s_gain_idx, GAIN_DB_DROP_SEVERE);
+            s_gain_idx = new_idx;
+            changed = true;
+            s_gain_p1_last_was_up = false;
+            s_gain_p1_up_suppress = 0;
+            gain_apply();
+            char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+            serial_console_print("%sGAIN: [P1] Down: %.1f → %.1f dB (−%.1f dB, err=%.0f%%, pos=%.1f/s, ok=%lu, sig=%lu delta=%lu)\n",
+                                 _ts, R820T_GAINS[old_idx] / 10.0, R820T_GAINS[s_gain_idx] / 10.0,
+                                 (R820T_GAINS[old_idx] - R820T_GAINS[s_gain_idx]) / 10.0,
+                                 err_rate * 100, pos_rate, (unsigned long)ok,
+                                 (unsigned long)avg_signal, (unsigned long)avg_delta);
+        } else if (err_rate > GAIN_ERR_SEVERE && s_gain_idx > GAIN_FLOOR_IDX && can_reduce) {
+            // Significant clipping (67-80%) — drop ~3 dB
+            int new_idx = gain_idx_for_db_drop(s_gain_idx, GAIN_DB_DROP_MODERATE);
+            s_gain_idx = new_idx;
+            changed = true;
+            s_gain_p1_last_was_up = false;
+            s_gain_p1_up_suppress = 0;
+            gain_apply();
+            char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+            serial_console_print("%sGAIN: [P1] Down: %.1f → %.1f dB (−%.1f dB, err=%.0f%%, pos=%.1f/s, ok=%lu, sig=%lu delta=%lu)\n",
+                                 _ts, R820T_GAINS[old_idx] / 10.0, R820T_GAINS[s_gain_idx] / 10.0,
+                                 (R820T_GAINS[old_idx] - R820T_GAINS[s_gain_idx]) / 10.0,
+                                 err_rate * 100, pos_rate, (unsigned long)ok,
+                                 (unsigned long)avg_signal, (unsigned long)avg_delta);
+        } else if (err_rate > gain_err_high() && s_gain_idx > GAIN_FLOOR_IDX && can_reduce) {
+            // Saturation starting (50-67%) — drop ~1.5 dB only if good message count holds
+            // Fix: use ok count (good CRC messages) not pos_rate — pos_rate is confounded
+            // by traffic changes (aircraft entering/leaving range between windows).
+            if (s_gain_p1_prev_ok == 0 || ok >= (uint32_t)(s_gain_p1_prev_ok * 0.80f)) {
+                int new_idx = gain_idx_for_db_drop(s_gain_idx, GAIN_DB_DROP_MILD);
+                s_gain_idx = new_idx;
+                changed = true;
+                s_gain_p1_last_was_up = false;
+                s_gain_p1_up_suppress = 0;
+                gain_apply();
+                char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+                serial_console_print("%sGAIN: [P1] Down: %.1f → %.1f dB (−%.1f dB, err=%.0f%%, ok=%lu, prev_ok=%lu, pos=%.1f/s, sig=%lu delta=%lu)\n",
+                                     _ts, R820T_GAINS[old_idx] / 10.0, R820T_GAINS[s_gain_idx] / 10.0,
+                                     (R820T_GAINS[old_idx] - R820T_GAINS[s_gain_idx]) / 10.0,
+                                     err_rate * 100, (unsigned long)ok, (unsigned long)s_gain_p1_prev_ok, pos_rate,
+                                     (unsigned long)avg_signal, (unsigned long)avg_delta);
+            } else {
+                // Good messages dropped >20% — we're losing real aircraft, hold
+                char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+                serial_console_print("%sGAIN: [P1] Holding %.1f dB — ok dropped (err=%.0f%%, ok=%lu, prev_ok=%lu, pos=%.1f/s, sig=%lu delta=%lu)\n",
+                                     _ts, R820T_GAINS[s_gain_idx] / 10.0, err_rate * 100,
+                                     (unsigned long)ok, (unsigned long)s_gain_p1_prev_ok, pos_rate,
+                                     (unsigned long)avg_signal, (unsigned long)avg_delta);
+                s_gain_p1_last_was_up = false;
+            }
+        } else if (err_rate < gain_err_low() && s_gain_idx < (int)R820T_GAIN_COUNT - 1
+                   && s_gain_p1_up_suppress == 0) {
+            // Low error (<40%) — we're deaf to distant aircraft, step up
+            // If last action was also a step-up that improved ok count and
+            // we're still below the saturation threshold, take a 1.5 dB step.
+            // Otherwise, conservative single-index step.
+            if (s_gain_p1_last_was_up && s_gain_p1_prev_ok > 0
+                && ok >= s_gain_p1_prev_ok) {
+                // Confirmed: last step-up helped. Accelerate with 1.5 dB step.
+                int new_idx = gain_idx_for_db_raise(s_gain_idx, GAIN_DB_DROP_MILD);
+                s_gain_idx = new_idx;
+                changed = true;
+                s_gain_p1_last_was_up = true;
+                gain_apply();
+                char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+                serial_console_print("%sGAIN: [P1] Up (accel): %.1f → %.1f dB (+%.1f dB, err=%.0f%%, ok=%lu, prev_ok=%lu, pos=%.1f/s, sig=%lu delta=%lu)\n",
+                                     _ts, R820T_GAINS[old_idx] / 10.0, R820T_GAINS[s_gain_idx] / 10.0,
+                                     (R820T_GAINS[s_gain_idx] - R820T_GAINS[old_idx]) / 10.0,
+                                     err_rate * 100, (unsigned long)ok, (unsigned long)s_gain_p1_prev_ok, pos_rate,
+                                     (unsigned long)avg_signal, (unsigned long)avg_delta);
+            } else if (s_gain_p1_last_was_up && s_gain_p1_prev_ok > 0
+                       && ok < (uint32_t)(s_gain_p1_prev_ok * 0.80f)) {
+                // Last step-up hurt throughput — we overshot
+                // Suppress further step-ups to allow convergence at this gain
+                s_gain_p1_up_suppress = GAIN_P1_STABLE_WIN;
+                s_gain_p1_last_was_up = false;
+                char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+                serial_console_print("%sGAIN: [P1] Step-up hurt throughput — suppressing (err=%.0f%%, ok=%lu, prev_ok=%lu, pos=%.1f/s, sig=%lu delta=%lu)\n",
+                                     _ts, err_rate * 100, (unsigned long)ok, (unsigned long)s_gain_p1_prev_ok, pos_rate,
+                                     (unsigned long)avg_signal, (unsigned long)avg_delta);
+            } else {
+                // First step-up or throughput ambiguous — conservative single step
+                s_gain_idx++;
+                changed = true;
+                s_gain_p1_last_was_up = true;
+                gain_apply();
+                char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+                serial_console_print("%sGAIN: [P1] Up: %.1f → %.1f dB (+%.1f dB, err=%.0f%%, ok=%lu, prev_ok=%lu, pos=%.1f/s, sig=%lu delta=%lu)\n",
+                                     _ts, R820T_GAINS[old_idx] / 10.0, R820T_GAINS[s_gain_idx] / 10.0,
+                                     (R820T_GAINS[s_gain_idx] - R820T_GAINS[old_idx]) / 10.0,
+                                     err_rate * 100, (unsigned long)ok, (unsigned long)s_gain_p1_prev_ok, pos_rate,
+                                     (unsigned long)avg_signal, (unsigned long)avg_delta);
+            }
+        }
+        // else: 40-50% error — target range, no change needed
+
+        // Log when high error was blocked by weak signal gate
+        if (!changed && !can_reduce && err_rate > gain_err_high()
+            && s_gain_idx > GAIN_FLOOR_IDX) {
+            char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+            serial_console_print("%sGAIN: [P1] Holding %.1f dB — err=%.0f%% but weak signals (ok=%lu, sig=%lu delta=%lu)\n",
+                                 _ts, R820T_GAINS[s_gain_idx] / 10.0, err_rate * 100,
+                                 (unsigned long)ok, (unsigned long)avg_signal, (unsigned long)avg_delta);
+        }
+
+        // Track throughput for next window's comparison
+        s_gain_p1_prev_pos_rate = pos_rate;
+        s_gain_p1_prev_ok = ok;
+
+        if (changed) {
+            s_gain_stable_count = 0;
+        } else {
+            s_gain_stable_count++;
+            if (s_gain_stable_count >= GAIN_P1_STABLE_WIN) {
+                // Converged — transition to phase 2
+                s_gain_phase = 2;
+                s_gain_err_ema = err_rate;
+                s_gain_pos_rate_ema = pos_rate;
+                s_gain_cooldown = 0;
+                s_gain_step_dir = 0;
+                s_gain_ceiling = R820T_GAIN_COUNT;
+                s_gain_low_err_count = 0;
+                s_gain_ceiling_strikes = 0;
+                s_gain_ceiling_age = 0;
+                s_gain_floor = -1;
+                s_gain_high_err_count = 0;
+                s_gain_floor_strikes = 0;
+                s_gain_floor_age = 0;
+                char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+                serial_console_print("%sGAIN: Converged at %.1f dB (err=%.0f%%, pos=%.1f/s, range=%.0fnm, sig=%lu delta=%lu) → steady-state\n",
+                                     _ts, R820T_GAINS[s_gain_idx] / 10.0, err_rate * 100, pos_rate, s_max_range_nm,
+                                     (unsigned long)avg_signal, (unsigned long)avg_delta);
+            }
+        }
+
+    } else {
+        // ══════════════════════════════════════════════════════════
+        // Phase 2: Steady-state — throughput-optimized
+        // Primary: did we get more valid position updates?
+        // Emergency: error rate as clipping detector only
+        // ══════════════════════════════════════════════════════════
+
+        // EMA update — only when we have enough CRC-ok messages for reliable
+        // metrics. During no-traffic periods (ok < 3, noise triggers only), the
+        // EMAs freeze at their last known-good values rather than drifting toward
+        // noise-floor error rates. This prevents the algorithm from thinking
+        // error is 90%+ when traffic returns after a quiet period.
+        if (ok >= GAIN_MIN_OK_FOR_STATS) {
+            s_gain_err_ema = GAIN_P2_EMA_ALPHA * err_rate + (1.0f - GAIN_P2_EMA_ALPHA) * s_gain_err_ema;
+            s_gain_pos_rate_ema = GAIN_P2_EMA_ALPHA * pos_rate + (1.0f - GAIN_P2_EMA_ALPHA) * s_gain_pos_rate_ema;
+        }
+        s_gain_error_rate = s_gain_err_ema;
+
+        // ── Update historical profile (phase 2 only — 60s windows are reliable) ──
+        // Gate on ok count: don't teach the profile "this gain produces nothing"
+        // when there's simply no traffic.
+        int gi = s_gain_idx;
+        if (ok >= GAIN_MIN_OK_FOR_STATS && gi >= 0 && gi < (int)R820T_GAIN_COUNT) {
+            if (s_gain_profile_samples[gi] == 0) {
+                s_gain_profile[gi] = pos_rate; // seed
+            } else {
+                s_gain_profile[gi] = GAIN_PROFILE_ALPHA * pos_rate
+                                   + (1.0f - GAIN_PROFILE_ALPHA) * s_gain_profile[gi];
+            }
+            if (s_gain_profile_samples[gi] < 65535)
+                s_gain_profile_samples[gi]++;
+        }
+
+        // ── Emergency brake: severe error, BUT only if signals confirm clipping ──
+        // High EMA error + strong signals = genuine ADC saturation → re-enter P1.
+        // High EMA error + weak/absent signals = noise or no traffic → hold in P2.
+        // Without this gate, traffic disappearing causes a false "clipping" diagnosis
+        // that triggers P1 re-entry, oscillation, and the nighttime death spiral.
+        if (s_gain_err_ema > GAIN_ERR_SEVERE) {
+            bool evidence_of_clipping = (ok >= GAIN_MIN_OK_FOR_STATS
+                                         && avg_signal >= GAIN_MIN_SIG_FOR_CLIPPING);
+            if (evidence_of_clipping) {
+                char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+                serial_console_print("%sGAIN: Confirmed clipping (EMA err=%.0f%%, sig=%lu delta=%lu) → returning to fast convergence\n",
+                                     _ts, s_gain_err_ema * 100,
+                                     (unsigned long)avg_signal, (unsigned long)avg_delta);
+                s_gain_phase = 1;
+                s_gain_stable_count = 0;
+                s_gain_p1_prev_pos_rate = 0.0f;
+                s_gain_p1_prev_ok = 0;
+                s_gain_p1_last_was_up = false;
+                s_gain_p1_up_suppress = 0;
+                s_gain_ceiling = R820T_GAIN_COUNT;
+                s_gain_low_err_count = 0;
+                s_gain_ceiling_strikes = 0;
+                s_gain_ceiling_age = 0;
+                s_gain_floor = -1;
+                s_gain_high_err_count = 0;
+                s_gain_floor_strikes = 0;
+                s_gain_floor_age = 0;
+                s_gain_step_dir = 0;
+                return;
+            }
+            // else: EMA err is high but signals are weak/absent — not clipping.
+            // Don't log every window (too noisy) — the P2 heartbeat shows the state.
+        }
+
+        // ── Soft ceiling expiry: sustained low error OR hard time cap ──
+        if (s_gain_ceiling < (int)R820T_GAIN_COUNT) {
+            s_gain_ceiling_age++;
+
+            // Hard time cap — always retry after 20 minutes regardless
+            if (s_gain_ceiling_age >= GAIN_CEILING_MAX_WIN) {
+                s_gain_ceiling = R820T_GAIN_COUNT;
+                s_gain_low_err_count = 0;
+                s_gain_ceiling_strikes = 0;
+                s_gain_ceiling_age = 0;
+                char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+                serial_console_print("%sGAIN: Ceiling expired (age=%d windows) → will retry higher\n",
+                                     _ts, GAIN_CEILING_MAX_WIN);
+            }
+        }
+        // Early-out: sustained low error clears ceiling sooner
+        if (s_gain_err_ema < gain_err_very_low()) {
+            s_gain_low_err_count++;
+            if (s_gain_low_err_count >= GAIN_CEILING_CLEAR_WIN &&
+                s_gain_ceiling < (int)R820T_GAIN_COUNT) {
+                s_gain_ceiling = R820T_GAIN_COUNT;
+                s_gain_low_err_count = 0;
+                s_gain_ceiling_strikes = 0;
+                s_gain_ceiling_age = 0;
+                char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+                serial_console_print("%sGAIN: Ceiling cleared (EMA err=%.1f%% × %d windows) → will retry higher\n",
+                                     _ts, s_gain_err_ema * 100, GAIN_CEILING_CLEAR_WIN);
+            }
+        } else {
+            s_gain_low_err_count = 0;
+        }
+
+        // ── Soft floor expiry: sustained high error OR hard time cap ──
+        if (s_gain_floor >= 0) {
+            s_gain_floor_age++;
+
+            // Hard time cap — always retry after 20 minutes regardless
+            if (s_gain_floor_age >= GAIN_FLOOR_MAX_WIN) {
+                s_gain_floor = -1;
+                s_gain_high_err_count = 0;
+                s_gain_floor_strikes = 0;
+                s_gain_floor_age = 0;
+                char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+                serial_console_print("%sGAIN: Floor expired (age=%d windows) → will retry lower\n",
+                                     _ts, GAIN_FLOOR_MAX_WIN);
+            }
+        }
+        // Early-out: sustained high error clears floor sooner (saturation is back)
+        if (s_gain_err_ema > gain_err_very_high()) {
+            s_gain_high_err_count++;
+            if (s_gain_high_err_count >= GAIN_FLOOR_CLEAR_WIN &&
+                s_gain_floor >= 0) {
+                s_gain_floor = -1;
+                s_gain_high_err_count = 0;
+                s_gain_floor_strikes = 0;
+                s_gain_floor_age = 0;
+                char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+                serial_console_print("%sGAIN: Floor cleared (EMA err=%.1f%% × %d windows) → will retry lower\n",
+                                     _ts, s_gain_err_ema * 100, GAIN_FLOOR_CLEAR_WIN);
+            }
+        } else {
+            s_gain_high_err_count = 0;
+        }
+
+        // ── Cooldown after gain change ──
+        if (s_gain_cooldown > 0) {
+            s_gain_cooldown--;
+            char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+            serial_console_print("%sGAIN: [P2] Settling: %.1f dB, EMA err=%.0f%%, pos=%.1f/s, range=%.0fnm, sig=%lu delta=%lu (cooldown %d)\n",
+                                 _ts, R820T_GAINS[s_gain_idx] / 10.0,
+                                 s_gain_err_ema * 100, s_gain_pos_rate_ema,
+                                 s_max_range_nm, (unsigned long)avg_signal, (unsigned long)avg_delta,
+                                 s_gain_cooldown);
+            return;
+        }
+
+        // ── Throughput comparison: evaluate result of last gain step ──
+        if (s_gain_step_dir != 0 && s_gain_pre_step_pos_rate > 0.0f) {
+            float change = (s_gain_pos_rate_ema - s_gain_pre_step_pos_rate) / s_gain_pre_step_pos_rate;
+
+            if (change < -GAIN_P2_THROUGHPUT_DROP) {
+                // Throughput dropped >15%. But was it the gain step, or traffic change?
+                // Compare signal environment: if avg_signal shifted dramatically,
+                // the traffic mix changed (aircraft arrived/departed) and the
+                // throughput drop isn't attributable to the gain step.
+                bool traffic_shifted = false;
+                if (s_gain_pre_step_signal > 0 && ok >= GAIN_MIN_OK_FOR_STATS) {
+                    float sig_change = fabsf((float)avg_signal - (float)s_gain_pre_step_signal)
+                                       / (float)s_gain_pre_step_signal;
+                    traffic_shifted = (sig_change > GAIN_P2_SIG_CHANGE_THRESH);
+                }
+
+                if (traffic_shifted) {
+                    // Signal environment changed >40% — throughput drop is likely from
+                    // traffic change, not the gain step. Hold current gain, no strike.
+                    s_gain_step_dir = 0;
+                    s_gain_cooldown = GAIN_P2_COOLDOWN;
+                    char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+                    serial_console_print("%sGAIN: [P2] Holding %.1f dB — throughput %+.0f%% but traffic shifted (sig %lu → %lu, no strike)\n",
+                                         _ts, R820T_GAINS[s_gain_idx] / 10.0, change * 100,
+                                         (unsigned long)s_gain_pre_step_signal, (unsigned long)avg_signal);
+                    return;
+                }
+
+                // Signal environment is similar — throughput drop is real, revert
+                int bad_idx = s_gain_idx;
+                if (s_gain_step_dir > 0) {
+                    // Stepped up and lost throughput → ceiling strike + step back
+                    s_gain_ceiling_strikes++;
+                    if (s_gain_ceiling_strikes >= GAIN_CEILING_STRIKES) {
+                        s_gain_ceiling = s_gain_idx;
+                        s_gain_ceiling_age = 0;
+                    }
+                    s_gain_idx--;
+                } else {
+                    // Stepped down and lost throughput → floor strike + step back up
+                    s_gain_floor_strikes++;
+                    if (s_gain_floor_strikes >= GAIN_FLOOR_STRIKES) {
+                        s_gain_floor = s_gain_idx;
+                        s_gain_floor_age = 0;
+                    }
+                    if (s_gain_idx < (int)R820T_GAIN_COUNT - 1) s_gain_idx++;
+                }
+                s_gain_cooldown = GAIN_P2_COOLDOWN;
+                s_gain_step_dir = 0;
+                gain_apply();
+                // Build status suffix
+                const char *sfx = "";
+                if (s_gain_ceiling < (int)R820T_GAIN_COUNT) sfx = ", ceiling set";
+                else if (s_gain_ceiling_strikes > 0) sfx = ", ceiling strike";
+                else if (s_gain_floor >= 0) sfx = ", floor set";
+                else if (s_gain_floor_strikes > 0) sfx = ", floor strike";
+                char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+                serial_console_print("%sGAIN: [P2] Reverted: %.1f → %.1f dB (throughput %+.0f%%, pos=%.1f/s, range=%.0fnm, sig=%lu delta=%lu%s)\n",
+                                     _ts, R820T_GAINS[bad_idx] / 10.0, R820T_GAINS[s_gain_idx] / 10.0,
+                                     change * 100, s_gain_pos_rate_ema, s_max_range_nm,
+                                     (unsigned long)avg_signal, (unsigned long)avg_delta, sfx);
+                return;
+            } else {
+                // Throughput held or improved — step was good, reset strikes
+                s_gain_ceiling_strikes = 0;
+                s_gain_floor_strikes = 0;
+                char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+                serial_console_print("%sGAIN: [P2] Confirmed: %.1f dB (throughput %+.0f%%, pos=%.1f/s, range=%.0fnm, sig=%lu delta=%lu)\n",
+                                     _ts, R820T_GAINS[s_gain_idx] / 10.0, change * 100, s_gain_pos_rate_ema, s_max_range_nm,
+                                     (unsigned long)avg_signal, (unsigned long)avg_delta);
+                s_gain_step_dir = 0;
+                // Let the new level settle before profile gets a vote
+                s_gain_cooldown = GAIN_P2_COOLDOWN;
+                return;
+            }
+        }
+
+        // ── Decide whether to try a gain step ──
+        // Check if historical profile suggests a better gain level nearby.
+        // Require both 5% relative AND 0.5/s absolute improvement —
+        // at low throughput (<10/s) the absolute floor prevents noise probes.
+        int best_neighbor = -1;
+        float best_rate = s_gain_pos_rate_ema;
+        float prof_threshold = best_rate * 1.05f;
+        if (prof_threshold < best_rate + GAIN_PROFILE_MIN_DELTA)
+            prof_threshold = best_rate + GAIN_PROFILE_MIN_DELTA;
+
+        // Look one step up (if below ceiling and not at max)
+        if (s_gain_idx + 1 < (int)R820T_GAIN_COUNT && s_gain_idx + 1 < s_gain_ceiling) {
+            int up = s_gain_idx + 1;
+            if (s_gain_profile_samples[up] >= GAIN_PROFILE_MIN_WIN
+                && s_gain_profile[up] > prof_threshold) {
+                best_neighbor = up;
+                best_rate = s_gain_profile[up];
+            }
+        }
+        // Look one step down (if above hard floor and soft floor)
+        if (s_gain_idx - 1 >= GAIN_FLOOR_IDX && s_gain_idx - 1 > s_gain_floor) {
+            int dn = s_gain_idx - 1;
+            if (s_gain_profile_samples[dn] >= GAIN_PROFILE_MIN_WIN
+                && s_gain_profile[dn] > prof_threshold) {
+                best_neighbor = dn;
+                best_rate = s_gain_profile[dn];
+            }
+        }
+
+        // If profile suggests a better neighbor, probe it
+        if (best_neighbor >= 0) {
+            s_gain_pre_step_pos_rate = s_gain_pos_rate_ema;
+            s_gain_pre_step_signal = avg_signal;
+            s_gain_step_dir = (best_neighbor > s_gain_idx) ? 1 : -1;
+            s_gain_idx = best_neighbor;
+            s_gain_cooldown = GAIN_P2_COOLDOWN;
+            gain_apply();
+            char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+            serial_console_print("%sGAIN: [P2] Probing: %.1f → %.1f dB (profile: %.1f/s vs current %.1f/s, sig=%lu delta=%lu)\n",
+                                 _ts, R820T_GAINS[old_idx] / 10.0, R820T_GAINS[s_gain_idx] / 10.0,
+                                 best_rate, s_gain_pos_rate_ema,
+                                 (unsigned long)avg_signal, (unsigned long)avg_delta);
+            return;
+        }
+
+        // No profile hint — use error rate heuristics for exploration
+        if (s_gain_err_ema > gain_err_high() && s_gain_idx > GAIN_FLOOR_IDX
+            && s_gain_idx - 1 > s_gain_floor
+            && ok >= GAIN_MIN_OK_FOR_STATS && avg_signal >= GAIN_MIN_SIG_FOR_DOWN) {
+            // Saturating (>50%) with strong signals — try stepping down
+            s_gain_pre_step_pos_rate = s_gain_pos_rate_ema;
+            s_gain_pre_step_signal = avg_signal;
+            s_gain_step_dir = -1;
+            s_gain_idx--;
+            s_gain_cooldown = GAIN_P2_COOLDOWN;
+            gain_apply();
+            char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+            serial_console_print("%sGAIN: [P2] Exploring down: %.1f → %.1f dB (EMA err=%.0f%%, pos=%.1f/s, range=%.0fnm, sig=%lu delta=%lu)\n",
+                                 _ts, R820T_GAINS[old_idx] / 10.0, R820T_GAINS[s_gain_idx] / 10.0,
+                                 s_gain_err_ema * 100, s_gain_pos_rate_ema, s_max_range_nm,
+                                 (unsigned long)avg_signal, (unsigned long)avg_delta);
+        } else if (s_gain_err_ema < gain_err_low()
+                   && s_gain_idx < (int)R820T_GAIN_COUNT - 1
+                   && s_gain_idx + 1 < s_gain_ceiling) {
+            // Below target band — graduated step-up based on how far below
+            int raise_tenths;
+            if (s_gain_err_ema <= 0.10f) {
+                raise_tenths = GAIN_DB_RAISE_FULL;      // ≤10%: +3.0 dB
+            } else if (s_gain_err_ema <= 0.20f) {
+                raise_tenths = GAIN_DB_RAISE_STRONG;     // 10-20%: +2.5 dB
+            } else if (s_gain_err_ema <= 0.30f) {
+                raise_tenths = GAIN_DB_RAISE_MODERATE;   // 20-30%: +1.5 dB
+            } else {
+                raise_tenths = GAIN_DB_RAISE_MILD;       // 30-40%: +1.0 dB
+            }
+            int new_idx = gain_idx_for_db_raise(s_gain_idx, raise_tenths);
+            // Clamp to ceiling
+            if (new_idx >= s_gain_ceiling) new_idx = s_gain_ceiling - 1;
+            if (new_idx <= s_gain_idx) new_idx = s_gain_idx + 1; // always move at least 1
+            if (new_idx < (int)R820T_GAIN_COUNT && new_idx < s_gain_ceiling) {
+                s_gain_pre_step_pos_rate = s_gain_pos_rate_ema;
+                s_gain_pre_step_signal = avg_signal;
+                s_gain_step_dir = 1;
+                s_gain_idx = new_idx;
+                s_gain_cooldown = GAIN_P2_COOLDOWN;
+                gain_apply();
+                char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+                serial_console_print("%sGAIN: [P2] Exploring up: %.1f → %.1f dB (+%.1f dB, EMA err=%.0f%%, pos=%.1f/s, range=%.0fnm, sig=%lu delta=%lu)\n",
+                                     _ts, R820T_GAINS[old_idx] / 10.0, R820T_GAINS[s_gain_idx] / 10.0,
+                                     (R820T_GAINS[s_gain_idx] - R820T_GAINS[old_idx]) / 10.0,
+                                     s_gain_err_ema * 100, s_gain_pos_rate_ema, s_max_range_nm,
+                                     (unsigned long)avg_signal, (unsigned long)avg_delta);
+            }
+        }
+
+        // ── P2 heartbeat: always log current state for webapp visibility ──
+        {
+            extern device_settings_t g_settings;
+            char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+            const char *bounds = "";
+            if (s_gain_ceiling < (int)R820T_GAIN_COUNT && s_gain_floor >= 0)
+                bounds = ", bounds: ceiling+floor set";
+            else if (s_gain_ceiling < (int)R820T_GAIN_COUNT)
+                bounds = ", bounds: ceiling set";
+            else if (s_gain_floor >= 0)
+                bounds = ", bounds: floor set";
+            serial_console_print("%sGAIN: [P2] Steady: %.1f dB, EMA err=%.0f%%, pos=%.1f/s, range=%.0fnm, sig=%lu delta=%lu, band=%d-%d%%%s\n",
+                                 _ts, R820T_GAINS[s_gain_idx] / 10.0,
+                                 s_gain_err_ema * 100, s_gain_pos_rate_ema,
+                                 s_max_range_nm,
+                                 (unsigned long)avg_signal, (unsigned long)avg_delta,
+                                 g_settings.gain_err_low, g_settings.gain_err_high,
+                                 bounds);
+        }
+    }
 }
 
 // --- Sort state for on-device aircraft list ---
@@ -444,170 +1397,129 @@ static void haversine(double lat1, double lon1, double lat2, double lon2,
     *bearing_deg = brg;
 }
 
+#include "sd_logger.h"
+
 // ============================================================
 // SD card logging
 // ============================================================
 
-static char sd_log_filename[64] = {0};
+static sd_log_ch_t sd_ch;                    // shared channel handle
 static int64_t sd_log_last_sync = 0;
-static int sd_log_writes = 0;
-static bool sd_log_initialized = false;  // header written at least once
-#define SD_SYNC_INTERVAL_US  5000000LL   // flush buffer every 5s
-#define SD_SYNC_WRITE_COUNT  100         // or every 100 messages
+#define SD_SYNC_INTERVAL_US  1000000LL       // flush every 1s if ≥1 sector
+#define SD_SYNC_MAX_US       5000000LL       // hard max: flush every 5s regardless
+#define SD_SYNC_MIN_BYTES    512             // min data for time-based flush
 
 // PSRAM write buffer — messages accumulate here between flushes.
-// File stays CLOSED between sync cycles so the FAT32 dirty bit is
-// never set when a hard reset occurs.  On reset we lose at most one
-// sync interval of buffered data, but macOS mounts without repair.
+// File handle stays OPEN between sync cycles for performance.
+// fsync() on every flush ensures data is committed to the card,
+// so a hard reset loses at most one sync interval of buffered data.
 #define SD_LOG_BUFSIZE  (64 * 1024)
 static char *sd_log_buf = NULL;
 static int   sd_log_buf_pos = 0;
 
-static void sd_log_pick_filename(void) {
+static char sd_log_filename_buf[64];  // scratch for filename generation
+
+static const char *sd_log_pick_filename(void) {
     time_t now;
     struct tm timeinfo;
     time(&now);
     gmtime_r(&now, &timeinfo);
 
-    if (now < 1704067200LL) {
-        snprintf(sd_log_filename, sizeof(sd_log_filename),
-            "/sdcard/adsb_boot%s.csv", sd_config_boot_id());
+    if (!time_manager_is_trusted_fn() || now < 1704067200LL) {
+        // No GPS/NTP fix yet — use boot-numbered name.
+        // Will be renamed to UTC timestamp when trusted time arrives.
+        snprintf(sd_log_filename_buf, sizeof(sd_log_filename_buf),
+            "/sdcard/logs/adsb_boot%s.csv", sd_config_boot_id());
     } else {
-        strftime(sd_log_filename, sizeof(sd_log_filename),
-            "/sdcard/adsb_%Y-%m-%dT%H%M%SZ.csv", &timeinfo);
+        strftime(sd_log_filename_buf, sizeof(sd_log_filename_buf),
+            "/sdcard/logs/adsb_%Y-%m-%dT%H%M%SZ.csv", &timeinfo);
     }
+    return sd_log_filename_buf;
 }
 
-// Write the CSV header to a new file and close it immediately.
+#define ADSB_CSV_HEADER \
+    "timestamp_utc,raw_msg,icao,callsign,altitude_ft,speed_kt," \
+    "heading_deg,vrate_fpm,lat,lon,squawk," \
+    "rx_lat,rx_lon,range_km,bearing_deg," \
+    "rx_sats,rx_hdop\n"
+
 static void sd_log_create(void) {
-    sd_log_pick_filename();
-
-    FILE *f = fopen(sd_log_filename, "w");
-    if (!f) {
-        ESP_LOGW(TAG, "Failed to open SD log: %s", sd_log_filename);
-        return;
-    }
-    fprintf(f, "timestamp_utc,raw_msg,icao,callsign,altitude_ft,speed_kt,"
-               "heading_deg,vrate_fpm,lat,lon,squawk,"
-               "rx_lat,rx_lon,range_km,bearing_deg,"
-               "rx_sats,rx_hdop\n");
-    fflush(f);
-    fsync(fileno(f));
-    fclose(f);
-    sd_clear_dirty_flag();
-
-    sd_log_initialized = true;
+    const char *fn = sd_log_pick_filename();
+    if (!sd_log_ch_open(&sd_ch, fn, ADSB_CSV_HEADER)) return;
     sd_log_last_sync = esp_timer_get_time();
-    sd_log_writes = 0;
-    sd_log_buf_pos = 0;
-    ESP_LOGI(TAG, "SD log: %s", sd_log_filename);
+    // NOTE: sd_log_buf_pos intentionally NOT zeroed — the buffer may
+    // contain valid CSV rows from before a failure.  The caller flushes
+    // the buffer after create/reopen.
 }
 
-// Flush the PSRAM buffer to disk: open → append → close → clear dirty.
-// File is open for only the duration of this call (~10-50ms).
 static void sd_log_flush(void) {
-    if (!sd_log_initialized || sd_log_buf_pos == 0) return;
-    if (sd_log_filename[0] == '\0') return;
-
-    static int s_flush_fail_count = 0;
-
-    FILE *f = fopen(sd_log_filename, "a");
-    if (!f) {
-        s_flush_fail_count++;
-        ESP_LOGW(TAG, "SD flush: cannot open %s (%d consecutive)", sd_log_filename, s_flush_fail_count);
-        if (s_flush_fail_count >= 5) {
-            // SD card likely removed — unmount the dead filesystem so
-            // the recovery path in sd_log_aircraft can remount.
-            ESP_LOGW(TAG, "SD card unresponsive after %d failures — unmounting", s_flush_fail_count);
-            // Set uninitialized FIRST to prevent recursion:
-            // sd_safe_shutdown → sd_log_close → sd_log_flush → returns immediately
-            sd_log_initialized = false;
-            sd_log_filename[0] = '\0';
-            sd_log_buf_pos = 0;
-            s_flush_fail_count = 0;
-            extern void sd_safe_shutdown(void);
-            sd_safe_shutdown();  // unmounts card, sets sd_card_handle = NULL
-        }
-        return;
-    }
-    s_flush_fail_count = 0;  // reset on success
-
-    size_t written = fwrite(sd_log_buf, 1, sd_log_buf_pos, f);
-    fflush(f);
-    fsync(fileno(f));
-    fclose(f);
-
-    // File is now closed — FatFS has no cached state.
-    // Clear dirty bit directly on disk; nothing can overwrite it
-    // until the next fopen (which only happens at next flush).
-    sd_clear_dirty_flag();
-
-    if ((int)written == sd_log_buf_pos) {
+    if (!sd_ch.initialized || sd_log_buf_pos == 0) return;
+    int n = sd_log_buf_pos;
+    sd_log_ch_flush(&sd_ch, sd_log_buf, n);
+    if (sd_ch.initialized) {
+        // Flush succeeded — clear buffer
         sd_log_buf_pos = 0;
-    } else {
-        // Partial write — shift unwritten data to front
-        int remain = sd_log_buf_pos - (int)written;
-        memmove(sd_log_buf, sd_log_buf + written, remain);
-        sd_log_buf_pos = remain;
-        ESP_LOGW(TAG, "SD flush: partial write (%d/%d)", (int)written, sd_log_buf_pos + (int)written);
+        sd_log_last_sync = esp_timer_get_time();
+        sd_log_record_flush(SD_FLUSH_CH_ADSB);
     }
-
-    sd_log_last_sync = esp_timer_get_time();
-    sd_log_writes = 0;
 }
 
 // Close the log permanently (for clean shutdown/unmount).
 void sd_log_close(void) {
-    if (!sd_log_initialized) return;  // already closed or never opened
-    sd_log_flush();  // write any remaining buffered data
-    sd_log_initialized = false;
-    ESP_LOGI(TAG, "SD log closed: %s", sd_log_filename);
+    if (!sd_ch.initialized) return;
+    sd_log_flush();
+    sd_log_ch_close(&sd_ch);
 }
 
 // Print current SD log status.
 void sd_log_print_status(void) {
-    if (sd_log_initialized && sd_log_filename[0]) {
+    if (sd_ch.initialized && sd_ch.filename[0]) {
         printf("I (%lu) CLASS: SD log: %s\n",
-            (unsigned long)(esp_timer_get_time() / 1000), sd_log_filename);
+            (unsigned long)(esp_timer_get_time() / 1000), sd_ch.filename);
     }
 }
 
 // Check if ADS-B SD logging is active (log file open and header written).
 bool sd_log_is_active(void) {
-    return sd_log_initialized;
+    return sd_ch.initialized;
 }
 
 // Close current log and create a fresh one with a new boot-numbered filename.
 // Called after MSC mode exit to start a clean log file.
 void sd_log_create_new(void) {
-    if (sd_log_initialized) sd_log_close();
+    if (sd_ch.initialized) sd_log_close();
     sd_log_create();
 }
 
 // Rename boot-numbered log to UTC-timestamped name.
 // Called once from GPS task when the system clock is first set.
 void sd_log_rename_with_time(void) {
-    if (!sd_log_initialized) return;
-    if (strstr(sd_log_filename, "adsb_boot") == NULL) return;
-    if (g_gps_fix_epoch == 0) return;  // wait for GPS fix
+    if (!sd_ch.initialized) return;
+    if (strstr(sd_ch.filename, "adsb_boot") == NULL) return;
+    if (!time_manager_is_trusted_fn()) return;  // wait for GPS/NTP
 
-    // Flush any buffered data to the old filename first
-    sd_log_flush();
+    ESP_LOGI(TAG, "SD rename starting [DMA free=%u largest=%u, internal=%u]",
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
     struct tm timeinfo;
-    time_t fix_time = g_gps_fix_epoch;
-    gmtime_r(&fix_time, &timeinfo);
+    time_t now;
+    time(&now);
+    gmtime_r(&now, &timeinfo);
 
     char new_filename[64];
     strftime(new_filename, sizeof(new_filename),
-        "/sdcard/adsb_%Y-%m-%dT%H%M%SZ.csv", &timeinfo);
+        "/sdcard/logs/adsb_%Y-%m-%dT%H%M%SZ.csv", &timeinfo);
 
-    // File is already closed (flush closes it), so rename is safe
-    if (rename(sd_log_filename, new_filename) == 0) {
-        ESP_LOGI(TAG, "SD log renamed: %s → %s", sd_log_filename, new_filename);
-        strncpy(sd_log_filename, new_filename, sizeof(sd_log_filename));
+    if (sd_log_ch_rename(&sd_ch, new_filename, sd_log_buf, sd_log_buf_pos)) {
+        sd_log_buf_pos = 0;  // buffer was flushed by rename
     } else {
-        ESP_LOGW(TAG, "SD log rename failed");
+        // Rename failed — channel is now uninitialized.  Create a fresh
+        // file (sd_log_create picks a new timestamp name + writes header).
+        // Buffer was already flushed by rename before the failure.
+        sd_log_buf_pos = 0;
+        sd_log_create();
     }
 }
 
@@ -618,7 +1530,7 @@ static void sd_log_buf_timestamp(void) {
     if (avail < 40) return;  // need room for timestamp
 
     int n;
-    if (g_gps_fix_epoch > 0) {
+    if (time_manager_is_trusted_fn()) {
         struct timeval tv;
         gettimeofday(&tv, NULL);
         struct tm tm_info;
@@ -642,30 +1554,69 @@ static void sd_log_aircraft(aircraft_t *ac, const struct mode_s_msg *mm) {
     extern bool sd_msc_is_active_fn(void);
     if (sd_msc_is_active_fn()) return;
 
-    // Allocate buffer once
+    // Allocate buffer once; init channel on first call
     if (!sd_log_buf) {
         sd_log_buf = heap_caps_malloc(SD_LOG_BUFSIZE, MALLOC_CAP_SPIRAM);
         if (!sd_log_buf) return;
         sd_log_buf_pos = 0;
+        sd_log_ch_init(&sd_ch, TAG);
     }
 
-    // Lazy create: retry every 5 seconds if the log hasn't been created yet
-    if (!sd_log_initialized) {
+    // Lazy create: retry if the log hasn't been created yet
+    if (!sd_ch.initialized) {
+        // If the FAT is structurally corrupt, stop retrying entirely.
+        // User must reformat the card and run 'mount'.
+        if (sd_log_bus_failed()) return;
+
         static int64_t last_retry = 0;
-        static int64_t last_mount_retry = 0;
         int64_t now_us = esp_timer_get_time();
-        if (now_us - last_retry > 5000000LL) {
-            last_retry = now_us;
+        if (now_us - last_retry < 5000000LL) return;  // 5s throttle
+        last_retry = now_us;
+
+        extern bool sd_is_mounted(void);
+
+        // 1. If we have a previous filename and card is mounted, try reopen
+        if (sd_ch.filename[0] && sd_is_mounted()) {
+            sd_log_ch_reopen(&sd_ch);
+            if (sd_ch.initialized && sd_log_buf_pos > 0) {
+                sd_log_flush();  // flush any buffered data from before failure
+            }
+        }
+
+        // 2. Card mounted but reopen failed (or no previous file) → new file
+        if (!sd_ch.initialized && sd_is_mounted()) {
             sd_log_create();
-            if (!sd_log_initialized && (now_us - last_mount_retry > 30000000LL)) {
-                last_mount_retry = now_us;
-                extern bool sd_remount(void);
-                if (sd_remount()) {
+            if (sd_ch.initialized && sd_log_buf_pos > 0) {
+                sd_log_flush();  // flush old buffer to new file
+            }
+        }
+
+        // 3. Card not mounted → try recovery, then reopen or create
+        if (!sd_ch.initialized) {
+            if (sd_log_try_recovery(TAG)) {
+                // Recovery succeeded — try reopen original file
+                if (sd_ch.filename[0]) {
+                    sd_log_ch_reopen(&sd_ch);
+                }
+                // If reopen failed, create new file
+                if (!sd_ch.initialized) {
                     sd_log_create();
+                }
+                if (sd_ch.initialized && sd_log_buf_pos > 0) {
+                    sd_log_flush();
                 }
             }
         }
-        if (!sd_log_initialized) return;
+
+        // 4. Card is mounted but we still can't create files → FAT is
+        //    structurally corrupt (zombie card).  Stop retrying to avoid
+        //    an infinite 5s loop of failed fopen() calls.
+        if (!sd_ch.initialized && sd_is_mounted()) {
+            sd_log_bus_fail("Card mounted but cannot create files "
+                            "— FAT corrupted, reformat card and run 'mount'");
+        }
+
+        if (!sd_ch.initialized) return;
     }
 
     // Check buffer space — flush if getting full (leave 512B headroom)
@@ -698,7 +1649,7 @@ static void sd_log_aircraft(aircraft_t *ac, const struct mode_s_msg *mm) {
 
     avail = SD_LOG_BUFSIZE - sd_log_buf_pos;
     n = snprintf(sd_log_buf + sd_log_buf_pos, avail,
-        ",%06lX,%s,%d,%d,%d,%d,%.5f,%.5f,%04X,%.5f,%.5f,%.1f,%.0f,%d,%.1f\n",
+        ",%06lX,%s,%d,%d,%d,%d,%.5f,%.5f,%04d,%.5f,%.5f,%.1f,%.0f,%d,%.1f\n",
         (unsigned long)ac->icao,
         ac->callsign[0] ? ac->callsign : "",
         ac->altitude,
@@ -717,12 +1668,25 @@ static void sd_log_aircraft(aircraft_t *ac, const struct mode_s_msg *mm) {
     );
     if (n > 0) sd_log_buf_pos += n;
 
-    sd_log_writes++;
-
-    // Periodic flush: buffer → disk → close → clear dirty
+    // Periodic flush:
+    //   • Buffer nearly full → immediate (safety)
+    //   • ≥1s since last flush AND ≥512 bytes → flush (one full sector min)
+    //   • ≥5s since last flush → flush regardless of size (low-traffic fallback)
     int64_t sync_now = esp_timer_get_time();
-    if (sd_log_writes >= SD_SYNC_WRITE_COUNT ||
-        (sync_now - sd_log_last_sync) > SD_SYNC_INTERVAL_US) {
+    int64_t since_self = sync_now - sd_log_last_sync;
+    bool buf_critical = sd_log_buf_pos > SD_LOG_BUFSIZE - 512;
+    bool has_block = sd_log_buf_pos >= SD_SYNC_MIN_BYTES;
+
+    bool should_flush = false;
+    if (buf_critical) {
+        should_flush = true;
+    } else if (since_self >= SD_SYNC_MAX_US && sd_log_buf_pos > 0) {
+        should_flush = true;                                          // 5s hard max
+    } else if (since_self >= SD_SYNC_INTERVAL_US && has_block) {
+        should_flush = true;                                          // 1s + ≥512B
+    }
+
+    if (should_flush) {
         sd_log_flush();
     }
 }
@@ -809,13 +1773,193 @@ void on_msg(mode_s_t *self, struct mode_s_msg *mm)
             c->even_ts    = now;
             c->even_valid = 1;
         }
-        if (c->even_valid && c->odd_valid) {
-            if (cpr_decode(c)) {
-                ac->lat = c->lat;
-                ac->lon = c->lon;
-                ac->has_position = 1;
+
+        int decoded = 0;
+
+        // ── CPR decode strategy with position jump detection:
+        //
+        //    Every candidate position (local or global) is jump-checked against
+        //    the last known good position (good_lat/good_lon). Implausible jumps
+        //    trigger suspect mode, which suppresses local decode (poisoned reference)
+        //    and waits for a clean global decode to recover.
+        //
+        //    Jump threshold: max(10nm, elapsed_seconds × 1.0 nm/s) — ~3600 kt,
+        //    faster than any transponder-equipped aircraft including hypersonic.
+        //    ──
+
+        #define CPR_TIGHT_AGE_US  2000000LL  // 2 seconds — tight global is trustworthy
+
+        int64_t frame_age = c->even_ts - c->odd_ts;
+        if (frame_age < 0) frame_age = -frame_age;
+
+        // 1. Local decode: primary path (skip if suspect — reference is poisoned)
+        if (ac->has_position && !ac->position_suspect) {
+            double new_lat, new_lon;
+            if (cpr_decode_local(ac->lat, ac->lon,
+                                 mm->raw_latitude, mm->raw_longitude,
+                                 mm->fflag, &new_lat, &new_lon)) {
+                if (cpr_jump_check(ac, new_lat, new_lon, now)) {
+                    // Good local decode — accept
+                    ac->lat = new_lat;
+                    ac->lon = new_lon;
+                    c->lat = new_lat;
+                    c->lon = new_lon;
+                    ac->good_lat = new_lat;
+                    ac->good_lon = new_lon;
+                    ac->good_pos_ts = now;
+                    ac->suspect_count = 0;
+                    decoded = 1;
+                } else {
+                    // Local jumped — reference is poisoned, enter suspect mode
+                    ac->position_suspect = 1;
+                    ac->suspect_count = 1;
+                    ac->suspect_agree = 0;
+                    ac->suspect_lat = 0;
+                    ac->suspect_lon = 0;
+                    serial_console_print("CPR: %06lX position suspect — local jumped, awaiting global recovery\n",
+                                         ac->icao);
+                    // Fall through to global decode for immediate recovery attempt
+                }
             }
         }
+
+        // 2. Global decode
+        if (c->even_valid && c->odd_valid && frame_age <= CPR_MAX_AGE_US) {
+            if (cpr_decode(c)) {
+                double gLat = c->lat, gLon = c->lon;
+
+                if (!ac->has_position) {
+                    // First contact — no good_pos, jump check auto-passes
+                    ac->lat = gLat;
+                    ac->lon = gLon;
+                    ac->has_position = 1;
+                    ac->good_lat = gLat;
+                    ac->good_lon = gLon;
+                    ac->good_pos_ts = now;
+                    decoded = 1;
+
+                } else if (ac->position_suspect) {
+                    // Recovery mode — two paths to accept:
+                    //   A. Global passes jump check against good_pos (good_pos was right)
+                    //   B. N consecutive globals agree with each other (good_pos was wrong)
+
+                    int recovered = 0;
+                    int via_consensus = 0;
+
+                    // Path A: matches good_pos — immediate recovery
+                    if (cpr_jump_check(ac, gLat, gLon, now)) {
+                        recovered = 1;
+                    }
+
+                    // Path B: consensus — globals agreeing with each other
+                    if (!recovered) {
+                        if (ac->suspect_agree > 0) {
+                            // Check against previous candidate
+                            double dlat = gLat - ac->suspect_lat;
+                            double dlon = (gLon - ac->suspect_lon) * cos(ac->suspect_lat * M_PI / 180.0);
+                            double dist_nm = sqrt(dlat * dlat + dlon * dlon) * 60.0;
+                            if (dist_nm <= CPR_CONSENSUS_NM) {
+                                ac->suspect_agree++;
+                                ac->suspect_lat = gLat;  // track latest in cluster
+                                ac->suspect_lon = gLon;
+                                if (ac->suspect_agree >= CPR_CONSENSUS_COUNT) {
+                                    recovered = 1;
+                                    via_consensus = 1;
+                                }
+                            } else {
+                                // Doesn't match previous candidate — restart consensus
+                                ac->suspect_agree = 1;
+                                ac->suspect_lat = gLat;
+                                ac->suspect_lon = gLon;
+                            }
+                        } else {
+                            // First candidate in recovery — seed consensus
+                            ac->suspect_agree = 1;
+                            ac->suspect_lat = gLat;
+                            ac->suspect_lon = gLon;
+                        }
+                    }
+
+                    if (recovered) {
+                        ac->lat = gLat;
+                        ac->lon = gLon;
+                        c->lat = gLat;
+                        c->lon = gLon;
+                        ac->position_suspect = 0;
+                        ac->suspect_count = 0;
+                        ac->suspect_agree = 0;
+                        ac->good_lat = gLat;
+                        ac->good_lon = gLon;
+                        ac->good_pos_ts = now;
+                        decoded = 1;
+                        if (via_consensus)
+                            serial_console_print("CPR: %06lX recovered via consensus (%d agreeing globals)\n",
+                                                 ac->icao, CPR_CONSENSUS_COUNT);
+                        else
+                            serial_console_print("CPR: %06lX recovered via global decode\n", ac->icao);
+                    } else {
+                        ac->suspect_count++;
+                        if (ac->suspect_count >= CPR_SUSPECT_GIVE_UP) {
+                            ac->has_position = 0;
+                            ac->position_suspect = 0;
+                            ac->suspect_count = 0;
+                            ac->suspect_agree = 0;
+                            serial_console_print("CPR: %06lX gave up recovery — resetting position\n",
+                                                 ac->icao);
+                        }
+                    }
+
+                } else if (!decoded) {
+                    // Local failed (50nm check) — try global as re-seed
+                    if (cpr_jump_check(ac, gLat, gLon, now)) {
+                        ac->lat = gLat;
+                        ac->lon = gLon;
+                        ac->good_lat = gLat;
+                        ac->good_lon = gLon;
+                        ac->good_pos_ts = now;
+                        decoded = 1;
+                    } else {
+                        // Global re-seed also implausible — enter suspect
+                        ac->position_suspect = 1;
+                        ac->suspect_count = 1;
+                        ac->suspect_agree = 0;
+                        ac->suspect_lat = 0;
+                        ac->suspect_lon = 0;
+                        serial_console_print("CPR: %06lX position suspect — global re-seed jumped\n",
+                                             ac->icao);
+                    }
+
+                } else if (frame_age <= CPR_TIGHT_AGE_US) {
+                    // Keyframe correction: local succeeded, tight global available
+                    if (cpr_jump_check(ac, gLat, gLon, now)) {
+                        double dlat = ac->lat - gLat;
+                        double dlon = (ac->lon - gLon) * cos(ac->lat * M_PI / 180.0);
+                        double dist_nm = sqrt(dlat * dlat + dlon * dlon) * 60.0;
+                        if (dist_nm > 2.0) {
+                            // Local reference has drifted — reseat from global
+                            ac->lat = gLat;
+                            ac->lon = gLon;
+                            ac->good_lat = gLat;
+                            ac->good_lon = gLon;
+                            ac->good_pos_ts = now;
+                        }
+                    } else {
+                        // Tight global disagrees with good_pos — good_pos may be wrong.
+                        // Both local and tight global agree (decoded=1 + tight pair),
+                        // but both are far from good_pos. Enter suspect, seed consensus.
+                        ac->position_suspect = 1;
+                        ac->suspect_count = 1;
+                        ac->suspect_agree = 1;
+                        ac->suspect_lat = gLat;
+                        ac->suspect_lon = gLon;
+                        serial_console_print("CPR: %06lX position suspect — tight global disagrees with reference\n",
+                                             ac->icao);
+                    }
+                    // Loose global (2–10s) with local already decoded: skip.
+                }
+            }
+        }
+        if (decoded) s_gain_win_pos++;  // track for adaptive gain throughput metric
     }
 
     // Velocity (DF17, TC 19, subtypes 1-4)
@@ -895,7 +2039,7 @@ void on_msg(mode_s_t *self, struct mode_s_msg *mm)
 
     // Squawk
     if (ac->squawk) {
-        int n = snprintf(line + pos, avail, " SQK:%04X", ac->squawk);
+        int n = snprintf(line + pos, avail, " SQK:%04d", ac->squawk);
         if (n > 0) { pos += n; avail -= n; }
     }
 
@@ -913,6 +2057,31 @@ void on_msg(mode_s_t *self, struct mode_s_msg *mm)
     }
 
     sd_log_aircraft(ac, mm);
+
+    // Queue aircraft update for MQTT feeder (returns immediately if not connected)
+    {
+        mqtt_aircraft_t mqac = {0};
+        snprintf(mqac.icao, sizeof(mqac.icao), "%06lX", (unsigned long)icao);
+        if (ac->callsign[0])
+            strncpy(mqac.callsign, ac->callsign, sizeof(mqac.callsign) - 1);
+        mqac.lat = ac->lat;
+        mqac.lon = ac->lon;
+        mqac.alt_ft = ac->altitude;
+        mqac.speed_kt = (int16_t)ac->speed;
+        mqac.heading_deg = (int16_t)ac->heading;
+        mqac.vert_rate_fpm = (int16_t)ac->vert_rate;
+        mqac.has_pos = ac->has_position ? true : false;
+        mqac.ts_us = esp_timer_get_time();
+        // Compute distance/bearing from receiver
+        receiver_pos_t rx = adsb_get_receiver_pos();
+        if (rx.fix_valid && ac->has_position) {
+            double dist_km, brg;
+            haversine(rx.lat, rx.lon, ac->lat, ac->lon, &dist_km, &brg);
+            mqac.dist_nm = (float)(dist_km * 0.539957);
+            mqac.bearing_deg = (int16_t)brg;
+        }
+        mqtt_feeder_update_aircraft(&mqac);
+    }
 
     // Update message statistics
     s_total_messages++;
@@ -959,6 +2128,14 @@ static void adsb_reader_task(void *arg)
         goto done;
     }
 
+    /* Log dongle identification for debugging */
+    {
+        char model_str[64];
+        int force_bt = 0;
+        rtlsdr_get_dongle_info(rtldev, model_str, sizeof(model_str), NULL, &force_bt);
+        ESP_LOGI(TAG, "RTL-SDR: %s%s", model_str, force_bt ? ", bias-T forced ON" : "");
+    }
+
     r = rtlsdr_set_center_freq(rtldev, 1090000000);
     if (r < 0) fprintf(stderr, "WARNING: Failed to set center freq.\n");
     else       fprintf(stderr, "Tuned to %u Hz.\n", 1090000000);
@@ -967,9 +2144,22 @@ static void adsb_reader_task(void *arg)
     if (r < 0) fprintf(stderr, "WARNING: Failed to set sample rate.\n");
     else       fprintf(stderr, "Sampling at %u S/s.\n", 2000000);
 
-    r = rtlsdr_set_tuner_gain_mode(rtldev, 0);  // 0 = automatic gain
-    if (r != 0) fprintf(stderr, "WARNING: Failed to set tuner gain.\n");
-    else        fprintf(stderr, "Tuner gain set to automatic.\n");
+    r = rtlsdr_set_tuner_gain_mode(rtldev, 1);  // 1 = manual gain
+    if (r != 0) fprintf(stderr, "WARNING: Failed to set tuner gain mode.\n");
+
+    // Initialize gain from settings
+    if (g_settings.adsb_gain_mode == 1) {
+        // Manual: use saved value
+        s_gain_auto = false;
+        s_gain_idx = gain_find_idx(g_settings.adsb_gain_tenths);
+    } else {
+        // Auto: start at max, let adaptive algorithm adjust
+        s_gain_auto = true;
+        s_gain_idx = R820T_GAIN_COUNT - 1;
+    }
+    gain_apply();
+    fprintf(stderr, "Tuner gain set to %.1f dB (%s).\n",
+            R820T_GAINS[s_gain_idx] / 10.0, s_gain_auto ? "adaptive" : "manual");
 
     // Apply bias-T setting from NVS (default: off)
     r = rtlsdr_set_bias_tee(rtldev, g_settings.adsb_bias_tee ? 1 : 0);
@@ -994,8 +2184,25 @@ static void adsb_reader_task(void *arg)
     }
 
     ESP_LOGI(TAG, "[APP] Free memory: %ld bytes", esp_get_free_heap_size());
+
     mode_s_init(&state);
+    ESP_LOGI(TAG, "mode_s_init done, stack HWM: %u free, heap: %s",
+             (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)),
+             heap_caps_check_integrity_all(true) ? "OK" : "CORRUPT");
+
+    // Allocate SD log buffer and initialize channel before creating the log
+    // file.  sd_log_aircraft() has a lazy-init path, but it re-inits the
+    // channel (memset) which would zero out an already-open file handle if
+    // sd_log_create() ran first.  Do the allocation here so both paths agree.
+    if (!sd_log_buf) {
+        sd_log_buf = heap_caps_malloc(SD_LOG_BUFSIZE, MALLOC_CAP_SPIRAM);
+        if (sd_log_buf) {
+            sd_log_buf_pos = 0;
+            sd_log_ch_init(&sd_ch, TAG);
+        }
+    }
     sd_log_create();
+
     s_msg_window_start = esp_timer_get_time();
 
     // Allocate read buffers and magnitude buffer once — in PSRAM to
@@ -1017,10 +2224,18 @@ static void adsb_reader_task(void *arg)
         free(buffer);
         goto done;
     }
-
     // Main read loop — runs until stop flag is set (e.g. device removed)
     int consecutive_errors = 0;
+    s_gain_last_eval = esp_timer_get_time();
+
     while (!s_adsb_reader_stop) {
+        // Apply deferred gain changes from external callers (serial console)
+        // This ensures rtlsdr_set_tuner_gain() is only called from the USB task.
+        if (s_gain_pending) {
+            gain_apply();
+            s_gain_pending = false;
+        }
+
         int read_ok = 1;
         for (int i = 0; i < DEFAULT_BUF_LENGTH; i += MAX_PACKET_SIZE) {
             r = rtlsdr_read_sync(rtldev, tbuffer, MAX_PACKET_SIZE, &n_read);
@@ -1039,6 +2254,91 @@ static void adsb_reader_task(void *arg)
         if (read_ok && n_read > 0) {
             demodulate(buffer, DEFAULT_BUF_LENGTH);
             consecutive_errors = 0;  // reset on successful read
+
+            // One-shot health check after first successful read
+            {
+                static bool first_read_logged = false;
+                if (!first_read_logged) {
+                    first_read_logged = true;
+                    ESP_LOGI(TAG, "First read OK, stack HWM: %u free, heap: %s",
+                             (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)),
+                             heap_caps_check_integrity_all(true) ? "OK" : "CORRUPT");
+                }
+            }
+
+            // Adaptive gain evaluation — phase-dependent timing
+            if (s_gain_auto) {
+                int64_t now_gain = esp_timer_get_time();
+                int64_t elapsed = now_gain - s_gain_last_eval;
+                uint32_t msgs = state.stat_crc_ok + state.stat_crc_fail;
+                bool should_eval = false;
+
+                // Warmup: let decoder stabilize before first evaluation
+                if (s_gain_warmup && elapsed < GAIN_WARMUP_US) {
+                    // Still warming up — skip
+                } else {
+                    if (s_gain_warmup) {
+                        // Warmup just ended — flush accumulated counters so first real window starts clean
+                        s_gain_warmup = false;
+                        state.stat_crc_ok = 0;
+                        state.stat_crc_fail = 0;
+                        state.stat_preambles = 0;
+                        state.stat_signal_sum = 0;
+                        state.stat_delta_sum = 0;
+                        s_gain_win_pos = 0;
+                        s_gain_last_eval = now_gain;
+                        ESP_LOGI("GAIN", "Warmup complete — starting adaptive gain");
+                    } else if (s_gain_phase == 1) {
+                        // Phase 1: fast — every 10s or 200 messages
+                        if (elapsed >= GAIN_P1_PERIOD_US || msgs >= GAIN_P1_MSG_COUNT)
+                            should_eval = true;
+                    } else {
+                        // Phase 2: steady — every 60s
+                        if (elapsed >= GAIN_P2_PERIOD_US)
+                            should_eval = true;
+                    }
+
+                    if (should_eval) {
+                        gain_evaluate(&state);
+                        s_gain_last_eval = now_gain;
+                    }
+                }
+            }
+
+            // Manual-mode heartbeat: log stats every 60s for webapp visibility
+            if (!s_gain_auto) {
+                static int64_t s_manual_hb_last = 0;
+                static uint32_t s_manual_hb_ok = 0;
+                static uint32_t s_manual_hb_fail = 0;
+                static uint32_t s_manual_hb_pos = 0;
+                static uint64_t s_manual_hb_signal = 0;
+                static uint64_t s_manual_hb_delta = 0;
+                int64_t now_hb = esp_timer_get_time();
+                if (s_manual_hb_last == 0) s_manual_hb_last = now_hb;  // first call
+                if (now_hb - s_manual_hb_last >= GAIN_P2_PERIOD_US) {
+                    float elapsed_s = (now_hb - s_manual_hb_last) / 1e6f;
+                    uint32_t d_ok = state.stat_crc_ok - s_manual_hb_ok;
+                    uint32_t d_fail = state.stat_crc_fail - s_manual_hb_fail;
+                    uint32_t d_pos = s_gain_win_pos - s_manual_hb_pos;
+                    uint64_t d_signal = state.stat_signal_sum - s_manual_hb_signal;
+                    uint64_t d_delta_sum = state.stat_delta_sum - s_manual_hb_delta;
+                    float err = (d_ok + d_fail > 0) ? (float)d_fail / (d_ok + d_fail) : 0;
+                    float pos_rate = (elapsed_s > 0) ? d_pos / elapsed_s : 0;
+                    uint32_t hb_avg_sig = d_ok > 0 ? (uint32_t)(d_signal / d_ok) : 0;
+                    uint32_t hb_avg_del = d_ok > 0 ? (uint32_t)(d_delta_sum / d_ok) : 0;
+                    s_manual_hb_last = now_hb;
+                    s_manual_hb_ok = state.stat_crc_ok;
+                    s_manual_hb_fail = state.stat_crc_fail;
+                    s_manual_hb_pos = s_gain_win_pos;
+                    s_manual_hb_signal = state.stat_signal_sum;
+                    s_manual_hb_delta = state.stat_delta_sum;
+                    char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+                    serial_console_print("%sGAIN: [Manual] %.1f dB, err=%.0f%%, pos=%.1f/s, range=%.0fnm, sig=%lu delta=%lu\n",
+                                         _ts, R820T_GAINS[s_gain_idx] / 10.0,
+                                         err * 100, pos_rate, s_max_range_nm,
+                                         (unsigned long)hb_avg_sig, (unsigned long)hb_avg_del);
+                }
+            }
         }
         if (!read_ok) {
             consecutive_errors++;
@@ -1120,7 +2420,8 @@ static void client_event_cb(const usb_host_client_event_msg_t *event_msg, void *
         break;
 
     default:
-        abort();
+        ESP_LOGW(TAG, "Unknown USB client event: %d", event_msg->event);
+        break;
     }
 }
 

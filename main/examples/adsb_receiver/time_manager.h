@@ -10,18 +10,19 @@
  *   Source        Stratum  Est. accuracy  Notes
  *   ────────────  ───────  ─────────────  ──────────────────────────────
  *   GPS PPS       0        ~100ns         Future: hardware interrupt on GPIO
- *   GPS NMEA      1        ~100-200ms     Serial latency, always 1PPS cadence
- *   NTP           2-3      ~30-100ms      WiFi required, configurable server
- *   PCF8563 RTC   16       ~1-5s          Write-only backup (not used for sync)
+ *   NTP           2        ~30-100ms      WiFi required, configurable server
+ *   GPS NMEA      3        ~1-2s          Serial pipeline delay (no PPS)
+ *   PCF8563 RTC   16       ~1-5s          Boot seed for TLS; not a sync source
  *   Unsync'd      —        unbounded      Boot with no source yet
  *
  * Boot behavior:
  *   System clock starts at epoch 0. Log lines use [boot+elapsed] format.
- *   The clock is NOT seeded from RTC — we don't know when the RTC was last
- *   disciplined and stale time is worse than no time. The system stays in
- *   boot+elapsed mode until GPS fix or NTP provides a verified source.
- *   The RTC IS written to when GPS/NTP updates arrive, preserving good time
- *   for other consumers (display clock, etc.) but never read back for sync.
+ *   On first RTC read, the POSIX clock is seeded from the RTC so that TLS
+ *   certificate validation works before GPS/NTP is available. This does NOT
+ *   change the log format — logs stay in [boot+elapsed] until a trusted
+ *   source (GPS, NTP, or PPS — stratum ≤ 3) syncs, at which point logs
+ *   switch to UTC. The RTC is written to when GPS/NTP updates arrive,
+ *   keeping it fresh for the next boot seed.
  *
  * How PPS will integrate (future):
  *   1. GPIO edge interrupt on PPS rising edge → captures esp_timer_get_time()
@@ -50,6 +51,14 @@
 #include "freertos/task.h"
 
 static const char *TM_TAG = "TIME";
+
+// ─── GPS Integrity Modes ─────────────────────────────────────────────────────
+
+typedef enum {
+    GPS_INTEGRITY_BASIC   = 0,  // garbled NMEA guard (>1 hr reject, 5-consecutive override)
+    GPS_INTEGRITY_STRICT  = 1,  // drift rate guard + NTP cross-check, no override
+    // Future modes: 2=paranoid (position consistency), 3=MLAT-grade, ...
+} gps_integrity_mode_t;
 
 // ─── Source Identifiers ──────────────────────────────────────────────────────
 
@@ -81,6 +90,7 @@ typedef struct {
     uint32_t      est_accuracy_us;    // estimated accuracy in microseconds
     uint32_t      update_count;       // total corrections from this source
     uint8_t       stratum;            // NTP stratum (0=PPS, 1=GPS, 2-3=NTP, 16=RTC)
+    uint8_t       consecutive_rejects; // consecutive large-offset rejections (sanity guard)
 } time_source_state_t;
 
 // ─── PPS State (future, pre-allocated) ───────────────────────────────────────
@@ -103,11 +113,32 @@ typedef struct {
 #define TIME_NTP_POLL_MAX_S   3600    // 1 hour maximum
 #define TIME_STALE_THRESHOLD_S  600   // source considered stale after 10 min no update
 
+// Basic mode: garbled NMEA guard
+#define TIME_BASIC_MAX_S      3600    // reject corrections >1 hour after initial sync
+#define TIME_BASIC_OVERRIDE      5    // accept after N consecutive rejections
+
+// Strict mode: drift rate guard + NTP cross-check
+#define TIME_STRICT_DRIFT_PPM     100    // max crystal drift (generous — real quartz is 20–50)
+#define TIME_STRICT_BASELINE_US   500000 // 500ms baseline for serial jitter
+#define TIME_STRICT_NTP_DISAGREE_S  5    // reject GPS if NTP disagrees by more than this
+
 typedef struct {
     time_source_state_t sources[TIME_MAX_SOURCES]; // indexed by time_source_t - 1
     time_source_t       active_source;              // currently governing source
     bool                synced;                     // at least one source has set the clock
+    bool                trusted;                    // a quality source (GPS/NTP/PPS, stratum ≤3) has synced
+                                                    // — drives log timestamp transition from [boot+elapsed] to UTC
+    bool                rtc_seeded;                 // POSIX clock seeded from RTC (for TLS, not logs)
     int64_t             boot_time_us;               // esp_timer when first sync happened
+
+    // Callback: fires when a trusted correction is applied to the system clock.
+    // Use to sync external RTC, update displays, etc.
+    void              (*on_correction)(time_source_t source);
+
+    // GPS integrity
+    gps_integrity_mode_t integrity_mode;            // set from device_settings
+    int64_t             last_accepted_utc_us;       // UTC microseconds of last accepted correction
+    int64_t             last_accepted_mono_us;      // esp_timer when last correction was accepted
 
     // NTP config
     char    ntp_server[64];
@@ -175,7 +206,10 @@ static inline void time_manager_init(const char *ntp_server, int32_t ntp_poll_s)
     // Set strata
     tm_get_source(TIME_SRC_RTC)->stratum = 16;
     tm_get_source(TIME_SRC_NTP)->stratum = 2;
-    tm_get_source(TIME_SRC_GPS)->stratum = 1;
+    // GPS-over-serial (no PPS) has ~1-2s pipeline delay from fix to NMEA parse.
+    // Stratum 3 means it's useful when WiFi/NTP is unavailable, but NTP (stratum 2)
+    // wins when both are active. PPS (stratum 0) would override everything.
+    tm_get_source(TIME_SRC_GPS)->stratum = 3;
     tm_get_source(TIME_SRC_PPS)->stratum = 0;
 
     // NTP config
@@ -189,6 +223,31 @@ static inline void time_manager_init(const char *ntp_server, int32_t ntp_poll_s)
 
     ESP_LOGI(TM_TAG, "Time manager initialized (NTP: %s, poll: %lds)",
              s_tm.ntp_server, (long)s_tm.ntp_poll_s);
+}
+
+/**
+ * Set GPS integrity mode. Call after time_manager_init() with the
+ * value from device_settings. Can also be changed at runtime.
+ */
+static inline void time_manager_set_integrity_mode(gps_integrity_mode_t mode) {
+    s_tm.integrity_mode = mode;
+    ESP_LOGI(TM_TAG, "GPS integrity mode: %s",
+             mode == GPS_INTEGRITY_STRICT ? "strict (drift guard + NTP cross-check)"
+                                          : "basic (garbled NMEA guard)");
+}
+
+static inline gps_integrity_mode_t time_manager_get_integrity_mode(void) {
+    return s_tm.integrity_mode;
+}
+
+/**
+ * Register a callback that fires when a trusted clock correction is applied.
+ * Use to sync external RTC, update displays, etc. The callback receives
+ * the source that triggered the correction (NTP, GPS, PPS).
+ * Set to NULL to unregister.
+ */
+static inline void time_manager_set_correction_cb(void (*cb)(time_source_t)) {
+    s_tm.on_correction = cb;
 }
 
 // ─── Core Update ─────────────────────────────────────────────────────────────
@@ -240,7 +299,72 @@ static inline bool time_manager_update(time_source_t source,
 
     // Skip tiny corrections (< 10ms) to avoid jitter — unless this is the first sync
     if (s_tm.synced && llabs(offset_us) < 10000) {
+        ss->consecutive_rejects = 0;
         return false;
+    }
+
+    // ── GPS integrity guard (post-initial-sync only) ──
+    if (s_tm.synced) {
+        if (s_tm.integrity_mode == GPS_INTEGRITY_STRICT) {
+            // ── Strict: drift rate guard ──
+            // Max plausible offset = elapsed × drift_ppm + baseline jitter.
+            // A garbled 2095 date (~2e9s) fails instantly. A gradual spoof
+            // shifting >100 ppm fails within one update cycle.
+            int64_t mono_now = esp_timer_get_time();
+            int64_t elapsed_us = mono_now - s_tm.last_accepted_mono_us;
+            if (elapsed_us < 0) elapsed_us = 0; // monotonic wraparound guard
+            int64_t max_offset_us = (elapsed_us / 10000) * TIME_STRICT_DRIFT_PPM
+                                  + TIME_STRICT_BASELINE_US;
+
+            if (llabs(offset_us) > max_offset_us) {
+                ESP_LOGW(TM_TAG, "%s: drift guard rejected %+.1fs "
+                         "(max plausible %.3fs after %.1fs elapsed)",
+                         time_source_name(source), offset_us / 1000000.0,
+                         max_offset_us / 1000000.0, elapsed_us / 1000000.0);
+                return false;
+            }
+
+            // ── Strict: NTP cross-check (when available) ──
+            // If NTP is active and recent, reject GPS if it disagrees with NTP
+            if (source == TIME_SRC_GPS) {
+                time_source_state_t *ntp = tm_get_source(TIME_SRC_NTP);
+                if (ntp && ntp->active && ntp->update_count > 0
+                    && !tm_source_is_stale(ntp)) {
+                    // NTP last saw system clock at offset ntp->last_offset_us.
+                    // GPS now proposes offset_us. If they disagree significantly, reject GPS.
+                    int64_t disagreement = llabs(offset_us - ntp->last_offset_us);
+                    if (disagreement > (int64_t)TIME_STRICT_NTP_DISAGREE_S * 1000000LL) {
+                        ESP_LOGW(TM_TAG, "%s: NTP cross-check failed "
+                                 "(GPS offset %+.1fs, NTP offset %+.1fs, delta %.1fs)",
+                                 time_source_name(source),
+                                 offset_us / 1000000.0,
+                                 ntp->last_offset_us / 1000000.0,
+                                 disagreement / 1000000.0);
+                        return false;
+                    }
+                }
+            }
+        } else {
+            // ── Basic: reject >1 hour, accept after N consecutive ──
+            if (llabs(offset_us) > (int64_t)TIME_BASIC_MAX_S * 1000000LL) {
+                ss->consecutive_rejects++;
+                if (ss->consecutive_rejects < TIME_BASIC_OVERRIDE) {
+                    ESP_LOGW(TM_TAG, "%s: rejected implausible correction %+.1fs "
+                             "(reject %u/%u — will accept if persistent)",
+                             time_source_name(source), offset_us / 1000000.0,
+                             (unsigned)ss->consecutive_rejects,
+                             (unsigned)TIME_BASIC_OVERRIDE);
+                    return false;
+                }
+                ESP_LOGW(TM_TAG, "%s: accepting large correction %+.1fs "
+                         "after %u consecutive reports",
+                         time_source_name(source), offset_us / 1000000.0,
+                         (unsigned)ss->consecutive_rejects);
+                ss->consecutive_rejects = 0;
+            } else {
+                ss->consecutive_rejects = 0;
+            }
+        }
     }
 
     // Apply the correction
@@ -249,8 +373,22 @@ static inline bool time_manager_update(time_source_t source,
     bool was_synced = s_tm.synced;
     s_tm.synced = true;
     s_tm.active_source = source;
+    s_tm.last_accepted_utc_us = src_us;
+    s_tm.last_accepted_mono_us = esp_timer_get_time();
     if (!was_synced) {
-        s_tm.boot_time_us = esp_timer_get_time();
+        s_tm.boot_time_us = s_tm.last_accepted_mono_us;
+    }
+    // Quality source (stratum ≤ 3: PPS/GPS/NTP) — trusted for log timestamps.
+    // RTC (stratum 16) seeds POSIX clock for TLS but does NOT flip this flag.
+    if (ss->stratum <= 3 && !s_tm.trusted) {
+        s_tm.trusted = true;
+        ESP_LOGI(TM_TAG, "Trusted time acquired from %s — logs switching to UTC",
+                 time_source_name(source));
+    }
+
+    // Notify external RTC sync (if registered) — only for trusted sources
+    if (ss->stratum <= 3 && s_tm.on_correction) {
+        s_tm.on_correction(source);
     }
 
     // Log significant corrections
@@ -346,18 +484,23 @@ static inline void time_manager_set_ntp_config(const char *server, int32_t poll_
 /**
  * Report a GPS NMEA time fix. Call from the GPS task on each valid RMC/GGA.
  *
- * utc_sec:      UTC epoch seconds from NMEA parse
- * serial_latency_us: estimated serial + processing delay (typ. 100000-200000)
+ * utc_sec:      UTC epoch seconds from NMEA parse (integer, floored)
+ * serial_latency_us: estimated total delay from fix to processing, including:
+ *                    - ~500ms average integer-second truncation (0-999ms uniform)
+ *                    - ~1600ms pipeline (L76K processing + UART + NMEA parse + task)
+ *                    Measured against NTP ground truth: ~2000ms total.
  *
  * The manager compensates for serial latency and decides whether to apply.
  */
 static inline bool time_manager_gps_update(time_t utc_sec, int32_t serial_latency_us) {
     struct timeval tv;
-    tv.tv_sec  = utc_sec;
-    tv.tv_usec = serial_latency_us; // compensate: NMEA was this old when parsed
+    // Normalize: tv_usec must be 0–999999 for settimeofday()
+    tv.tv_sec  = utc_sec + serial_latency_us / 1000000;
+    tv.tv_usec = serial_latency_us % 1000000;
 
-    // Accuracy is bounded by serial latency — typically 100-200ms
-    uint32_t accuracy = (uint32_t)abs(serial_latency_us) + 50000; // add 50ms margin
+    // Accuracy is bounded by integer truncation jitter (~±500ms)
+    // plus pipeline variance (~±200ms)
+    uint32_t accuracy = 700000; // ~700ms
 
     return time_manager_update(TIME_SRC_GPS, &tv, accuracy);
 }
@@ -373,16 +516,54 @@ static inline void time_manager_gps_lost_fix(void) {
 
 // ─── RTC Integration ─────────────────────────────────────────────────────────
 //
-// In ADS-B Scope, the RTC is WRITE-ONLY for clock sync purposes:
-// - GPS/NTP write good time to the RTC (for display clock, etc.)
-// - We do NOT read the RTC back to set the system clock at boot
-// - Boot stays in [boot+elapsed] mode until GPS or NTP provides verified time
-// - time_manager_rtc_update() is available for other projects that want RTC boot seeding
+// The RTC provides two functions:
+//
+// 1. Boot seed (time_manager_rtc_seed): Sets the POSIX clock from the PCF8563
+//    so that TLS certificate validation works before GPS/NTP is available.
+//    Does NOT mark the system as synced or trusted — log timestamps stay in
+//    [boot+elapsed] format. Only seeds if the RTC looks sane (>2024) and the
+//    POSIX clock is still near epoch.
+//
+// 2. Write-back: GPS/NTP write good time to the RTC for the display clock
+//    and for the next boot seed. The RTC is never used as a time source for
+//    clock discipline — only for the initial TLS bootstrap.
 
 /**
- * Report time from PCF8563 RTC.
- * NOT called at boot in ADS-B Scope (we don't trust undisciplined RTC).
- * Available for other use cases that want RTC as a fallback.
+ * Seed POSIX clock from RTC at boot — for TLS cert validation only.
+ *
+ * Sets the system clock via settimeofday() but does NOT update any time
+ * manager source state, synced flag, or trusted flag. Log timestamps
+ * remain in [boot+elapsed] format until GPS or NTP provides verified time.
+ *
+ * utc_sec: approximate UTC epoch from RTC (converted from local time by caller)
+ *
+ * Returns true if the clock was seeded, false if skipped (already seeded,
+ * RTC value implausible, or POSIX clock already set by a better source).
+ */
+static inline bool time_manager_rtc_seed(time_t utc_sec) {
+    if (s_tm.rtc_seeded) return false;           // already done
+    if (utc_sec < 1704067200) return false;       // before 2024-01-01 — RTC garbage
+
+    struct timeval tv_now;
+    gettimeofday(&tv_now, NULL);
+    if (tv_now.tv_sec > 1704067200) return false; // POSIX clock already set (NTP won race)
+
+    struct timeval tv_rtc = { .tv_sec = utc_sec, .tv_usec = 0 };
+    settimeofday(&tv_rtc, NULL);
+    s_tm.rtc_seeded = true;
+
+    struct tm t;
+    gmtime_r(&utc_sec, &t);
+    ESP_LOGI(TM_TAG, "RTC seed: %04d-%02d-%02d %02d:%02d:%02d UTC",
+             t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+             t.tm_hour, t.tm_min, t.tm_sec);
+    return true;
+}
+
+/**
+ * Report time from PCF8563 RTC as a time source.
+ * NOT used in ADS-B Scope — here for completeness.
+ * Use time_manager_rtc_seed() for boot TLS seeding instead.
  */
 static inline bool time_manager_rtc_update(time_t utc_sec) {
     struct timeval tv = { .tv_sec = utc_sec, .tv_usec = 0 };
@@ -521,7 +702,24 @@ static inline int64_t time_manager_get_precise_us(uint32_t *est_error_us) {
 // ─── Status / Query ──────────────────────────────────────────────────────────
 
 /**
- * Check if we have any quality time source (GPS or NTP synced recently).
+ * Check if a trusted time source (GPS, NTP, or PPS) has synced.
+ * Drives the log timestamp transition from [boot+elapsed] to UTC.
+ * RTC boot seeding does NOT make this return true.
+ */
+static inline bool time_manager_is_trusted(void) {
+    return s_tm.trusted;
+}
+
+/**
+ * C-linkage wrapper for time_manager_is_trusted() — used by serial_console.c
+ * for log timestamp formatting.
+ */
+extern "C" bool time_manager_is_trusted_fn(void) {
+    return s_tm.trusted;
+}
+
+/**
+ * Check if we have any time source at all (including RTC seed).
  */
 static inline bool time_manager_has_quality_source(void) {
     return s_tm.synced && s_tm.active_source != TIME_SRC_NONE;
@@ -543,9 +741,11 @@ static inline time_source_t time_manager_active_source(void) {
  * Print status of all time sources to the console.
  */
 static inline void time_manager_print_status(void) {
-    printf("[TIME] Active source: %s  Synced: %s\n",
+    printf("[TIME] Active source: %s  Synced: %s  Trusted: %s  RTC-seeded: %s\n",
            time_source_name(s_tm.active_source),
-           s_tm.synced ? "yes" : "no");
+           s_tm.synced ? "yes" : "no",
+           s_tm.trusted ? "yes" : "no",
+           s_tm.rtc_seeded ? "yes" : "no");
 
     for (int i = 0; i < TIME_MAX_SOURCES; i++) {
         time_source_state_t *ss = &s_tm.sources[i];

@@ -29,9 +29,18 @@
 #include "rtlsdr_i2c.h"
 #include "tuner_r82xx.h"
 
+/* Forward declaration — defined in librtlsdr.c, declared here with void*
+ * because tuner_r82xx.c doesn't include rtl-sdr.h (avoids circular deps). */
+int rtlsdr_set_bias_tee_gpio(void *dev, int gpio, int on);
+
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
 #define MHZ(x) ((x) * 1000 * 1000)
 #define KHZ(x) ((x) * 1000)
+
+/* Band identifiers for Blog V4/V4L input switching */
+#define HF  1
+#define VHF 2
+#define UHF 3
 
 /*
  * Static constants
@@ -504,7 +513,8 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
     if (rc < 0)
         return rc;
 
-    if (priv->cfg->rafael_chip == CHIP_R828D)
+    if (priv->cfg->rafael_chip == CHIP_R828D ||
+        rtlsdr_check_dongle_model(priv->rtl_dev, "RTLSDRBlog", "Blog V4L"))
         vco_power_ref = 1;
 
     vco_fine_tune = (data[4] & 0x30) >> 4;
@@ -1158,8 +1168,24 @@ int r82xx_set_bandwidth(struct r82xx_priv *priv, int bw, uint32_t rate)
 int r82xx_set_freq(struct r82xx_priv *priv, uint32_t freq)
 {
     int rc = -1;
-    uint32_t lo_freq = freq + priv->int_freq;
+    int is_blog_v4  = rtlsdr_check_dongle_model(priv->rtl_dev, "RTLSDRBlog", "Blog V4");
+    int is_blog_v4l = rtlsdr_check_dongle_model(priv->rtl_dev, "RTLSDRBlog", "Blog V4L");
+    uint32_t upconvert_freq;
+    uint32_t lo_freq;
     uint8_t air_cable1_in;
+    uint8_t band;
+    uint8_t cable_2_in;
+    uint8_t cable_1_in;
+    uint8_t air_in;
+
+    /* Blog V4/V4L: automatically upconvert by 28.8 MHz when tuning below
+     * 28.8 MHz so SDR software doesn't need a manual offset.  The V4's
+     * internal upconverter mixes HF with the 28.8 MHz oscillator. */
+    upconvert_freq = (is_blog_v4 || is_blog_v4l)
+        ? ((freq < MHZ(28.8)) ? (freq + MHZ(28.8)) : freq)
+        : freq;
+
+    lo_freq = upconvert_freq + priv->int_freq;
 
     rc = r82xx_set_mux(priv, lo_freq);
     if (rc < 0)
@@ -1169,17 +1195,96 @@ int r82xx_set_freq(struct r82xx_priv *priv, uint32_t freq)
     if (rc < 0 || !priv->has_lock)
         goto err;
 
-    /* switch between 'Cable1' and 'Air-In' inputs on sticks with
-     * R828D tuner. We switch at 345 MHz, because that's where the
-     * noise-floor has about the same level with identical LNA
-     * settings. The original driver used 320 MHz. */
-    air_cable1_in = (freq > MHZ(345)) ? 0x00 : 0x60;
+    /* ── Input switching ──────────────────────────────────────────────
+     * The R828D has multiple RF inputs (Air-In, Cable1, Cable2).
+     * Which input to use depends on frequency and dongle variant.
+     *
+     * Blog V4:  3 inputs — Cable2 (HF ≤28.8 MHz), Cable1 (VHF 28.8–250 MHz),
+     *           Air-In (UHF >250 MHz).  GPIO5 controls upconverter switch.
+     * Blog V4L: 2 inputs — Cable1 (HF ≤28.8 MHz), Air-In (UHF >28.8 MHz).
+     *           GPIO5 controls upconverter switch.
+     * Generic R828D: 2 inputs — Cable1 (≤345 MHz), Air-In (>345 MHz).
+     * R820T:    Single input — no switching needed.
+     */
+    if (is_blog_v4) {
+        band = (freq <= MHZ(28.8)) ? HF
+             : ((freq > MHZ(28.8) && freq < MHZ(250)) ? VHF : UHF);
 
-    if ((priv->cfg->rafael_chip == CHIP_R828D) &&
-        (air_cable1_in != priv->input))
-    {
-        priv->input = air_cable1_in;
-        rc = r82xx_write_reg_mask(priv, 0x05, air_cable1_in, 0x60);
+        /* Bypass tracking filter for HF — the upconverter path doesn't
+         * benefit from it, and bypassing reduces insertion loss.
+         * Must be outside band-change guard since r82xx_set_mux
+         * re-applies the tracking filter on every frequency change. */
+        if (band == HF) {
+            rc = r82xx_write_reg_mask(priv, 0x1a, 0x40, 0xc3);
+            if (rc < 0) goto err;
+            rc = r82xx_write_reg(priv, 0x1b, 0x00);
+            if (rc < 0) goto err;
+        }
+
+        /* Only switch registers when band actually changes */
+        if (band != priv->input) {
+            priv->input = band;
+
+            /* Cable2 = HF input (upconverter) */
+            cable_2_in = (band == HF) ? 0x08 : 0x00;
+            rc = r82xx_write_reg_mask(priv, 0x06, cable_2_in, 0x08);
+            if (rc < 0) goto err;
+
+            /* GPIO5 controls upconverter switch on newer batches */
+            rc = rtlsdr_set_bias_tee_gpio(priv->rtl_dev, 5, !cable_2_in);
+            if (rc < 0) goto err;
+
+            /* Cable1 = VHF input */
+            cable_1_in = (band == VHF) ? 0x40 : 0x00;
+            rc = r82xx_write_reg_mask(priv, 0x05, cable_1_in, 0x40);
+            if (rc < 0) goto err;
+
+            /* Air-In = UHF input */
+            air_in = (band == UHF) ? 0x00 : 0x20;
+            rc = r82xx_write_reg_mask(priv, 0x05, air_in, 0x20);
+            if (rc < 0) goto err;
+        }
+    } else if (is_blog_v4l) {
+        band = (freq <= MHZ(28.8)) ? HF : UHF;
+
+        /* Bypass tracking filter for HF (same rationale as V4) */
+        if (band == HF) {
+            rc = r82xx_write_reg_mask(priv, 0x1a, 0x40, 0xc3);
+            if (rc < 0) goto err;
+            rc = r82xx_write_reg(priv, 0x1b, 0x00);
+            if (rc < 0) goto err;
+        }
+
+        if (band != priv->input) {
+            priv->input = band;
+
+            /* Cable1 = HF input (upconverter) */
+            cable_1_in = (band == HF) ? 0x40 : 0x00;
+
+            /* GPIO5 controls upconverter switch on newer batches */
+            rc = rtlsdr_set_bias_tee_gpio(priv->rtl_dev, 5, !cable_1_in);
+            if (rc < 0) goto err;
+
+            rc = r82xx_write_reg_mask(priv, 0x05, cable_1_in, 0x40);
+            if (rc < 0) goto err;
+
+            /* Air-In = UHF input */
+            air_in = (band == UHF) ? 0x00 : 0x20;
+            rc = r82xx_write_reg_mask(priv, 0x05, air_in, 0x20);
+            if (rc < 0) goto err;
+        }
+    } else {
+        /* Generic R828D or R820T — original switching logic.
+         * Switch between Cable1 and Air-In at 345 MHz where the
+         * noise floor is roughly equal with identical LNA settings. */
+        air_cable1_in = (freq > MHZ(345)) ? 0x00 : 0x60;
+
+        if ((priv->cfg->rafael_chip == CHIP_R828D) &&
+            (air_cable1_in != priv->input))
+        {
+            priv->input = air_cable1_in;
+            rc = r82xx_write_reg_mask(priv, 0x05, air_cable1_in, 0x60);
+        }
     }
 
 err:

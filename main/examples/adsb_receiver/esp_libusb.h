@@ -29,6 +29,7 @@ typedef struct
     uint8_t *response_buf;
     bool is_done;
     bool is_success;
+    bool stall_detected;    // EP0 STALL detected — needs pipe recovery
     int bytes_transferred;
     usb_transfer_t *transfer;      // bulk transfer - allocated once, never freed
     usb_transfer_t *ctrl_transfer; // control transfer - pre-allocated once in init_adsb_dev

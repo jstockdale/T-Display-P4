@@ -19,6 +19,11 @@ void mode_s_init(mode_s_t *self)
     self->fix_errors = 1;
     self->check_crc = 1;
     self->aggressive = 0;
+    self->stat_preambles = 0;
+    self->stat_crc_ok = 0;
+    self->stat_crc_fail = 0;
+    self->stat_signal_sum = 0;
+    self->stat_delta_sum = 0;
 
     // Allocate the ICAO address cache. We use two uint32_t for every entry
     // because it's a addr / timestamp pair for every entry
@@ -809,9 +814,28 @@ void mode_s_detect(mode_s_t *self, uint16_t *mag, uint32_t maglen, mode_s_callba
             // Decode the received message
             mode_s_decode(self, &mm, msg);
 
+            // Track statistics for adaptive gain
+            self->stat_preambles++;
+            if (mm.crcok)
+                self->stat_crc_ok++;
+            else
+                self->stat_crc_fail++;
+
             // Skip this message if we are sure it's fine.
             if (mm.crcok)
             {
+                // Accumulate signal quality metrics for adaptive gain.
+                // Preamble signal level: true average of the 4 preamble peaks.
+                // (Note: the threshold `high` on line 699 divides by 6 for margin;
+                //  here we divide by 4 for an actual average.)
+                // These preamble samples are never modified by phase correction
+                // (which only affects data bits at offset >= MODE_S_PREAMBLE_US*2).
+                self->stat_signal_sum += (uint32_t)(mag[j] + mag[j+2] + mag[j+7] + mag[j+9]) / 4;
+                // Bit delta: average |high−low| across all bit pairs in the message.
+                // Computed on original (restored) magnitudes — represents actual
+                // received SNR. Higher = cleaner decode. Noise floor at 2550.
+                self->stat_delta_sum += (uint32_t)delta;
+
                 j += (MODE_S_PREAMBLE_US + (msglen * 8)) * 2;
                 good_message = 1;
                 if (use_correction)

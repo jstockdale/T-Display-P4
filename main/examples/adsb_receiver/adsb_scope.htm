@@ -6,6 +6,8 @@
 <title>ADS-B Scope – Off by One</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://unpkg.com/mqtt@5.3.0/dist/mqtt.min.js"></script>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Space+Grotesk:wght@400;600;700&display=swap');
   :root { --bg:#0a0e14; --panel:#111820; --panel-border:#1e2a36; --text:#c8d6e5; --text-dim:#5c7080; --accent:#00e5a0; --accent-dim:rgba(0,229,160,0.15); --warning:#ff6b35; --blue:#4dabf7; }
@@ -20,8 +22,66 @@
   #topbar .logo{font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:15px;color:var(--accent);letter-spacing:-0.5px;white-space:nowrap}
   #topbar .logo span{color:var(--text-dim);font-weight:400}
   .scope-ver{font-size:10px;opacity:0.5}
-  .stat{display:flex;align-items:center;gap:5px;color:var(--text-dim)}.stat .val{color:var(--text);font-weight:600;font-variant-numeric:tabular-nums}.stat .val.live{color:var(--accent)}
+  .stat{display:flex;align-items:center;gap:5px;color:var(--text-dim)}.stat .val{color:var(--text);font-weight:600;font-variant-numeric:tabular-nums;min-width:3ch}.stat .val.live{color:var(--accent)}
   #stats-bar{display:flex;align-items:center;gap:14px;flex-shrink:0}
+  .gain-led{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--text-dim);opacity:0.4;margin:0 5px 0 0;vertical-align:middle;transition:opacity 0.3s}
+  .gain-live{display:inline-flex;align-items:center}
+  #gain-badge .val{color:var(--text-dim)}
+  #gain-badge .val.gain-steady{color:var(--accent)}#gain-badge .val.gain-converging{color:#c4a63a}#gain-badge .val.gain-manual{color:var(--text)}
+  #gain-badge.gain-state-converging .gain-live{animation:gain-pulse 2s ease-in-out infinite}
+  #gain-badge.open .gain-led{opacity:1}
+  #gain-badge.open.gain-state-steady .gain-led{background:var(--accent)}
+  #gain-badge.open.gain-state-converging .gain-led{background:#c4a63a}
+  #gain-badge.open.gain-state-manual .gain-led{background:var(--text)}
+  @keyframes gain-pulse{0%,100%{opacity:0.5}50%{opacity:1}}
+  #gain-popover{display:none;position:absolute;top:66px;z-index:999;background:rgba(17,24,32,0.9);border:1px solid var(--panel-border);border-radius:6px;padding:8px 12px;font-size:11px;line-height:1.7;min-width:190px;color:var(--text-dim)}
+  #gain-popover.visible{display:block}
+  #gain-pop-mode{font-weight:600;margin-bottom:2px;cursor:pointer;transition:color 0.15s}
+  #gain-pop-mode:hover{filter:brightness(1.3)}
+  #gain-mode-editor{display:none;margin:4px 0 6px;padding:6px 0}
+  #gain-mode-editor.visible{display:block}
+  .gain-mode-btns{display:flex;gap:6px;margin-bottom:6px}
+  .gain-mode-btn{padding:2px 8px;border:1px solid var(--panel-border);border-radius:3px;cursor:pointer;font-size:10px;color:var(--text-dim);transition:all 0.15s}
+  .gain-mode-btn:hover{border-color:var(--text-dim);color:var(--text)}
+  .gain-mode-btn.active{border-color:var(--accent);color:var(--accent)}
+  .gain-slider{display:flex;align-items:center;gap:8px}
+  .gain-slider .track-wrap{position:relative;flex:1;height:30px}
+  .gain-slider .track{position:absolute;top:10px;left:0;right:0;height:4px;background:var(--panel-border);border-radius:2px}
+  .gain-slider .track-ends{display:flex;justify-content:space-between;position:absolute;top:17px;left:0;right:0;font-size:8px;color:var(--text-dim);opacity:0.5}
+  .gain-slider .gain-pos{position:absolute;top:10px;height:4px;left:0;background:var(--accent);opacity:0.3;border-radius:2px}
+  .gain-slider.auto-mode.converging .gain-pos{background:#c4a63a}
+  .gain-slider input[type=range]{position:absolute;top:0;left:0;width:100%;height:24px;-webkit-appearance:none;appearance:none;background:transparent;margin:0;cursor:pointer}
+  .gain-slider input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;height:14px;width:14px;border-radius:50%;background:var(--text);cursor:pointer;border:2px solid var(--bg)}
+  .gain-slider input[type=range]::-moz-range-thumb{height:14px;width:14px;border-radius:50%;background:var(--text);cursor:pointer;border:2px solid var(--bg)}
+  .gain-slider.auto-mode input[type=range]{pointer-events:none;cursor:default}
+  .gain-slider.auto-mode input[type=range]::-webkit-slider-thumb{background:var(--accent);cursor:default}
+  .gain-slider.auto-mode input[type=range]::-moz-range-thumb{background:var(--accent);cursor:default}
+  .gain-slider.auto-mode.converging input[type=range]::-webkit-slider-thumb{background:#c4a63a}
+  .gain-slider.auto-mode.converging input[type=range]::-moz-range-thumb{background:#c4a63a}
+  .gain-slider .gain-db-val{font-weight:600;font-size:10px;min-width:38px}
+  .gain-slider .gain-db-val.auto-steady{color:var(--accent)}
+  .gain-slider .gain-db-val.auto-conv{color:#c4a63a}
+  .gain-slider .gain-db-val.manual{color:var(--text)}
+  #gain-pop-detail span{display:block}
+  #gain-pop-detail .err-label{cursor:pointer;transition:color 0.15s}
+  #gain-pop-detail .err-label:hover{color:var(--text)}
+  #gain-pop-detail .err-label.band-open{color:var(--accent)}
+  #gain-band-editor{display:none;margin:4px 0 2px;padding:6px 0}
+  #gain-band-editor.visible{display:block}
+  .gain-preset{padding:2px 8px;border:1px solid var(--panel-border);border-radius:3px;cursor:pointer;font-size:10px;color:var(--text-dim);transition:all 0.15s}
+  .gain-preset:hover{border-color:var(--text-dim);color:var(--text)}
+  .gain-preset.active{border-color:var(--accent);color:var(--accent)}
+  .dual-range{position:relative;display:flex;align-items:center;gap:8px;margin:8px 0 4px}
+  .dual-range .band-val{color:var(--text);font-weight:600;font-size:10px;min-width:28px}
+  .dual-range .band-val.low{text-align:right}
+  .dual-range .band-val.high{text-align:left}
+  .dual-range .track-wrap{position:relative;flex:1;height:30px}
+  .dual-range .track{position:absolute;top:10px;left:0;right:0;height:4px;background:var(--panel-border);border-radius:2px}
+  .dual-range .track-ends{display:flex;justify-content:space-between;position:absolute;top:17px;left:0;right:0;font-size:8px;color:var(--text-dim);opacity:0.5}
+  .dual-range .fill{position:absolute;top:10px;height:4px;background:var(--accent);opacity:0.4;border-radius:2px}
+  .dual-range input[type=range]{position:absolute;top:0;left:0;width:100%;height:24px;-webkit-appearance:none;appearance:none;background:transparent;pointer-events:none;margin:0}
+  .dual-range input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;height:14px;width:14px;border-radius:50%;background:var(--accent);cursor:pointer;pointer-events:auto;border:2px solid var(--bg)}
+  .dual-range input[type=range]::-moz-range-thumb{height:14px;width:14px;border-radius:50%;background:var(--accent);cursor:pointer;pointer-events:auto;border:2px solid var(--bg)}
   .topbtn{background:transparent;color:var(--text-dim);border:1px solid var(--panel-border);padding:4px 10px;border-radius:4px;font-family:inherit;font-size:11px;font-weight:600;cursor:pointer;text-transform:uppercase;letter-spacing:0.5px;white-space:nowrap;min-height:32px;touch-action:manipulation}
   .topbtn:hover{border-color:var(--text-dim);color:var(--text)}.topbtn.active{border-color:var(--accent);color:var(--accent)}
   #connect-btn{background:var(--accent);color:var(--bg);border:none;padding:6px 16px;border-radius:4px;font-family:inherit;font-size:12px;font-weight:700;cursor:pointer;text-transform:uppercase;letter-spacing:0.5px;white-space:nowrap;min-height:36px;touch-action:manipulation}
@@ -30,26 +90,63 @@
   #label-modes{display:flex;gap:3px;flex-shrink:0}
   #color-modes button,#label-modes button{background:transparent;color:var(--text-dim);border:1px solid var(--panel-border);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:10px;cursor:pointer;font-weight:600;white-space:nowrap;min-height:28px;min-width:32px;touch-action:manipulation}
   #color-modes button:hover,#label-modes button:hover{border-color:var(--text-dim)}#color-modes button.active,#label-modes button.active{border-color:var(--accent);color:var(--accent)}
-  #ac-map-btn,#mesh-map-btn{background:transparent;color:var(--text-dim);border:1px solid var(--panel-border);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:10px;cursor:pointer;font-weight:600;white-space:nowrap;min-height:28px;touch-action:manipulation}
-  #ac-map-btn:hover,#mesh-map-btn:hover{border-color:var(--text-dim)}#ac-map-btn.active{border-color:var(--accent);color:var(--accent)}#mesh-map-btn.active{border-color:var(--blue);color:var(--blue)}
+  #ac-map-btn,#mesh-map-btn,#view3d-btn{background:transparent;color:var(--text-dim);border:1px solid var(--panel-border);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:10px;cursor:pointer;font-weight:600;white-space:nowrap;min-height:28px;touch-action:manipulation}
+  #ac-map-btn:hover,#mesh-map-btn:hover,#view3d-btn:hover{border-color:var(--text-dim)}#ac-map-btn.active{border-color:var(--accent);color:var(--accent)}#mesh-map-btn.active{border-color:var(--blue);color:var(--blue)}#view3d-btn.active{border-color:var(--accent);color:var(--accent)}
+  #view3d-container{position:absolute;inset:0;z-index:1;display:none;background:#060a0f}
+  #view3d-canvas{width:100%;height:100%;display:block}
+  #view3d-labels{position:absolute;inset:0;pointer-events:none;overflow:hidden}
+  .lbl3d{position:absolute;font-size:11px;font-family:'JetBrains Mono',monospace;white-space:nowrap;pointer-events:auto;cursor:pointer;transform:translate(10px,-50%);text-shadow:0 1px 3px rgba(0,0,0,0.9),0 0 6px rgba(0,0,0,0.5)}
+  .lbl3d.sel3d{font-weight:700;filter:drop-shadow(0 0 6px currentColor)}
   #panel{position:absolute;bottom:0;left:0;right:0;z-index:1000;background:linear-gradient(0deg,rgba(10,14,20,0.97),rgba(10,14,20,0.85));backdrop-filter:blur(10px);border-top:1px solid var(--panel-border);height:35vh;overflow:hidden;display:flex;flex-direction:column}
   #panel.collapsed{height:44px}
   #panel-drag{height:12px;cursor:ns-resize;flex-shrink:0;display:flex;align-items:center;justify-content:center;touch-action:none}
   #panel-drag::after{content:'';width:40px;height:3px;background:var(--panel-border);border-radius:2px}
   #panel-drag:hover::after{background:var(--text-dim)}
-  #panel-toggle{width:100%;padding:4px 8px;background:none;border:none;color:var(--text-dim);font-family:inherit;font-size:11px;cursor:pointer;text-align:center;letter-spacing:1px;text-transform:uppercase;flex-shrink:0;min-height:32px;touch-action:manipulation}
+  #panel-toggle-bar{width:100%;padding:4px 8px;background:none;border:none;color:var(--text-dim);font-family:inherit;font-size:11px;text-align:center;letter-spacing:1px;text-transform:uppercase;flex-shrink:0;min-height:32px;display:flex;align-items:center;justify-content:center}
+  #panel-toggle{cursor:pointer;padding:4px 16px;border-radius:3px;touch-action:manipulation}
+  #panel-toggle:hover{color:var(--text)}
   #panel-scroll{flex:1;overflow:auto;-webkit-overflow-scrolling:touch;outline:none}
   #ac-table{width:100%;border-collapse:collapse;font-size:11px;min-width:700px}
-  #ac-table th{position:sticky;top:0;background:var(--panel);color:var(--text-dim);text-align:left;padding:6px 10px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;font-size:10px;border-bottom:1px solid var(--panel-border)}
+  #ac-table th{position:sticky;top:0;z-index:2;background:var(--panel);color:var(--text-dim);text-align:left;padding:6px 10px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;font-size:10px;border-bottom:1px solid var(--panel-border)}
   #ac-table td{padding:5px 10px;border-bottom:1px solid rgba(30,42,54,0.4);white-space:nowrap}
   #ac-table tr:hover td{background:var(--accent-dim);cursor:pointer}
   #ac-table tr.selected td{background:rgba(77,171,247,0.15);border-bottom-color:rgba(77,171,247,0.08)}
   #ac-table tr.kb-focus{outline:1px solid var(--accent);outline-offset:-1px;position:relative;z-index:1}
   #ac-table tr.kb-focus td{border-bottom-color:transparent}
   .col-icao{font-weight:600}.col-cs{color:var(--text);font-weight:600}.col-alt{color:var(--accent)}
-  #ac-table th{cursor:pointer;user-select:none;white-space:nowrap}#ac-table th:hover{color:var(--accent)}
+  #ac-table .col-pin{width:24px;text-align:center!important;cursor:pointer}
+  #ac-table tr.dim-040 td{opacity:0.4}
+  #ac-table tr.dim-050 td{opacity:0.5}
+  .pin-led{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--text-dim);opacity:0.3;vertical-align:middle}
+  .pin-led.on{background:var(--accent);opacity:1}
+  .pin-led.on-gold{background:#dab24a;opacity:1}
+  .pin-led.on-gold-dim{background:#a08630;opacity:1}
+  .pin-led.on-gold{background:#dab24a;opacity:1}
+  #ac-table th.col-pin:hover .pin-led{background:var(--accent);opacity:1}
+  #ac-table th.col-pin.sort-active .pin-led{background:var(--accent);opacity:1}
+  #ac-table th{cursor:pointer;user-select:none;white-space:nowrap}#ac-table th:hover{color:var(--accent)}#ac-table th.sort-active{color:var(--accent)}
   #ac-table th span{font-size:9px;opacity:0.6;display:inline-block;width:10px;text-align:center}
+  #ac-table th.sort-active span{opacity:1}
   .col-vr.climbing{color:var(--accent)}.col-vr.descending{color:var(--warning)}.col-dist{color:var(--text-dim)}
+  /* Squawk */
+  .sqk-badge{font-size:9px;font-weight:700;padding:1px 4px;border-radius:2px;letter-spacing:0.3px}
+  .sqk-7700{background:#ff3b3b;color:#fff}.sqk-7500{background:#ff3b3b;color:#fff;animation:sqk-pulse 1s ease-in-out infinite}.sqk-7600{background:#ff8c00;color:#fff}
+  .sqk-7400{background:#9b59b6;color:#fff}.sqk-7777{background:#5a6a7a;color:#fff}
+  .sqk-dim{color:var(--text-dim);font-size:9px}
+  #ac-table tr.sqk-emerg td{border-left:2px solid #ff3b3b}
+  #ac-table tr.sqk-emerg{background:rgba(255,59,59,0.08)}
+  #ac-table tr.sqk-nordo td{border-left:2px solid #ff8c00}
+  #ac-table tr.sqk-nordo{background:rgba(255,140,0,0.06)}
+  @keyframes sqk-pulse{0%,100%{opacity:1}50%{opacity:0.4}}
+  .ac-label .sqk-alert{font-weight:700;margin-left:3px}
+  .sqk-icon-pulse{animation:sqk-ring 1.5s ease-in-out infinite}
+  @keyframes sqk-ring{0%,100%{filter:drop-shadow(0 0 4px #ff3b3b55)}50%{filter:drop-shadow(0 0 12px #ff3b3b) drop-shadow(0 0 4px #fff)}}
+  /* Toast */
+  #sqk-toast{position:absolute;top:66px;left:50%;transform:translateX(-50%);z-index:2000;display:flex;flex-direction:column;gap:6px;pointer-events:none}
+  .sqk-toast-item{background:rgba(255,59,59,0.95);color:#fff;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:700;padding:8px 16px;border-radius:6px;white-space:nowrap;pointer-events:auto;animation:sqk-toast-in 0.3s ease-out;box-shadow:0 4px 20px rgba(255,59,59,0.4)}
+  .sqk-toast-item.nordo{background:rgba(255,140,0,0.95);box-shadow:0 4px 20px rgba(255,140,0,0.4)}
+  .sqk-toast-item.fade{opacity:0;transition:opacity 0.5s}
+  @keyframes sqk-toast-in{from{transform:translateY(-20px);opacity:0}to{transform:translateY(0);opacity:1}}
   .leaflet-div-icon{background:none!important;border:none!important}
   .leaflet-control-zoom{display:none!important}
   #zoom-ctrl{position:absolute;right:12px;z-index:1000;display:flex;flex-direction:row;gap:8px}
@@ -69,7 +166,16 @@
   #sd-info{color:var(--text-dim);font-size:10px;margin-top:4px;padding-top:4px;border-top:1px solid var(--panel-border)}
   #sd-info #sd-logs{display:inline-block;vertical-align:top}
   #sd-info .sd-ok{color:var(--accent)}#sd-info .sd-meshy{color:var(--blue)}#sd-info .sd-err{color:var(--warning)}#sd-info .sd-wait{color:var(--text-dim)}
-  #detail-wrap{position:absolute;top:66px;right:12px;bottom:calc(var(--panel-h, 35vh) + 8px);z-index:1000;overflow-y:auto;overflow-x:hidden;display:none;flex-direction:column;gap:8px;width:240px;padding-bottom:8px;-webkit-overflow-scrolling:touch}
+  #mqtt-info{color:var(--text-dim);font-size:10px;margin-top:4px;padding-top:4px;border-top:1px solid var(--panel-border);cursor:pointer}
+  #mqtt-info:hover{color:var(--text)}
+  #mqtt-info.mqtt-open{color:var(--accent)}
+  .mqtt-off{color:var(--text-dim)}.mqtt-connecting{color:#dab24a;font-weight:600}.mqtt-on{color:var(--accent);font-weight:600}.mqtt-err{color:var(--warning);font-weight:600}
+  #mqtt-config{margin-top:4px;padding-top:4px}
+  #mqtt-config input[type="text"],#mqtt-config input[type="password"],#mqtt-config input:not([type]){background:rgba(255,255,255,0.06);border:1px solid var(--panel-border);border-radius:3px;color:var(--text);font-family:inherit;font-size:10px;padding:3px 6px;width:100%;margin:2px 0;box-sizing:border-box}
+  #mqtt-config input::placeholder{color:var(--text-dim);opacity:0.6}
+  #mqtt-config label{font-size:10px;color:var(--text-dim);cursor:pointer}
+  #mqtt-config button{background:var(--accent);color:var(--bg);border:none;border-radius:3px;font-family:inherit;font-size:10px;font-weight:600;padding:3px 10px;cursor:pointer;margin-top:4px}
+  #detail-wrap{position:absolute;top:66px;right:12px;bottom:calc(var(--panel-h, 35vh) + 8px);z-index:1000;overflow-y:auto;overflow-x:hidden;display:none;flex-direction:column;gap:8px;width:288px;padding-bottom:8px;-webkit-overflow-scrolling:touch}
   #detail-wrap.visible{display:flex}
   .det-card{background:rgba(17,24,32,0.95);border:1px solid var(--panel-border);border-radius:6px;padding:10px 14px;font-size:12px;color:var(--text);line-height:1.7;flex-shrink:0}
   .det-card .dh{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;border-bottom:1px solid var(--panel-border);padding-bottom:4px}
@@ -79,8 +185,9 @@
   .dv{font-weight:600}.dv.up{color:var(--accent)}.dv.dn{color:var(--warning)}
   #log-panel{display:none;position:absolute;top:160px;left:12px;z-index:1001;width:min(640px,calc(100vw - 24px));height:min(400px,calc(100vh - 220px));background:rgba(10,14,20,0.96);border:1px solid var(--panel-border);border-radius:6px;overflow:hidden;flex-direction:column;resize:both}
   #log-panel.visible{display:flex}
-  #log-header{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid var(--panel-border);font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:0.5px;flex-shrink:0}
+  #log-header{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid var(--panel-border);font-size:11px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:0.5px;flex-shrink:0;cursor:grab}
   #log-header button{background:none;border:none;color:var(--text-dim);font-size:14px;cursor:pointer;padding:4px 8px;min-width:32px;min-height:32px;touch-action:manipulation}#log-header button:hover{color:var(--text)}
+  #log-header.dragging{cursor:grabbing}
   #log-controls{display:flex;gap:10px;align-items:center;padding:6px 12px;border-bottom:1px solid var(--panel-border);flex-shrink:0}
   #log-controls label{font-size:10px;color:var(--text-dim);display:flex;align-items:center;gap:4px;cursor:pointer;min-height:32px;touch-action:manipulation}
   #log-controls input[type="checkbox"]{accent-color:var(--accent);width:16px;height:16px}
@@ -163,7 +270,7 @@
     #topbar-spacer{display:none}
 
     #gnss-info{font-size:10px;padding:6px 10px;max-width:calc(100vw - 70px)}
-    #detail-wrap{right:8px;width:200px;max-height:50vh}
+    #detail-wrap{right:8px;width:240px;max-height:50vh}
     #panel{height:30vh}
 
     #log-panel{top:auto!important;bottom:0!important;left:0!important;right:0!important;width:100%!important;height:50vh!important;border-radius:6px 6px 0 0;resize:none}
@@ -214,11 +321,12 @@
 </head>
 <body>
 <div id="topbar">
-  <div class="logo">ADS-B SCOPE <span>/ Off by One <span class="scope-ver">v1.0.6</span></span></div>
+  <div class="logo">ADS-B SCOPE <span>/ Off by One <span class="scope-ver">v1.0.8</span></span></div>
   <div id="stats-bar">
     <div class="stat"><span>AC</span><span class="val live" id="ac-count">0</span></div>
     <div class="stat hm"><span>MSG</span><span class="val" id="msg-count">0</span></div>
     <div class="stat hm"><span>MSG/s</span><span class="val" id="msg-rate">0</span></div>
+    <div class="stat hm" id="gain-badge" onclick="toggleGainPopover()" title="Tuner gain (click for details)" style="cursor:pointer"><span>GAIN</span><span class="gain-live" id="gain-live"><span class="gain-led" id="gain-led"></span><span class="val" id="gain-val">N/A</span></span></div>
   </div>
   <div id="color-modes">
     <button class="active" onclick="setCM('mono')" id="cm-mono" title="Terminal green">MONO</button>
@@ -232,6 +340,7 @@
   </div>
   <button id="ac-map-btn" class="active" onclick="toggleAcMap()" title="Show aircraft on map">✈ AC</button>
   <button id="mesh-map-btn" onclick="toggleMeshyMap()" title="Show Meshtastic nodes on map">⬡ MESH</button>
+  <button id="view3d-btn" onclick="toggle3dView()" title="Toggle 3D perspective view">3D</button>
   <div id="topbar-spacer"></div>
   <div id="topbar-right">
     <button class="topbtn" id="log-btn" onclick="toggleLog()" title="Toggle serial log panel">Log</button>
@@ -244,6 +353,10 @@
     <button id="connect-btn" onclick="toggleSerial()" title="Connect to device via WebSerial">Connect Serial</button>
   </div>
 </div>
+<div id="gain-popover">
+  <div id="gain-pop-mode"></div>
+  <div id="gain-pop-detail"></div>
+</div>
 <div id="timeline">
   <button id="tl-play" onclick="tlToggle()" title="Play/pause CSV timeline">▶</button>
   <button onclick="tlSpeed(-1)" title="Slow down playback">−</button>
@@ -255,6 +368,15 @@
 </div>
 <div id="gnss-info"><span style="color:var(--text-dim)">Last: </span><span id="gnss-utc" title="Device UTC clock" class="utc-none">--:--:-- UTC</span><br><span title="GPS receiver status and satellite count">RX: <span id="gnss-status" class="nofix">No fix</span></span><br><span id="gnss-detail" title="Horizontal dilution of precision and receiver coordinates"></span>
 <div id="sd-info">SD: <div id="sd-logs"></div></div>
+<div id="mqtt-info" title="Click to configure MQTT feed" onclick="mqttToggleConfig(event)">MQTT: <span id="mqtt-status" class="mqtt-off">off</span></div>
+<div id="mqtt-config" style="display:none" onclick="event.stopPropagation()">
+  <label title="Enable or disable MQTT publishing"><input type="checkbox" id="mqtt-cfg-on" onchange="mqttCfgSave()"> Enabled</label><br>
+  <input id="mqtt-cfg-url" placeholder="wss://mqtt.offx1.com:9883" title="Broker WebSocket URL" spellcheck="false" onchange="mqttCfgSave()"><br>
+  <input id="mqtt-cfg-user" placeholder="Username" title="Broker username" spellcheck="false" onchange="mqttCfgSave()"><br>
+  <input id="mqtt-cfg-pass" placeholder="Password" type="password" title="Broker password" spellcheck="false" onchange="mqttCfgSave()"><br>
+  <input id="mqtt-cfg-username" placeholder="Username (optional)" title="Your name — shown in MQTT client ID instead of random tab ID" spellcheck="false" onchange="mqttCfgSave()"><br>
+  <button onclick="mqttCfgApply()" title="Connect with current settings">Apply</button>
+</div>
 </div>
 <div id="detail-wrap"></div>
 <div id="session-panel"></div>
@@ -264,6 +386,7 @@
     <label><input type="checkbox" id="f-a" checked onchange="refilterLog()"> ADS-B</label>
     <label><input type="checkbox" id="f-g" checked onchange="refilterLog()"> GNSS</label>
     <label><input type="checkbox" id="f-m" checked onchange="refilterLog()"> Meshy</label>
+    <label><input type="checkbox" id="f-r" checked onchange="refilterLog()"> RTC</label>
     <label><input type="checkbox" id="f-o" checked onchange="refilterLog()"> Other</label>
     <label><input type="checkbox" id="f-s" checked> Live</label>
   </div>
@@ -307,7 +430,7 @@
 </div>
 <div id="flash-overlay" onclick="toggleFlash()"></div>
 <div id="flash-panel">
-  <div id="flash-header"><span>Firmware Update</span><div style="display:flex;align-items:center;gap:8px"><span style="font-size:10px;color:var(--text-dim);font-weight:400;text-transform:none;letter-spacing:0">ADS-B Scope v1.0.6</span><button onclick="toggleFlash()" title="Close firmware panel">✕</button></div></div>
+  <div id="flash-header"><span>Firmware Update</span><div style="display:flex;align-items:center;gap:8px"><span style="font-size:10px;color:var(--text-dim);font-weight:400;text-transform:none;letter-spacing:0">ADS-B Scope v1.0.8</span><button onclick="toggleFlash()" title="Close firmware panel">✕</button></div></div>
   <div id="flash-body">
     <div class="flash-row"><span class="fl">Device Version</span><span class="fv" id="flash-dev-ver">–</span></div>
     <div class="flash-row"><span class="fl">Latest Version</span><span class="fv" id="flash-latest-ver">–</span></div>
@@ -319,30 +442,40 @@
     </div>
     <div id="flash-log"></div>
     <div id="flash-actions">
+      <button class="flash-btn secondary" onclick="checkAndInstallAircraftDb(true)" title="Download and install aircraft database to SD card (27 MB)">Install<br>Aircraft DB</button>
       <button class="flash-btn secondary" onclick="document.getElementById('flash-file').click()" title="Select a local firmware binary">Local .bin</button>
       <input type="file" id="flash-file" accept=".bin" style="display:none" onchange="flashLocalFile(this)">
       <button class="flash-btn primary" id="flash-go-btn" onclick="startFlash()" title="Download and flash latest firmware">Flash Latest</button>
     </div>
   </div>
 </div>
+<div id="sqk-toast"></div>
 <div id="map"></div>
+<div id="view3d-container"><canvas id="view3d-canvas"></canvas><div id="view3d-labels"></div></div>
 <div id="panel">
   <div id="panel-drag"></div>
-  <button id="panel-toggle" onclick="togglePanel()" title="Show/hide aircraft table">▲ Aircraft ▲</button>
+  <div id="panel-toggle-bar" tabindex="-1"><span id="panel-toggle" onclick="togglePanel()" title="Show/hide aircraft table">▲ Aircraft ▲</span></div>
   <div id="panel-scroll" tabindex="0">
-  <table id="ac-table"><thead><tr><th onclick="tblSort('icao')">ICAO <span id="sh-icao"></span></th><th onclick="tblSort('cs')">Callsign <span id="sh-cs"></span></th><th onclick="tblSort('alt')">Alt <span id="sh-alt"></span></th><th onclick="tblSort('spd')">Spd <span id="sh-spd"></span></th><th onclick="tblSort('hdg')">Hdg <span id="sh-hdg"></span></th><th onclick="tblSort('vr')">V/S <span id="sh-vr"></span></th><th onclick="tblSort('dist')">Dist <span id="sh-dist"></span></th><th onclick="tblSort('brg')">Brg <span id="sh-brg"></span></th><th onclick="tblSort('age')">Age <span id="sh-age"></span></th><th onclick="tblSort('msgs')">Msgs <span id="sh-msgs"></span></th></tr></thead><tbody id="ac-tbody"></tbody></table>
+  <table id="ac-table"><thead><tr><th onclick="tblSort('pin')" title="Pin aircraft to keep visible after signal loss" class="col-pin"><span style="display:inline-block;width:10px"></span><span class="pin-led"></span><span id="sh-pin"></span></th><th onclick="tblSort('icao')">ICAO <span id="sh-icao"></span></th><th onclick="tblSort('cs')">Callsign <span id="sh-cs"></span></th><th onclick="tblSort('sqk')">SQK <span id="sh-sqk"></span></th><th onclick="tblSort('alt')">Alt <span id="sh-alt"></span></th><th onclick="tblSort('spd')">Spd <span id="sh-spd"></span></th><th onclick="tblSort('hdg')">Hdg <span id="sh-hdg"></span></th><th onclick="tblSort('vr')">V/S <span id="sh-vr"></span></th><th onclick="tblSort('dist')">Dist <span id="sh-dist"></span></th><th onclick="tblSort('brg')">Brg <span id="sh-brg"></span></th><th onclick="tblSort('age')">Age <span id="sh-age"></span></th><th onclick="tblSort('msgs')">Msgs <span id="sh-msgs"></span></th></tr></thead><tbody id="ac-tbody"></tbody></table>
   </div>
 </div>
 <script>
-const SCOPE_VERSION='1.0.5';
+const SCOPE_VERSION='1.0.7';
 const A=new Map();let rxP=null,map,rxM,rxR=[],rxRL=[],meshyR=[],meshyRL=[],port,reader,conn=false,totM=0,mTs=[],logN=0,selSet=new Set(),cMode='mono',lMode='alt';
 let sessStart=null,sessEnd=null; // session timestamps
 let consoleReady=false; // set when firmware prints "Serial console ready"
+// Gain state — parsed from serial GAIN: log lines
+let gainDb=null,gainAuto=true,gainPhase=0,gainErrEma=null,gainPosRate=null,gainRange=null,gainCeiling=false,gainFloor=false;
+let gainBandLow=40,gainBandHigh=50; // target error rate band (percent)
 let rxTrail=[],rxTrailLine=null; // receiver position history [{lat,lon,ts}]
 let deviceUtcMs=null; // latest UTC from device serial timestamps
 let lastSerialMs=0;  // browser time of last serial line received
 const icaoDb=new Map(); // aircraft DB cache: icao → {reg,tc,mfr,model,owner,op}
-const EXP=180000,LMAX=1000;
+const EXP=180000,LMAX=2000,TRAIL_MAX=3000,PRUNE_MS=30*60*1000,RX_TRAIL_MAX=2000;
+let liveAcCount=0,tblDirty=true;
+const dirtyAc=new Set(); // ICAOs needing updAc on next tick
+let ringsDirty=true; // set when aircraft count/distance changes
+let _ringTick=0,_detDirty=true;
 
 // Haversine distance in nm between two lat/lon points
 function distNm(lat1,lon1,lat2,lon2){
@@ -395,6 +528,7 @@ function setCM(m){
     lg.classList.remove('visible');
   }
   for(const[i,a]of A)updAc(i,a);
+  if(v3d)update3d();
 }
 
 function setLM(m){
@@ -402,6 +536,7 @@ function setLM(m){
   document.querySelectorAll('#label-modes button').forEach(b=>b.classList.remove('active'));
   document.getElementById('lm-'+m)?.classList.add('active');
   for(const[i,a]of A)updAc(i,a);
+  if(v3d)update3d();
   // Refresh meshy labels (markers + peeks) for new label mode
   for(const id in meshyMarkers){
     if(meshyMarkers[id].lb&&!meshyMsgBubbles[id])
@@ -422,6 +557,14 @@ function initMap(){
 }
 // Zoom anchored to selected aircraft (or map center if none selected)
 function zoomSel(dir){
+  if(v3d){
+    // 3D mode: adjust orbit radius
+    camOrbit.r*=dir>0?0.75:1.33;
+    camOrbit.r=Math.max(2,Math.min(250,camOrbit.r));
+    if(camMode!=='free')camOrbUpdate();
+    nr3d=true;
+    return;
+  }
   if(selSet.size===1){
     const ic=[...selSet][0];
     const ac=A.get(ic);
@@ -445,36 +588,40 @@ function acStale(ac,sel){
   const age=nowTime()-ac.ls;
   if(age<30000)return{opacity:1,gray:false};      // fresh
   if(age<60000)return{opacity:0.5,gray:false};     // dimming
-  // Selected stale aircraft stay more visible
-  if(sel)return{opacity:0.55,gray:true};
-  return{opacity:0.35,gray:true};                   // stale/gray
+  // >60s: gray territory — differentiate by expired/pinned state
+  if(ac.expired){
+    if(ac.pinned)return{opacity:sel?0.8:0.40,gray:true};  // expired pinned
+    return{opacity:sel?0.7:0.35,gray:true};                // expired unpinned
+  }
+  return{opacity:sel?0.8:0.4,gray:true};                   // stale (still live)
 }
 function mkIcon(h,c,sel,st,ic){
   const s=sel?24:18;
-  const col=st?.gray?(sel?'#99a':'#667'):c;
+  const ac=A.get(ic);
+  const col=st?.gray?(sel?(ac&&ac.expired&&ac.pinned?'#dab24a':'#99a'):(ac&&ac.expired&&ac.pinned?'#a08630':'#667')):c;
   const op=st?st.opacity:1;
-  const g=sel?`filter:drop-shadow(0 0 8px ${col})drop-shadow(0 0 3px #fff);`:`filter:drop-shadow(0 0 4px ${col}55);`;
+  const emPulse=ac&&sqkIsEmerg(ac.sqk);
+  const g=emPulse?'filter:drop-shadow(0 0 8px #ff3b3b) drop-shadow(0 0 3px #ff3b3b);':(sel?`filter:drop-shadow(0 0 8px ${col})drop-shadow(0 0 3px #fff);`:`filter:drop-shadow(0 0 4px ${col}55);`);
+  const pulseClass=emPulse?' sqk-icon-pulse':'';
   const db=ic?icaoDb.get(ic):null;
   const isHeli=db&&db.cls==='H';
   if(h==null){
-    // No heading data – show a dot
-    return L.divIcon({html:`<div style="display:flex;align-items:center;justify-content:center;width:${s}px;height:${s}px;font-size:${Math.round(s*0.5)}px;color:${col};opacity:${op};${g}">●</div>`,iconSize:[s,s],iconAnchor:[s/2,s/2],className:''});
+    return L.divIcon({html:`<div class="${pulseClass}" style="display:flex;align-items:center;justify-content:center;width:${s}px;height:${s}px;font-size:${Math.round(s*0.5)}px;color:${col};opacity:${op};${g}">●</div>`,iconSize:[s,s],iconAnchor:[s/2,s/2],className:''});
   }
   if(isHeli){
-    // Helicopter top-down silhouette (facing east like ✈, rotated by heading)
-    // Body/nose at right, tail boom extends left, rotor blades cross through body
     const r=h-90;
-    return L.divIcon({html:`<div style="display:flex;align-items:center;justify-content:center;width:${s}px;height:${s}px;opacity:${op};${g}"><svg width="${s}" height="${s}" viewBox="0 0 24 24" style="transform:rotate(${r}deg)"><g fill="none" stroke="${col}" stroke-width="1.3" stroke-linecap="round"><ellipse cx="14" cy="12" rx="5" ry="2.2" fill="${col}" stroke="none"/><line x1="9" y1="12" x2="3" y2="12"/><line x1="3" y1="9" x2="3" y2="15"/><line x1="20" y1="5.5" x2="8" y2="18.5" opacity="0.7"/><line x1="20" y1="18.5" x2="8" y2="5.5" opacity="0.7"/></g></svg></div>`,iconSize:[s,s],iconAnchor:[s/2,s/2],className:''});
+    return L.divIcon({html:`<div class="${pulseClass}" style="display:flex;align-items:center;justify-content:center;width:${s}px;height:${s}px;opacity:${op};${g}"><svg width="${s}" height="${s}" viewBox="0 0 24 24" style="transform:rotate(${r}deg)"><g fill="none" stroke="${col}" stroke-width="1.3" stroke-linecap="round"><ellipse cx="14" cy="12" rx="5" ry="2.2" fill="${col}" stroke="none"/><line x1="9" y1="12" x2="3" y2="12"/><line x1="3" y1="9" x2="3" y2="15"/><line x1="20" y1="5.5" x2="8" y2="18.5" opacity="0.7"/><line x1="20" y1="18.5" x2="8" y2="5.5" opacity="0.7"/></g></svg></div>`,iconSize:[s,s],iconAnchor:[s/2,s/2],className:''});
   }
-  return L.divIcon({html:`<div style="display:flex;align-items:center;justify-content:center;width:${s}px;height:${s}px;font-size:${s}px;color:${col};opacity:${op};${g}"><div style="transform:rotate(${h-90}deg);line-height:1">✈</div></div>`,iconSize:[s,s],iconAnchor:[s/2,s/2],className:''});
+  return L.divIcon({html:`<div class="${pulseClass}" style="display:flex;align-items:center;justify-content:center;width:${s}px;height:${s}px;font-size:${s}px;color:${col};opacity:${op};${g}"><div style="transform:rotate(${h-90}deg);line-height:1">✈</div></div>`,iconSize:[s,s],iconAnchor:[s/2,s/2],className:''});
 }
 function mkLbl(ic,ac,c,st){
   const sel=selSet.has(ic)?'sel':'';
-  const col=st?.gray?(sel?'#99a':'#667'):c;
+  const col=st?.gray?(sel?(ac&&ac.expired&&ac.pinned?'#dab24a':'#99a'):(ac&&ac.expired&&ac.pinned?'#a08630':'#667')):c;
   const op=st?st.opacity:1;
   const info=lMode==='dist'?(ac.dist!=null?ac.dist.toFixed(1)+'nm':''):(ac.alt?ac.alt+'ft':'');
   const name=ac.cs||ic;
-  return L.divIcon({html:`<div class="ac-label ${sel}" style="color:${col};opacity:${op}" onclick="sel0('${ic}',event)">${name}${info?' '+info:''}</div>`,iconSize:[0,0],iconAnchor:[-14,6],className:''});
+  const sqkAlert=sqkIsEmerg(ac.sqk)?'<span class="sqk-alert" style="color:'+(ac.sqk==='7600'?'#ff8c00':'#ff3b3b')+'">⚠'+ac.sqk+'</span>':'';
+  return L.divIcon({html:`<div class="ac-label ${sel}" style="color:${col};opacity:${op}" onclick="sel0('${ic}',event)">${name}${info?' '+info:''}${sqkAlert}</div>`,iconSize:[0,0],iconAnchor:[-14,6],className:''});
 }
 // Compute heading from last two trail points when ADS-B heading is unavailable
 function trailHdg(ac){
@@ -489,41 +636,163 @@ function trailHdg(ac){
   return Math.round(brg);
 }
 
-// Rebuild trail as per-segment polylines colored by recorded alt/speed
+// Rebuild trail as batched polylines with adaptive segment budget
 function rebuildTrail(ic,ac,sel,st,tw,to){
   if(!ac.tr)return;
   ac.tr.clearLayers();
+  ac._trAppLine=null; // discard append line reference
   const pts=ac.trPts;
   if(!pts||pts.length<2)return;
-  const grayCol=sel?'#889':'#556';
+  const grayCol=sel?(ac.expired&&ac.pinned?'#dab24a':'#889'):(ac.expired&&ac.pinned?'#a08630':'#556');
   const baseCol=st.gray?grayCol:acCol(ic,ac);
   const perSeg=!st.gray&&(cMode==='alt'||cMode==='speed');
+  const GAP=10000;
+  // Adaptive segment budget: ~50 segments per 15 minutes of track
+  const t0=pts[0].ts||0,t1=pts[pts.length-1].ts||0;
+  const trackMin=Math.max(1,(t1-t0)/60000);
+  const budgetSegs=Math.max(50,Math.ceil(trackMin/15)*50);
+  const batchSize=Math.max(5,Math.floor(pts.length/budgetSegs));
+  let bs=0;
   for(let i=1;i<pts.length;i++){
-    const p=pts[i-1],q=pts[i];
-    const segC=perSeg?(ptCol(q.alt,q.speed)||baseCol):baseCol;
-    ac.tr.addLayer(L.polyline([[p.lat,p.lng],[q.lat,q.lng]],{color:segC,weight:tw,opacity:to,interactive:false}));
+    const isGap=pts[i].ts&&pts[i-1].ts&&(pts[i].ts-pts[i-1].ts)>GAP;
+    const atEnd=i===pts.length-1;
+    if(isGap||atEnd||(i-bs)>=batchSize){
+      const end=isGap?i:i+1;
+      const coords=[];for(let j=bs;j<end;j++)coords.push([pts[j].lat,pts[j].lng]);
+      const mid=pts[Math.floor((bs+end-1)/2)];
+      const segC=perSeg?(ptCol(mid.alt,mid.speed)||baseCol):baseCol;
+      if(coords.length>=2)ac.tr.addLayer(L.polyline(coords,{color:segC,weight:tw,opacity:to,interactive:false}));
+      if(isGap){
+        ac.tr.addLayer(L.polyline([[pts[i-1].lat,pts[i-1].lng],[pts[i].lat,pts[i].lng]],{color:segC,weight:tw,opacity:to*0.5,dashArray:'6 4',interactive:false}));
+      }
+      bs=isGap?i:(end-1); // overlap by 1 for visual continuity
+    }
   }
-  ac._trCM=cMode;ac._trGray=st.gray;ac._trSel=sel;ac._trTw=tw;ac._trTo=to;ac._trLen=pts.length;
+  ac._trCM=cMode;ac._trGray=st.gray;ac._trSel=sel;ac._trTw=tw;ac._trTo=to;ac._trLen=pts.length;ac._trAp=0;
 }
 
 function appendTrailSeg(ic,ac,sel,st,tw,to){
   const pts=ac.trPts;
   if(!pts||pts.length<2)return;
-  const grayCol=sel?'#889':'#556';
+  const grayCol=sel?(ac.expired&&ac.pinned?'#dab24a':'#889'):(ac.expired&&ac.pinned?'#a08630':'#556');
   const baseCol=st.gray?grayCol:acCol(ic,ac);
-  const perSeg=!st.gray&&(cMode==='alt'||cMode==='speed');
   const p=pts[pts.length-2],q=pts[pts.length-1];
-  const segC=perSeg?(ptCol(q.alt,q.speed)||baseCol):baseCol;
-  ac.tr.addLayer(L.polyline([[p.lat,p.lng],[q.lat,q.lng]],{color:segC,weight:tw,opacity:to,interactive:false}));
+  const GAP=10000;
+  const isGap=q.ts&&p.ts&&(q.ts-p.ts)>GAP;
+  if(isGap){
+    // Gap: add dashed segment, start fresh append line
+    ac.tr.addLayer(L.polyline([[p.lat,p.lng],[q.lat,q.lng]],{
+      color:baseCol,weight:tw,opacity:to*0.5,dashArray:'6 4',interactive:false
+    }));
+    ac._trAppLine=null;
+  }
+  if(!ac._trAppLine){
+    // Start new append line from previous point
+    ac._trAppLine=L.polyline([[p.lat,p.lng],[q.lat,q.lng]],{
+      color:baseCol,weight:tw,opacity:to,interactive:false
+    });
+    ac.tr.addLayer(ac._trAppLine);
+  }else{
+    // Extend existing append line — zero new Leaflet layers
+    ac._trAppLine.addLatLng([q.lat,q.lng]);
+  }
   ac._trLen=pts.length;
+  ac._trAp=(ac._trAp||0)+1;
 }
+
+// ── Periodic trail decimation ──
+// Removes redundant points from older trail data where the aircraft is flying
+// in a straight line at constant altitude/speed. Uses interpolation: if a point
+// lies close to the line between its kept neighbors, it adds no shape information.
+// Preserves turns, climbs, descents, and speed changes at full resolution.
+// Uses both interpolation (position/alt/speed deviation from straight line)
+// and bearing change detection (catches slow-moving turns like helicopters
+// where position deviation is tiny but heading is changing).
+const DECIMATE_FRESH=300000; // 5 minutes — recent points kept at full resolution
+const DECIMATE_POS_TOL=0.0025; // ~275m — deviation from straight line
+const DECIMATE_ALT_TOL=100;    // ft — deviation from interpolated altitude
+const DECIMATE_SPD_TOL=5;      // kt — deviation from interpolated speed
+const DECIMATE_HDG_TOL=3;      // degrees — bearing change threshold
+function _bearing(a,b){
+  const dLon=(b.lng-a.lng)*Math.PI/180;
+  const la=a.lat*Math.PI/180,lb=b.lat*Math.PI/180;
+  const y=Math.sin(dLon)*Math.cos(lb);
+  const x=Math.cos(la)*Math.sin(lb)-Math.sin(la)*Math.cos(lb)*Math.cos(dLon);
+  return(Math.atan2(y,x)*180/Math.PI+360)%360;
+}
+function _hdgDiff(a,b){const d=Math.abs(a-b);return d>180?360-d:d}
+function decimateTrails(){
+  const now=Date.now();
+  const cutoff=now-DECIMATE_FRESH;
+  for(const[ic,ac]of A){
+    const pts=ac.trPts;
+    if(!pts||pts.length<10)continue;
+    // Find the boundary: last point index older than cutoff
+    let cutIdx=0;
+    for(let i=pts.length-1;i>=0;i--){
+      if(pts[i].ts&&pts[i].ts<cutoff){cutIdx=i;break}
+    }
+    if(cutIdx<3)continue;
+    // Walk the decimation zone using interpolation + bearing change test.
+    // Always keep first point. For each candidate, check if it deviates
+    // from the line between the last kept point and the next point,
+    // OR if the bearing changes significantly (catches slow turns).
+    const kept=[pts[0]];
+    let li=0; // index of last kept point
+    let prevRemoved=false;
+    for(let i=1;i<cutIdx;i++){
+      // Never remove two consecutive points
+      if(prevRemoved){kept.push(pts[i]);li=i;prevRemoved=false;continue}
+      const L=pts[li],P=pts[i],N=pts[i+1];
+      // Interpolate: where should P be if the path is a straight line from L to N?
+      const dt=N.ts-L.ts;
+      if(!dt||!P.ts||!L.ts||!N.ts){kept.push(P);li=i;prevRemoved=false;continue}
+      const t=(P.ts-L.ts)/dt; // 0..1 fractional time position
+      const eLat=L.lat+t*(N.lat-L.lat);
+      const eLng=L.lng+t*(N.lng-L.lng);
+      const eAlt=(L.alt||0)+t*((N.alt||0)-(L.alt||0));
+      const eSpd=(L.speed||0)+t*((N.speed||0)-(L.speed||0));
+      // Position/alt/speed interpolation test
+      const posRedundant=
+        Math.abs(P.lat-eLat)<=DECIMATE_POS_TOL
+        &&Math.abs(P.lng-eLng)<=DECIMATE_POS_TOL
+        &&Math.abs((P.alt||0)-eAlt)<=DECIMATE_ALT_TOL
+        &&Math.abs((P.speed||0)-eSpd)<=DECIMATE_SPD_TOL;
+      // Bearing change test: even if position deviation is tiny (slow aircraft),
+      // a heading change means a turn that must be preserved.
+      // Only check when points are far enough apart to compute meaningful bearing.
+      let hdgRedundant=true;
+      const dLP=Math.abs(P.lat-L.lat)+Math.abs(P.lng-L.lng);
+      const dPN=Math.abs(N.lat-P.lat)+Math.abs(N.lng-P.lng);
+      if(dLP>0.00005&&dPN>0.00005){ // ~5m minimum movement to compute bearing
+        const bLP=_bearing(L,P),bPN=_bearing(P,N);
+        hdgRedundant=_hdgDiff(bLP,bPN)<=DECIMATE_HDG_TOL;
+      }
+      if(posRedundant&&hdgRedundant){
+        prevRemoved=true;
+      }else{
+        kept.push(P);li=i;prevRemoved=false;
+      }
+    }
+    // Append the fresh zone (cutIdx onward) unchanged
+    const fresh=pts.slice(cutIdx);
+    const newPts=kept.concat(fresh);
+    const removed=pts.length-newPts.length;
+    if(removed>0){
+      ac.trPts=newPts;
+      ac._trLen=-1; // force trail polyline rebuild on next render
+    }
+  }
+}
+// Run decimation every 60 seconds
+setInterval(decimateTrails,60000);
 
 function updAc(ic,ac){
   const sel=selSet.has(ic);
-  if(!acMapVisible||!ac.hasPos||(ac.expired&&!sel))return;
+  if(!acMapVisible||!ac.hasPos||(ac.expired&&!sel&&!ac.pinned))return;
   const st=acStale(ac,sel);
   const c=acCol(ic,ac),tw=sel?2.5:1.5;
-  const to=sel?Math.max(st.opacity,0.8):(st.gray?0.2:st.opacity*0.6);
+  const to=sel?Math.max(st.opacity,0.8):(st.gray?0.25:st.opacity*0.6);
   const hdg=ac.hdg!=null?ac.hdg:trailHdg(ac);
   if(!ac.mk){
     ac.mk=L.marker([ac.lat,ac.lon],{icon:mkIcon(hdg,c,sel,st,ic)}).addTo(map);
@@ -532,59 +801,161 @@ function updAc(ic,ac){
     ac.lb=L.marker([ac.lat,ac.lon],{icon:mkLbl(ic,ac,c,st),interactive:true}).addTo(map);
     ac.lb.on('click',(e)=>sel0(ic,e.originalEvent));
     ac.mk.on('click',(e)=>sel0(ic,e.originalEvent));
+    ac._ik=hdg+'|'+c+'|'+sel+'|'+st.opacity+'|'+st.gray+'|'+ac.expired+'|'+ac.pinned+'|'+ac.sqk;
+    const _li0=lMode==='dist'?(ac.dist!=null?ac.dist.toFixed(1):''):(ac.alt||'');
+    ac._lk=(ac.cs||ic)+'|'+c+'|'+sel+'|'+st.opacity+'|'+st.gray+'|'+ac.expired+'|'+ac.pinned+'|'+lMode+'|'+_li0+'|'+ac.sqk;
   }else{
-    ac.mk.setLatLng([ac.lat,ac.lon]).setIcon(mkIcon(hdg,c,sel,st,ic));
-    ac.lb.setLatLng([ac.lat,ac.lon]).setIcon(mkLbl(ic,ac,c,st));
+    ac.mk.setLatLng([ac.lat,ac.lon]);
+    ac.lb.setLatLng([ac.lat,ac.lon]);
+    const _ik=hdg+'|'+c+'|'+sel+'|'+st.opacity+'|'+st.gray+'|'+ac.expired+'|'+ac.pinned+'|'+ac.sqk;
+    if(ac._ik!==_ik){ac.mk.setIcon(mkIcon(hdg,c,sel,st,ic));ac._ik=_ik}
+    const _li=lMode==='dist'?(ac.dist!=null?ac.dist.toFixed(1):''):(ac.alt||'');
+    const _lk=(ac.cs||ic)+'|'+c+'|'+sel+'|'+st.opacity+'|'+st.gray+'|'+ac.expired+'|'+ac.pinned+'|'+lMode+'|'+_li+'|'+ac.sqk;
+    if(ac._lk!==_lk){ac.lb.setIcon(mkLbl(ic,ac,c,st));ac._lk=_lk}
   }
   const z=acZ(ic,ac);
-  ac.mk.setZIndexOffset(z);
-  ac.lb.setZIndexOffset(z);
+  if(ac._z!==z){ac.mk.setZIndexOffset(z);ac.lb.setZIndexOffset(z);ac._z=z}
   if(!ac.trPts)ac.trPts=[];
   const pts=ac.trPts,la=pts.length?pts[pts.length-1]:null;
   let added=false;
   if(!la||la.lat!==ac.lat||la.lng!==ac.lon){
-    pts.push({lat:ac.lat,lng:ac.lon,alt:ac.alt,speed:ac.speed});
-    added=true;
+    pts.push({lat:ac.lat,lng:ac.lon,alt:ac.alt,speed:ac.speed,ts:Date.now()});
+    added=true;tblDirty=true;
+    if(pts.length>TRAIL_MAX){pts.splice(0,Math.floor(TRAIL_MAX*0.2));ac._trLen=-1}
   }
   const prevLen=added?pts.length-1:pts.length;
   const needRebuild=!ac._trCM||ac._trCM!==cMode||ac._trGray!==st.gray
     ||ac._trSel!==sel||ac._trTw!==tw||ac._trTo!==to
-    ||ac._trLen!==prevLen;
+    ||ac._trLen!==prevLen||(ac._trAp||0)>50;
   if(needRebuild){
     rebuildTrail(ic,ac,sel,st,tw,to);
   }else if(added&&pts.length>=2){
     appendTrailSeg(ic,ac,sel,st,tw,to);
   }
 }
-function rmAc(ac){if(ac.mk)map.removeLayer(ac.mk);if(ac.lb)map.removeLayer(ac.lb);if(ac.tr)map.removeLayer(ac.tr)}
+function rmAc(ac){if(ac.mk)map.removeLayer(ac.mk);if(ac.lb)map.removeLayer(ac.lb);if(ac.tr)map.removeLayer(ac.tr);ac._trAppLine=null}
 
 // --- Selection ---
 // Remove map layers for expired aircraft that lost selection
-function cleanExpired(){for(const[ic,ac]of A){if(ac.expired&&!selSet.has(ic)&&ac.mk){rmAc(ac);ac.mk=null;ac.lb=null;ac.tr=null}}}
+function cleanExpired(){for(const[ic,ac]of A){if(ac.expired&&!selSet.has(ic)&&!ac.pinned&&ac.mk){rmAc(ac);ac.mk=null;ac.lb=null;ac.tr=null}}}
+let selAnchor=null; // ICAO of anchor row for shift-range selection
+
+// ── Selection undo/redo history ──
+const SEL_HIST_MAX=30;
+let selHistory=[],selHistIdx=-1,selHistLock=false;
+function selSnap(){
+  // Return a serializable snapshot of current selection
+  return JSON.stringify([...selSet].sort());
+}
+function selPush(){
+  // Save current selection state after a change. Skip if identical to current.
+  if(selHistLock)return; // don't push during undo/redo restore
+  const snap=selSnap();
+  if(selHistIdx>=0&&selHistIdx<selHistory.length&&selHistory[selHistIdx]===snap)return;
+  // Truncate any redo entries
+  selHistory.length=selHistIdx+1;
+  selHistory.push(snap);
+  if(selHistory.length>SEL_HIST_MAX)selHistory.shift();
+  selHistIdx=selHistory.length-1;
+}
+function selRestore(snap){
+  selHistLock=true;
+  const oldSel=new Set(selSet);
+  selSet.clear();
+  for(const ic of JSON.parse(snap))selSet.add(ic);
+  selAnchor=selSet.size?[...selSet][selSet.size-1]:null;
+  cleanExpired();
+  tblDirty=true;
+  for(const oc of oldSel){if(!selSet.has(oc)){const ac=A.get(oc);if(ac)updAc(oc,ac)}}
+  for(const nc of selSet){if(!oldSel.has(nc)){const ac=A.get(nc);if(ac)updAc(nc,ac)}}
+  updDet();
+  selHistLock=false;
+}
+function selUndo(){
+  if(selHistIdx<=0)return;
+  // Push current state if we haven't yet (first undo from a fresh change)
+  if(selHistIdx===selHistory.length-1){
+    const snap=selSnap();
+    if(selHistory[selHistIdx]!==snap){selHistory.push(snap);selHistIdx=selHistory.length-1;}
+  }
+  selHistIdx--;
+  selRestore(selHistory[selHistIdx]);
+}
+function selRedo(){
+  if(selHistIdx>=selHistory.length-1)return;
+  selHistIdx++;
+  selRestore(selHistory[selHistIdx]);
+}
+// Push initial empty selection
+selHistory.push(selSnap());selHistIdx=0;
 function sel0(ic,ev){
-  const multi=ev&&(ev.metaKey||ev.shiftKey||ev.ctrlKey);
-  if(multi){
+  const shift=ev&&ev.shiftKey;
+  const multi=ev&&(ev.metaKey||ev.ctrlKey);
+  const rows=document.querySelectorAll('#ac-tbody tr');
+  const oldSel=new Set(selSet);
+
+  if(shift&&selAnchor){
+    // Range select: anchor → clicked row
+    let anchorIdx=-1,targetIdx=-1;
+    for(let j=0;j<rows.length;j++){
+      if(rows[j].dataset.ic===selAnchor)anchorIdx=j;
+      if(rows[j].dataset.ic===ic)targetIdx=j;
+    }
+    if(anchorIdx>=0&&targetIdx>=0){
+      if(!multi)selSet.clear(); // shift only = fresh range; shift+cmd = add range
+      const lo=Math.min(anchorIdx,targetIdx),hi=Math.max(anchorIdx,targetIdx);
+      for(let j=lo;j<=hi;j++){
+        const ric=rows[j]?.dataset.ic;
+        if(ric)selSet.add(ric);
+      }
+    }
+    // Don't update anchor on shift-click — it stays at the original
+  }else if(multi){
+    // Toggle single item, set as new anchor
     if(selSet.has(ic))selSet.delete(ic);else selSet.add(ic);
+    selAnchor=ic;
   }else{
+    // Simple click — single selection, set anchor
     selSet.clear();selSet.add(ic);
+    selAnchor=ic;
   }
   cleanExpired();
-  for(const[i,a]of A)updAc(i,a);
+  // Surgical update: only aircraft whose selection state changed
+  for(const oc of oldSel){if(!selSet.has(oc)){const ac=A.get(oc);if(ac)updAc(oc,ac)}}
+  for(const nc of selSet){if(!oldSel.has(nc)){const ac=A.get(nc);if(ac)updAc(nc,ac)}}
   updDet();
-  // Sync keyboard focus to clicked row and focus container for arrow keys
-  const rows=document.querySelectorAll('#ac-tbody tr');
-  for(let j=0;j<rows.length;j++){if(rows[j].dataset.ic===ic){kbFocusIdx=j;break}}
+  tblDirty=true;selPush();
+  for(let j=0;j<rows.length;j++){if(rows[j].dataset.ic===ic){kbFocusIdx=j;kbFocusIcao=ic;break}}
   kbApplyFocus();
-  document.getElementById('panel-scroll').focus({preventScroll:true});
+  // Focus panel for keyboard nav — but only if click came from the table, not from 3D
+  const ps=document.getElementById('panel-scroll');
+  if(ev&&ev.target&&ps.contains(ev.target))ps.focus({preventScroll:true});
+  else if(!v3d)ps.focus({preventScroll:true});
 }
-function deselOne(ic){selSet.delete(ic);cleanExpired();for(const[i,a]of A)updAc(i,a);updDet()}
-function desel(){selSet.clear();cleanExpired();updDet();for(const[i,a]of A)updAc(i,a)}
-function dismissAc(ic,ev){
+function selAll(){
+  const rows=document.querySelectorAll('#ac-tbody tr');
+  const oldSel=new Set(selSet);
+  for(let j=0;j<rows.length;j++){
+    const ic=rows[j]?.dataset.ic;
+    if(ic)selSet.add(ic);
+  }
+  cleanExpired();
+  for(const nc of selSet){if(!oldSel.has(nc)){const ac=A.get(nc);if(ac)updAc(nc,ac)}}
+  updDet();
+  tblDirty=true;selPush();
+}
+function deselOne(ic){selSet.delete(ic);cleanExpired();tblDirty=true;const ac=A.get(ic);if(ac)updAc(ic,ac);updDet();selPush()}
+function desel(){const old=new Set(selSet);selSet.clear();selAnchor=null;cleanExpired();tblDirty=true;for(const oc of old){const ac=A.get(oc);if(ac)updAc(oc,ac)}updDet();selPush()}
+function togglePin(ic,ev){
   ev.stopPropagation();
-  selSet.delete(ic);
   const ac=A.get(ic);
-  if(ac){ac.pinned=false;rmAc(ac);ac.mk=null;ac.lb=null;ac.tr=null}
-  for(const[i,a]of A)updAc(i,a);
+  if(!ac)return;
+  ac.pinned=!ac.pinned;
+  if(!ac.pinned&&ac.expired&&!selSet.has(ic)){
+    rmAc(ac);ac.mk=null;ac.lb=null;ac.tr=null;
+  }
+  tblDirty=true;
+  if(ac.mk)updAc(ic,ac);
   updDet();
 }
 function updDet(){
@@ -605,6 +976,7 @@ function updDet(){
       <div class="dr"><span class="dl">Type</span><span class="dv">${db.tc?db.tc+(db.model?' – '+db.model:''):'---'}</span></div>
       ${db.owner?`<div class="dr"><span class="dl">Owner</span><span class="dv">${db.owner}</span></div>`:''}
       ${db.op?`<div class="dr"><span class="dl">Operator</span><span class="dv">${db.op}</span></div>`:''}`:''}
+      ${ac.sqk?`<div class="dr"><span class="dl">Squawk</span><span class="dv"${sqkIsEmerg(ac.sqk)?' style="color:'+(ac.sqk==='7600'?'#ff8c00':'#ff3b3b')+';font-weight:700"':''}>${ac.sqk}${sqkLabel(ac.sqk)?' — '+sqkLabel(ac.sqk):''}</span></div>`:''}
       <div class="dr"><span class="dl">Altitude</span><span class="dv">${ac.alt!=null?ac.alt.toLocaleString()+' ft':'---'}</span></div>
       <div class="dr"><span class="dl">Speed</span><span class="dv">${ac.speed?ac.speed+' kt':'---'}</span></div>
       <div class="dr"><span class="dl">Heading</span><span class="dv">${ac.hdg!=null?ac.hdg+'°':'---'}</span></div>
@@ -621,6 +993,36 @@ const GR=/GNSS: fix=(\w+) lat=([\d.-]+) lon=([\d.-]+) sats=(\d+) hdop=([\d.]+) q
 const MR=/^[\[(].+?[\])] ([0-9A-F]{6})\s*/;
 const AR=/\s(-?\d+)ft/,SR=/\s(\d+)kt\s+(\d+)°/,VR=/\s([+-]\d+)fpm/;
 const PR=/\((\d+\.\d+)([NS]),(\d+\.\d+)([EW])\)/,DR=/(\d+\.\d+)nm@(\d+)°/;
+const QR=/SQK:(\d{4})/;
+
+// ── Squawk classification ──
+const SQK_EMERG={'7700':'EMERGENCY','7500':'HIJACK','7600':'RADIO FAILURE'};
+const SQK_NOTABLE={'7400':'UAV LOST LINK','7777':'MIL INTERCEPT'};
+const SQK_ROUTINE={'1200':'VFR','7000':'VFR (ICAO)','2000':'SSR ENTRY'};
+function sqkIsEmerg(s){return s&&SQK_EMERG[s]}
+function sqkBadgeHtml(s){
+  if(!s)return'';
+  if(s==='7700'||s==='7500')return'<span class="sqk-badge sqk-'+s+'">'+s+'</span>';
+  if(s==='7600')return'<span class="sqk-badge sqk-7600">'+s+'</span>';
+  if(s==='7400')return'<span class="sqk-badge sqk-7400">'+s+'</span>';
+  if(s==='7777')return'<span class="sqk-badge sqk-7777">'+s+'</span>';
+  if(SQK_ROUTINE[s])return'<span class="sqk-dim">'+s+'</span>';
+  return s;
+}
+function sqkLabel(s){return SQK_EMERG[s]||SQK_NOTABLE[s]||SQK_ROUTINE[s]||''}
+const _sqkToasted=new Set(); // ICAOs already toasted — one-shot per aircraft
+function sqkToast(ic,ac){
+  const el=document.getElementById('sqk-toast');
+  if(!el)return;
+  const label=SQK_EMERG[ac.sqk]||ac.sqk;
+  const name=ac.cs||ic;
+  const d=document.createElement('div');
+  d.className='sqk-toast-item'+(ac.sqk==='7600'?' nordo':'');
+  d.textContent='⚠ '+name+' ('+ic+') — SQUAWK '+ac.sqk+' '+label;
+  el.appendChild(d);
+  // Auto-dismiss after 8 seconds
+  setTimeout(()=>{d.classList.add('fade');setTimeout(()=>d.remove(),600)},8000);
+}
 
 function parse(l){
   // Detect device reboot – reset all status indicators, expire all aircraft
@@ -631,10 +1033,17 @@ function parse(l){
     rxTrail=[];
     updGnss();
     for(const[ic,ac]of A){if(!ac.expired){rmAc(ac);ac.expired=true}}
-    selSet.clear();
+    selSet.clear();selAnchor=null;
     deviceVersion='';updFlashVer();
     consoleReady=false;
     meshyConfig={};
+    gainDb=null;gainAuto=true;gainPhase=0;gainErrEma=null;gainPosRate=null;gainRange=null;gainCeiling=false;gainFloor=false;
+    gainBandLow=40;gainBandHigh=50;
+    updGainBadge();
+    const gp=document.getElementById('gain-popover');if(gp)gp.classList.remove('visible');
+    const gb=document.getElementById('gain-badge');if(gb){gb.classList.remove('open','gain-state-steady','gain-state-converging','gain-state-manual')}
+    if(mqttDeviceSerial)mqttPubScopeEvent('serial_disconnect',{device:mqttDeviceSerial});
+    mqttDeviceSerial='';  // will be re-parsed from new boot log
   }
   // Parse device version from boot log
   const verM=/App version:\s+(\S+)/.exec(l);
@@ -650,12 +1059,23 @@ function parse(l){
     const el=document.getElementById('flash-dev-ver');
     if(el&&deviceVersion)el.textContent=deviceVersion+' ('+ctM[1].trim()+')';
   }
+  // Parse MQTT device ID from firmware boot log
+  const mqttIdM=/MQTT.*Device ID:\s*(\S+)/.exec(l);
+  if(mqttIdM&&!mqttDeviceSerial){
+    mqttDeviceSerial=mqttIdM[1];
+    addLog('[scope] Device: '+mqttDeviceSerial);
+    // TODO: Pause webapp MQTT relay when device is publishing directly.
+    // Track firmware MQTT state changes in serial log and only relay
+    // when device MQTT is confirmed down.
+    mqttPubScopeEvent('serial_connect',{device:mqttDeviceSerial});
+    if(mqttConnected)mqttPubMeta();  // announce device on adsb/ topics
+  }
   // SD card status – distinguish ADS-B vs Meshy log events
   if(/Failed to reopen/.test(l)){
     const isMeshy=/meshy/i.test(l);
     const fn=l.match(/(\/\S+\.csv)/);
     updSD(isMeshy?'meshy':'adsb','lost',fn?fn[1]:null);
-  }else if(/Failed.*open meshy SD log/.test(l)){
+  }else if(/Failed.*open meshy SD log|MESHY:.*Failed.*open.*SD log/.test(l)){
     updSD('meshy','fail',null);
   }else if(/Failed.*open SD log/.test(l)){
     updSD('adsb','fail',null);
@@ -664,14 +1084,14 @@ function parse(l){
   }else if(/SD mount attempt (\d+) failed/.test(l)){
     const m=l.match(/attempt (\d+)/);
     updSD('card','retrying',m?m[1]:null);
-  }else if(/Meshy SD log renamed:/.test(l)){
+  }else if(/Meshy SD log renamed:|MESHY:.*SD log renamed:/.test(l)){
     const fn=l.match(/→ (\/\S+)/);
     updSD('meshy',true,fn?fn[1]:null);
   }else if(/SD log renamed:/.test(l)){
     const fn=l.match(/→ (\/\S+)/);
     updSD('adsb',true,fn?fn[1]:null);
-  }else if(/Meshy SD log: \//.test(l)){
-    const fn=l.match(/Meshy SD log: (\/\S+)/);
+  }else if(/Meshy SD log: \/|MESHY:.*SD log: \//.test(l)){
+    const fn=l.match(/SD log: (\/\S+)/);
     updSD('meshy',true,fn?fn[1]:null);
   }else if(/SD log: \//.test(l)){
     const fn=l.match(/SD log: (\/\S+)/);
@@ -679,19 +1099,87 @@ function parse(l){
   }else if(/filesystem mounted/.test(l)){
     updSD('card','mounted',null);
   }
+  // ── Gain state from serial log lines ──
+  if(/\[SETTINGS\] Loaded:/.test(l)){
+    const bm=l.match(/band=(\d+)-(\d+)%/);
+    if(bm){gainBandLow=parseInt(bm[1]);gainBandHigh=parseInt(bm[2])}
+    if(/gain=auto/.test(l))gainAuto=true;
+    else if(/gain=manual/.test(l))gainAuto=false;
+    updGainBadge();
+  }
+  if(/Tuner gain set to/.test(l)){
+    const gm=l.match(/([\d.]+)\s*dB\s*\((\w+)/);
+    if(gm){gainDb=parseFloat(gm[1]);gainAuto=gm[2]==='adaptive';gainPhase=1;updGainBadge()}
+  }
+  if(/GAIN:/.test(l)){
+    // Extract dB from any gain log line (Down/Up/Converged/Exploring/Probing/Confirmed/Reverted)
+    const dbm=l.match(/→?\s*([\d.]+)\s*dB/);
+    if(dbm)gainDb=parseFloat(dbm[1]);
+    // Extract error rate
+    const em=l.match(/err=([\d.]+)%/);
+    if(em)gainErrEma=parseFloat(em[1]);
+    const ema=l.match(/EMA err=([\d.]+)%/);
+    if(ema)gainErrEma=parseFloat(ema[1]);
+    // Extract pos rate
+    const pm=l.match(/pos=([\d.]+)\/s/);
+    if(pm)gainPosRate=parseFloat(pm[1]);
+    // Extract range
+    const rm=l.match(/range=([\d.]+)nm/);
+    if(rm)gainRange=parseFloat(rm[1]);
+    // Extract target band
+    const bm=l.match(/band=(\d+)-(\d+)%/);
+    if(bm){gainBandLow=parseInt(bm[1]);gainBandHigh=parseInt(bm[2])}
+    // Phase transitions
+    if(/\[P1\]/.test(l))gainPhase=1;
+    if(/\[P2\]/.test(l))gainPhase=2;
+    if(/→ steady-state/.test(l))gainPhase=2;
+    // Mode switches
+    if(/Set manual gain/.test(l))gainAuto=false;
+    if(/Switched to adaptive/.test(l)){gainAuto=true;gainPhase=1;}
+    // Ceiling/floor status
+    if(/ceiling set/.test(l))gainCeiling=true;
+    if(/Ceiling expired|Ceiling cleared/.test(l))gainCeiling=false;
+    if(/floor set/.test(l))gainFloor=true;
+    if(/Floor expired|Floor cleared/.test(l))gainFloor=false;
+    updGainBadge();
+  }
   const gm=GR.exec(l);
-  if(gm){const la=parseFloat(gm[2]),lo=parseFloat(gm[3]);if(gm[1]==='A'&&la&&lo){const dts=parseDeviceTs(l)||Date.now();rxP={lat:la,lon:lo,sats:parseInt(gm[4]),hdop:parseFloat(gm[5]),fix:true,ts:dts};const prev=rxTrail.length?rxTrail[rxTrail.length-1]:null;if(!prev||prev.lat!==la||prev.lon!==lo){rxTrail.push({lat:la,lon:lo,ts:dts})}updRx();if(!map._p&&!map._userMoved){map.setView([la,lo],11);map._p=true}if(meshyConfig.node)updateNodePosition(meshyConfig.node,la,lo,0)}updGnss();return}
+  if(gm){const la=parseFloat(gm[2]),lo=parseFloat(gm[3]);if(gm[1]==='A'&&la&&lo){const dts=parseDeviceTs(l)||Date.now();rxP={lat:la,lon:lo,sats:parseInt(gm[4]),hdop:parseFloat(gm[5]),fix:true,ts:dts};const prev=rxTrail.length?rxTrail[rxTrail.length-1]:null;if(!prev||prev.lat!==la||prev.lon!==lo){rxTrail.push({lat:la,lon:lo,ts:dts});if(rxTrail.length>RX_TRAIL_MAX){const half=Math.floor(rxTrail.length/2);const thinned=[];for(let ri=0;ri<half;ri+=2)thinned.push(rxTrail[ri]);rxTrail.splice(0,half,...thinned)}}updRx();if(!map._p&&!map._userMoved){map.setView([la,lo],11);map._p=true}if(meshyConfig.node)updateNodePosition(meshyConfig.node,la,lo,0)}updGnss();return}
   // Aircraft DB cache — parse ICAO: lines from firmware
   const icaoM=/ICAO: ([0-9A-F]{6})\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)(?:\|([^|]*))?/.exec(l);
-  if(icaoM){icaoDb.set(icaoM[1],{reg:icaoM[2],tc:icaoM[3],mfr:icaoM[4],model:icaoM[5],owner:icaoM[6],op:icaoM[7],cls:icaoM[8]||'?'});if(selSet.has(icaoM[1]))updDet();return}
+  if(icaoM){icaoDb.set(icaoM[1],{reg:icaoM[2],tc:icaoM[3],mfr:icaoM[4],model:icaoM[5],owner:icaoM[6],op:icaoM[7],cls:icaoM[8]||'?'});if(selSet.has(icaoM[1]))_detDirty=true;return}
   const mm=MR.exec(l);if(!mm)return;
   const ic=mm[1],af=l.substring(mm[0].length),cm=af.match(/^([\w]{2,8})\s/),cs=(cm&&/[A-Z]/.test(cm[1]))?cm[1]:null;
   totM++;
   let ac=A.get(ic);
-  if(!ac){ac={cs:null,alt:null,speed:null,hdg:null,vr:null,lat:null,lon:null,hasPos:false,expired:false,dist:null,brg:null,ls:Date.now(),msgs:0,mk:null,lb:null,tr:null,trPts:[]};A.set(ic,ac)}
-  ac.ls=Date.now();ac.msgs++;if(cs)ac.cs=cs;
-  // Revive if expired – new message means it's back
-  if(ac.expired){ac.expired=false;ac.mk=null;ac.lb=null;ac.tr=null;}
+  if(!ac){ac={cs:null,sqk:null,alt:null,speed:null,hdg:null,vr:null,lat:null,lon:null,hasPos:false,expired:false,pinned:false,dist:null,brg:null,ls:Date.now(),msgs:0,mk:null,lb:null,tr:null,trPts:[]};A.set(ic,ac)}
+
+  // ── Expired aircraft: decide merge vs new detection ──
+  if(ac.expired){
+    const gap=Date.now()-ac.ls;
+    const sameCs=!cs||!ac.cs||cs===ac.cs;
+    const MERGE_MAX_MS=30*60*1000; // 30 minutes
+
+    if(sameCs&&gap<MERGE_MAX_MS){
+      // Merge — same flight, brief gap. Revive with trail intact.
+      ac.expired=false;
+      rmAc(ac);ac.mk=null;ac.lb=null;ac.tr=null;
+      // Trail stays — gap will render as dashed segment
+    }else{
+      // New detection — different callsign or long gap. Fresh start.
+      rmAc(ac);
+      const wasPinned=ac.pinned; // preserve pin for same-airframe tracking
+      ac.cs=null;ac.sqk=null;ac.alt=null;ac.speed=null;ac.hdg=null;ac.vr=null;
+      ac.lat=null;ac.lon=null;ac.hasPos=false;ac.expired=false;
+      ac.dist=null;ac.brg=null;ac.msgs=0;
+      ac.mk=null;ac.lb=null;ac.tr=null;ac.trPts=[];
+      ac.pinned=wasPinned;
+      // Selection: keep if pinned, clear if not
+      if(!wasPinned)selSet.delete(ic);
+    }
+  }
+
+  ac.ls=Date.now();ac.msgs++;tblDirty=true;if(cs)ac.cs=cs;
   let m;
   if(m=AR.exec(l))ac.alt=parseInt(m[1]);
   if(m=SR.exec(l)){ac.speed=parseInt(m[1]);ac.hdg=parseInt(m[2])}
@@ -705,7 +1193,19 @@ function parse(l){
     }
   }
   if(m=DR.exec(l)){ac.dist=parseFloat(m[1]);ac.brg=parseInt(m[2])}
-  updAc(ic,ac);if(selSet.has(ic))updDet();
+  if(m=QR.exec(l)){
+    const oldSqk=ac.sqk;
+    ac.sqk=m[1];
+    // Fire toast for new emergency squawk (once per ICAO)
+    if(sqkIsEmerg(ac.sqk)&&!_sqkToasted.has(ic)){
+      _sqkToasted.add(ic);
+      sqkToast(ic,ac);
+    }
+    // Clear toast state if squawk changes away from emergency
+    if(oldSqk&&sqkIsEmerg(oldSqk)&&!sqkIsEmerg(ac.sqk))_sqkToasted.delete(ic);
+  }
+  updAc(ic,ac);if(selSet.has(ic))_detDirty=true;
+  if(ac.hasPos)mqttBatchAircraft(ic,ac);
   const n=Date.now();mTs.push(n);while(mTs.length&&mTs[0]<n-5000)mTs.shift();
 }
 
@@ -940,9 +1440,10 @@ function logType(l){
   if(/MESHY|meshy_|Meshy/.test(l))return 'meshy';
   if(MR.test(l))return 'adsb';
   if(/error|fail/i.test(l))return 'error';
+  if(/RTC: pcf8563/.test(l))return 'rtc';
   return 'other';
 }
-const logCls={adsb:'log-adsb',gnss:'log-gnss',scope:'log-scope',error:'log-error',other:'log-info',meshy:'log-meshy',console:'log-console'};
+const logCls={adsb:'log-adsb',gnss:'log-gnss',scope:'log-scope',error:'log-error',other:'log-info',meshy:'log-meshy',console:'log-console',rtc:'log-info'};
 
 function addLog(l){
   const live=document.getElementById('f-s').checked;
@@ -956,18 +1457,26 @@ function stripAnsi(s){return s.replace(/\x1b\[[0-9;]*[a-zA-Z]/g,'')}
 function appendLogLine(el,l){
   l=stripAnsi(l);
   const t=logType(l);
-  const d=document.createElement('div');
+  let d;
+  if(logN>=LMAX){
+    // Ring buffer: recycle oldest node — move to end, update content
+    d=el.firstChild;
+    el.appendChild(d); // DOM move, not clone
+  }else{
+    d=document.createElement('div');
+    el.appendChild(d);
+    logN++;
+  }
   d.className=logCls[t]||'log-info';
   d.dataset.lt=t;
   d.textContent=l;
   d.style.display=isTypeVisible(t)?'':'none';
-  el.appendChild(d);logN++;
-  while(logN>LMAX&&el.firstChild){el.removeChild(el.firstChild);logN--}
 }
 function isTypeVisible(t){
   if(t==='adsb')return document.getElementById('f-a').checked;
   if(t==='gnss')return document.getElementById('f-g').checked;
   if(t==='meshy')return document.getElementById('f-m').checked;
+  if(t==='rtc')return document.getElementById('f-r').checked;
   if(t==='scope')return true;
   if(t==='console')return true;
   if(t==='error')return true;
@@ -982,6 +1491,332 @@ function refilterLog(){
 }
 function clearLog(){document.getElementById('log-output').innerHTML='';logN=0;logPaused=[]}
 function toggleLog(){document.getElementById('log-panel').classList.toggle('visible');document.getElementById('log-btn').classList.toggle('active');syncPanelLayout()}
+
+// --- Gain badge + panel ---
+function updGainBadge(){
+  const el=document.getElementById('gain-val');
+  const badge=document.getElementById('gain-badge');
+  if(!el||!badge)return;
+  el.textContent=gainDb!=null?gainDb.toFixed(1):'N/A';
+  el.classList.remove('gain-steady','gain-converging','gain-manual');
+  badge.classList.remove('gain-state-steady','gain-state-converging','gain-state-manual');
+  if(gainDb==null)return;
+  if(!gainAuto){
+    el.classList.add('gain-manual');
+    badge.classList.add('gain-state-manual');
+  } else if(gainPhase>=2){
+    el.classList.add('gain-steady');
+    badge.classList.add('gain-state-steady');
+  } else {
+    el.classList.add('gain-converging');
+    badge.classList.add('gain-state-converging');
+  }
+  // Update panel content and position if visible
+  const pop=document.getElementById('gain-popover');
+  if(pop.classList.contains('visible')){
+    updGainPopContent();
+    const r=badge.getBoundingClientRect();
+    pop.style.left=Math.max(4,Math.round(r.left))+'px';
+  }
+}
+function updGainPopContent(){
+  // Don't rebuild DOM while user is dragging band slider — innerHTML destroys
+  // the native range input tracking mid-drag. Updates will resume on release.
+  if(_activeThumb) return;
+
+  const mode=document.getElementById('gain-pop-mode');
+  const det=document.getElementById('gain-pop-detail');
+  if(gainDb==null){
+    mode.textContent='RTL-SDR not active';
+    mode.style.color='var(--text-dim)';
+    mode.onclick=null;
+    det.innerHTML='<span>Waiting for data…</span>';
+    return;
+  }
+
+  // Mode label — clickable to expand gain control
+  const modeOpen=document.getElementById('gain-mode-editor')?.classList.contains('visible');
+  let modeText,modeCol;
+  if(!gainAuto){
+    modeText='Manual: '+gainDb.toFixed(1)+' dB';
+    modeCol='var(--text)';
+  }else{
+    const phaseStr=gainPhase>=2?'Steady-state':'Converging';
+    modeText='Auto ('+phaseStr+'): '+gainDb.toFixed(1)+' dB';
+    modeCol=gainPhase>=2?'var(--accent)':'#c4a63a';
+  }
+  mode.innerHTML=modeText;
+  mode.style.color=modeCol;  // green (steady), gold (converging), or white (manual) — same whether open or closed
+  mode.classList.toggle('mode-open',modeOpen);
+  mode.style.animation=(gainAuto&&gainPhase<2)?'gain-pulse 2s ease-in-out infinite':'none';
+  mode.onclick=toggleGainMode;
+  mode.title='Click to change gain mode';
+
+  // Build detail lines
+  const lines=[];
+
+  // Gain mode editor (Auto/Manual toggle + slider)
+  const dbPct=gainDb!=null?((gainDb/49.6)*100):0;
+  const autoMode=gainAuto;
+  const sliderCls='gain-slider'+(autoMode?' auto-mode'+(gainPhase<2?' converging':''):'');
+  const valCls='gain-db-val'+(autoMode?(gainPhase>=2?' auto-steady':' auto-conv'):' manual');
+  lines.push('<div id="gain-mode-editor"'+(modeOpen?' class="visible"':'')+'>'
+    +'<div class="gain-mode-btns">'
+    +'<span class="gain-mode-btn'+(autoMode?' active':'')+'" onclick="gainModeSet(\'auto\')" title="Adaptive gain — algorithm adjusts automatically">Auto</span>'
+    +'<span class="gain-mode-btn'+(!autoMode?' active':'')+'" onclick="gainModeSet(\'manual\')" title="Fixed gain — drag the slider to set">Manual</span>'
+    +'</div>'
+    +'<div class="'+sliderCls+'">'
+    +'<span class="gain-db-val '+valCls+'" id="gain-slider-val">'+(gainDb!=null?gainDb.toFixed(1):'---')+' dB</span>'
+    +'<div class="track-wrap">'
+    +'<div class="track"></div>'
+    +'<div class="track-ends"><span>0</span><span>12.5</span><span>25.4</span><span>37.2</span><span>49.6</span></div>'
+    +'<div class="gain-pos" style="width:'+dbPct+'%"></div>'
+    +'<input type="range" min="0" max="496" step="1" value="'+(gainDb!=null?Math.round(gainDb*10):496)+'" oninput="gainSliderDrag(this)" title="'+(autoMode?'Gain is controlled by the adaptive algorithm':'Drag to set tuner gain')+'">'
+    +'</div>'
+    +'</div>'
+    +'</div>');
+  if(gainErrEma!=null){
+    const bandOpen=document.getElementById('gain-band-editor')?.classList.contains('visible');
+    let preset='';
+    if(gainBandLow===35&&gainBandHigh===45)preset=' — Conservative';
+    else if(gainBandLow===40&&gainBandHigh===50)preset=' — Balanced';
+    else if(gainBandLow===45&&gainBandHigh===55)preset=' — Aggressive';
+    lines.push('<span title="Percentage of ADS-B messages that fail CRC">Error rate: '+gainErrEma.toFixed(1)+'%</span>');
+    if(gainAuto){
+      lines.push('<span class="err-label'+(bandOpen?' band-open':'')+'" onclick="toggleGainBand()" title="Click to adjust target error rate band">Target: '+gainBandLow+'–'+gainBandHigh+'%'+preset+'</span>');
+    }else{
+      lines.push('<span class="err-label'+(bandOpen?' band-open':'')+'" onclick="toggleGainBand()" title="Target band is not used in manual mode — click to configure for auto mode" style="opacity:0.5">Target: '+gainBandLow+'–'+gainBandHigh+'%'+preset+' (inactive)</span>');
+    }
+    // Two-thumb range slider
+    const lo=gainBandLow,hi=gainBandHigh;
+    const pctL=((lo-25)/(60-25))*100,pctH=((hi-25)/(60-25))*100;
+    lines.push('<div id="gain-band-editor"'+(bandOpen?' class="visible"':'')+'>'
+      +'<div style="display:flex;gap:6px;margin-bottom:6px">'
+      +'<span class="gain-preset'+(lo===35&&hi===45?' active':'')+'" onclick="gainBandPreset(35,45)" title="Cleaner messages, reduced range">Conservative</span>'
+      +'<span class="gain-preset'+(lo===40&&hi===50?' active':'')+'" onclick="gainBandPreset(40,50)" title="Good range with moderate noise rejection (default)">Balanced</span>'
+      +'<span class="gain-preset'+(lo===45&&hi===55?' active':'')+'" onclick="gainBandPreset(45,55)" title="Maximum range, more noise">Aggressive</span>'
+      +'</div>'
+      +'<div class="dual-range">'
+      +'<span class="band-val low" id="gain-band-low-val">'+lo+'%</span>'
+      +'<div class="track-wrap" onpointerdown="gainBandThumbPick(event)">'
+      +'<div class="track"></div>'
+      +'<div class="track-ends"><span>25</span><span>60</span></div>'
+      +'<div class="fill" style="left:'+pctL+'%;right:'+(100-pctH)+'%"></div>'
+      +'<input type="range" min="25" max="60" step="1" value="'+lo+'" id="gain-band-low-in" oninput="gainBandSlide(this,\'low\')" title="Low threshold">'
+      +'<input type="range" min="25" max="60" step="1" value="'+hi+'" id="gain-band-high-in" oninput="gainBandSlide(this,\'high\')" title="High threshold">'
+      +'</div>'
+      +'<span class="band-val high" id="gain-band-high-val">'+hi+'%</span>'
+      +'</div>'
+      +'</div>');
+  }
+  if(gainPosRate!=null)lines.push('<span title="Position updates decoded per second – the primary optimization metric">Position rate: '+gainPosRate.toFixed(1)+'/s</span>');
+  if(gainRange!=null)lines.push('<span title="Farthest aircraft detected in the current gain window">Max range: '+gainRange.toFixed(0)+' nm</span>');
+  if(gainCeiling||gainFloor){
+    const bounds=[];
+    if(gainCeiling)bounds.push('ceiling');
+    if(gainFloor)bounds.push('floor');
+    lines.push('<span title="Gain levels that were tried and found to reduce throughput – will auto-expire after 20 minutes">Bounds: '+bounds.join(', ')+' set</span>');
+  }
+  if(gainErrEma==null&&gainPosRate==null&&gainRange==null){
+    lines.push('<span style="color:var(--text-dim)">Waiting for data…</span>');
+  }
+  det.innerHTML=lines.join('');
+}
+function toggleGainPopover(){
+  const pop=document.getElementById('gain-popover');
+  const badge=document.getElementById('gain-badge');
+  if(pop.classList.contains('visible')){
+    pop.classList.remove('visible');
+    badge.classList.remove('open');
+    return;
+  }
+  // Position: align left with badge, top with gnss-info panel
+  const r=badge.getBoundingClientRect();
+  pop.style.left=Math.max(4,Math.round(r.left))+'px';
+  updGainPopContent();
+  pop.classList.add('visible');
+  badge.classList.add('open');
+  bringToFront(pop);
+}
+
+function toggleGainBand(){
+  const ed=document.getElementById('gain-band-editor');
+  const lbl=document.querySelector('#gain-pop-detail .err-label');
+  if(!ed)return;
+  const opening=!ed.classList.contains('visible');
+  ed.classList.toggle('visible',opening);
+  if(lbl)lbl.classList.toggle('band-open',opening);
+}
+
+function toggleGainMode(){
+  const ed=document.getElementById('gain-mode-editor');
+  const mode=document.getElementById('gain-pop-mode');
+  if(!ed)return;
+  const opening=!ed.classList.contains('visible');
+  ed.classList.toggle('visible',opening);
+  mode.classList.toggle('mode-open',opening);
+}
+
+async function gainModeSet(m){
+  if(!conn||!port?.writable)return;
+  const cmd=m==='auto'?'gain auto':'gain '+(gainDb!=null?gainDb.toFixed(1):'43.4');
+  // Fire and forget — UI updates when next GAIN: log line arrives
+  sendCmdResume(cmd,3000).catch(e=>console.warn('gain mode:',e));
+}
+
+let _gainSliderTimer=null;
+function gainSliderDrag(el){
+  // Only allow dragging in manual mode
+  if(gainAuto)return;
+  const tenths=parseInt(el.value);
+  const db=tenths/10;
+  // Update display immediately
+  const valEl=document.getElementById('gain-slider-val');
+  if(valEl)valEl.textContent=db.toFixed(1)+' dB';
+  const pos=el.parentElement.querySelector('.gain-pos');
+  if(pos)pos.style.width=((db/49.6)*100)+'%';
+  // Debounce serial command
+  clearTimeout(_gainSliderTimer);
+  _gainSliderTimer=setTimeout(async()=>{
+    if(!conn||!port?.writable)return;
+    sendCmdResume('gain '+db.toFixed(1),3000).catch(e=>console.warn('gain set:',e));
+  },300);
+}
+
+function gainBandPreset(low,high){
+  gainBandLow=low;gainBandHigh=high;
+  updGainPopContent();  // rebuild to reflect new values and active preset
+  clearTimeout(_gainBandTimer);
+  _gainBandTimer=setTimeout(()=>gainBandSend(),200);
+}
+
+let _gainBandTimer=null;
+let _pushSaved=null;  // {which:'high'|'low', val:number} — original value before push
+let _activeThumb=null; // 'low'|'high' — which thumb is being dragged
+
+// Global release handler — fires even if pointer leaves the slider element
+document.addEventListener('pointerup',()=>{if(_activeThumb){_pushSaved=null;_activeThumb=null;}});
+document.addEventListener('pointercancel',()=>{if(_activeThumb){_pushSaved=null;_activeThumb=null;}});
+
+function gainBandThumbPick(e){
+  // On pointerdown: bring the closer thumb to top so it captures the drag.
+  const wrap=e.currentTarget;
+  const lowIn=wrap.querySelector('#gain-band-low-in');
+  const highIn=wrap.querySelector('#gain-band-high-in');
+  if(!lowIn||!highIn)return;
+  const rect=wrap.getBoundingClientRect();
+  const clickPct=(e.clientX-rect.left)/rect.width*100;
+  const lowPct=((parseInt(lowIn.value)-25)/(60-25))*100;
+  const highPct=((parseInt(highIn.value)-25)/(60-25))*100;
+  const distLow=Math.abs(clickPct-lowPct);
+  const distHigh=Math.abs(clickPct-highPct);
+  // Bring closer thumb to top; break ties by preferring the one user is approaching from
+  if(distLow<=distHigh){
+    lowIn.style.zIndex='2';highIn.style.zIndex='1';
+  }else{
+    highIn.style.zIndex='2';lowIn.style.zIndex='1';
+  }
+}
+
+function gainBandSlide(el,which){
+  const wrap=el.closest('.track-wrap');
+  const inputs=wrap.querySelectorAll('input[type=range]');
+  const lowIn=inputs[0],highIn=inputs[1];
+  let low=parseInt(lowIn.value),high=parseInt(highIn.value);
+  const MIN_SPREAD=10,MAX_SPREAD=20;
+  _activeThumb=which;
+
+  // Clamp to valid bounds (both inputs share min=25 max=60 for visual alignment)
+  if(which==='low') low=Math.min(low,50);
+  if(which==='high') high=Math.max(high,35);
+
+  // Z-index: bring the active thumb's input to the top so it captures events
+  lowIn.style.zIndex=(which==='low')?'2':'1';
+  highIn.style.zIndex=(which==='high')?'2':'1';
+
+  if(which==='low'){
+    if(low>high-MIN_SPREAD){
+      // Too close — push high up
+      if(!_pushSaved||_pushSaved.which!=='high')_pushSaved={which:'high',val:high,mode:'push'};
+      high=Math.min(60,low+MIN_SPREAD);
+    }else if(high-low>MAX_SPREAD){
+      // Too wide — pull high down
+      if(!_pushSaved||_pushSaved.which!=='high')_pushSaved={which:'high',val:high,mode:'pull'};
+      high=low+MAX_SPREAD;
+    }else if(_pushSaved&&_pushSaved.which==='high'){
+      if(_pushSaved.mode==='push'){
+        // Pushed high up — restore when gap opens enough
+        if(low+MIN_SPREAD<=_pushSaved.val){high=_pushSaved.val;_pushSaved=null;}
+        else{high=low+MIN_SPREAD;}
+      }else{
+        // Pulled high down — restore when gap narrows enough
+        if(low+MAX_SPREAD>=_pushSaved.val){high=_pushSaved.val;_pushSaved=null;}
+        else{high=low+MAX_SPREAD;}
+      }
+    }
+    lowIn.value=low;highIn.value=high;
+  }else{
+    if(high<low+MIN_SPREAD){
+      // Too close — push low down
+      if(!_pushSaved||_pushSaved.which!=='low')_pushSaved={which:'low',val:low,mode:'push'};
+      low=Math.max(25,high-MIN_SPREAD);
+    }else if(high-low>MAX_SPREAD){
+      // Too wide — pull low up
+      if(!_pushSaved||_pushSaved.which!=='low')_pushSaved={which:'low',val:low,mode:'pull'};
+      low=high-MAX_SPREAD;
+    }else if(_pushSaved&&_pushSaved.which==='low'){
+      if(_pushSaved.mode==='push'){
+        // Pushed low down — restore when gap opens enough
+        if(high-MIN_SPREAD>=_pushSaved.val){low=_pushSaved.val;_pushSaved=null;}
+        else{low=high-MIN_SPREAD;}
+      }else{
+        // Pulled low up — restore when gap narrows enough
+        if(high-MAX_SPREAD<=_pushSaved.val){low=_pushSaved.val;_pushSaved=null;}
+        else{low=high-MAX_SPREAD;}
+      }
+    }
+    lowIn.value=low;highIn.value=high;
+  }
+
+  gainBandLow=low;gainBandHigh=high;
+
+  // Update fill bar
+  const fill=wrap.querySelector('.fill');
+  if(fill){
+    const pctL=((low-25)/(60-25))*100;
+    const pctH=((high-25)/(60-25))*100;
+    fill.style.left=pctL+'%';
+    fill.style.right=(100-pctH)+'%';
+  }
+
+  // Update value labels
+  const lowVal=document.getElementById('gain-band-low-val');
+  const highVal=document.getElementById('gain-band-high-val');
+  if(lowVal)lowVal.textContent=low+'%';
+  if(highVal)highVal.textContent=high+'%';
+
+  // Update target label and preset highlights
+  const lbl=document.querySelector('#gain-pop-detail .err-label');
+  if(lbl){
+    let preset='';
+    if(low===35&&high===45)preset=' — Conservative';
+    else if(low===40&&high===50)preset=' — Balanced';
+    else if(low===45&&high===55)preset=' — Aggressive';
+    lbl.innerHTML='Target: '+low+'–'+high+'%'+preset;
+  }
+  document.querySelectorAll('.gain-preset').forEach(b=>b.classList.remove('active'));
+  if(low===35&&high===45)document.querySelectorAll('.gain-preset')[0]?.classList.add('active');
+  else if(low===40&&high===50)document.querySelectorAll('.gain-preset')[1]?.classList.add('active');
+  else if(low===45&&high===55)document.querySelectorAll('.gain-preset')[2]?.classList.add('active');
+
+  clearTimeout(_gainBandTimer);
+  _gainBandTimer=setTimeout(()=>gainBandSend(),500);
+}
+
+async function gainBandSend(){
+  if(!conn||!port?.writable)return;
+  sendCmdResume('gain band '+gainBandLow+' '+gainBandHigh,3000).catch(e=>console.warn('gain band:',e));
+}
 
 // --- Meshy panel ---
 const meshyNodes={};  // nodeId -> {short:'', long:''}
@@ -1027,12 +1862,16 @@ async function takeScreenshot(){
   if(!conn){alert('Connect serial first');return}
   const btn=document.getElementById('screenshot-btn');
   if(btn)btn.textContent='⏳';
+  // Lock cmdQueue — prevent sendCmdResume from interfering during screenshot
+  const ticket=cmdQueue;
+  let unlock;
+  cmdQueue=new Promise(r=>{unlock=r;});
   try{
+    await ticket; // wait for any in-flight command to finish
     // Step 1: Capture screenshot to SD card
     const saveResult=await sendCmd('screenshot',10000);
     if(!saveResult||/failed/i.test(saveResult)){
       addLog('[scope] Screenshot capture failed');
-      if(btn)btn.textContent='📸';
       return;
     }
     addLog('[scope] '+saveResult.trim());
@@ -1040,7 +1879,6 @@ async function takeScreenshot(){
     const raw=await sendCmd('screenshot send',30000);
     if(!raw||!raw.includes('SCREENSHOT_BEGIN')){
       addLog('[scope] Screenshot send failed');
-      if(btn)btn.textContent='📸';
       return;
     }
     // Parse: find SCREENSHOT_BEGIN line, collect base64, stop at SCREENSHOT_END
@@ -1058,7 +1896,6 @@ async function takeScreenshot(){
     }
     if(b64.length===0){
       addLog('[scope] Screenshot: no base64 data received');
-      if(btn)btn.textContent='📸';
       return;
     }
     const bin=Uint8Array.from(atob(b64),c=>c.charCodeAt(0));
@@ -1072,11 +1909,19 @@ async function takeScreenshot(){
     addLog('[scope] Screenshot error: '+e.message);
   }finally{
     if(btn)btn.textContent='📸';
-    // Return to log mode — sendCmd leaves device in command mode
+    // Return to log mode — same flush pattern as sendCmdResume
     try{
-      cmdWaiting=false;cmdBuf=[];
+      cmdBuf=[];cmdWaiting=true;cmdSkipPrompts=0;
       await serialWrite('log\n');
+      await new Promise(r=>setTimeout(r,500));
+      const flushed=cmdBuf.slice();
+      cmdWaiting=false;cmdBuf=[];cmdSkipPrompts=0;
+      for(const l of flushed){
+        const clean=l.replace(/\x1b\[[0-9;]*m/g,'').trim();
+        if(clean&&!clean.startsWith('Entering log mode'))parse(clean);
+      }
     }catch(e){}
+    unlock(); // release cmdQueue lock
   }
 }
 function handleMeshyTx(l){
@@ -1437,6 +2282,17 @@ function ageMeshyMsgBubbles(){
   }
 }
 setInterval(ageMeshyMsgBubbles,2000);
+// Sweep stale meshyDedup entries every 60s — 10min TTL
+const MESHY_DEDUP_TTL=600000;
+setInterval(function(){
+  const now=Date.now();
+  for(const key in meshyDedup){
+    const e=meshyDedup[key];
+    if((now-e.ts)>MESHY_DEDUP_TTL||!e.el.isConnected){
+      delete meshyDedup[key];
+    }
+  }
+},60000);
 function fmtRx(r){
   const hops=r.hopStart>0?(r.hopStart-r.hop):0;
   return `RSSI:${r.rssi} SNR:${r.snr}${hops>0?' +'+hops+'hop':''}${r.hop>0?' relay':' direct'}`;
@@ -1579,7 +2435,7 @@ function refilterMeshy(){
 
 // --- Table sort ---
 let sortCol=null, sortDir=0; // 0=default, 1=asc, -1=desc
-const sortKeys=['icao','cs','alt','spd','hdg','vr','dist','brg','age','msgs'];
+const sortKeys=['pin','icao','cs','alt','spd','hdg','vr','dist','brg','age','msgs'];
 function tblSort(col){
   if(sortCol===col){
     if(sortDir===1)sortDir=-1;
@@ -1589,14 +2445,20 @@ function tblSort(col){
   // Update header indicators
   for(const k of sortKeys){
     const el=document.getElementById('sh-'+k);
-    if(el)el.textContent=(sortCol===k?(sortDir===1?'▲':'▼'):'');
+    if(el){
+      el.textContent=(sortCol===k?(sortDir===1?'▲':'▼'):'');
+      const th=el.closest('th');
+      if(th)th.classList.toggle('sort-active',sortCol===k);
+    }
   }
 }
 function sortVal(ic,ac,n){
   const age=Math.round((n-ac.ls)/1000);
   switch(sortCol){
+    case'pin':return ac.pinned?(ac.expired?1:0):2;
     case'icao':return ic;
     case'cs':return ac.cs||'zzz';
+    case'sqk':return ac.sqk||'zzzz';
     case'alt':return ac.alt??-99999;
     case'spd':return ac.speed??-1;
     case'hdg':return ac.hdg??-1;
@@ -1626,72 +2488,188 @@ function updSessionInfo(){
   if(sessEnd)html+='<span class="sess-off">DISCONNECTED:</span><span class="sess-off">'+fmtTime(sessEnd)+'</span>';
   el.innerHTML=html;
 }
+// --- Keyed row pool: persistent DOM rows with cell-level updates ---
+const rowPool=new Map(); // ic → {tr, tds:[11], pin:span, _c:{cache}}
+function tblCreateRow(ic){
+  const tr=document.createElement('tr');
+  tr.dataset.ic=ic;
+  tr.onclick=function(e){sel0(ic,e)};
+  const tds=[];
+  for(let i=0;i<12;i++){const td=document.createElement('td');tr.appendChild(td);tds.push(td)}
+  tds[0].className='col-pin';
+  tds[0].onclick=function(e){togglePin(ic,e)};
+  const pin=document.createElement('span');pin.className='pin-led';
+  tds[0].appendChild(pin);
+  tds[1].className='col-icao';
+  tds[1].textContent=ic;
+  tds[3].className='col-sqk';
+  const entry={tr,tds,pin,_c:{}};
+  rowPool.set(ic,entry);
+  return entry;
+}
+function tblUpdateRow(entry,ic,ac,n){
+  const{tr,tds,pin,_c:c}=entry;
+  const isSel=selSet.has(ic);
+  const age=Math.round((n-ac.ls)/1000);
+  const color=acCol(ic,ac);
+  const pinCls=ac.pinned?(ac.expired?(isSel?'pin-led on-gold':'pin-led on-gold-dim'):'pin-led on'):'pin-led';
+  // Emergency squawk row class
+  const sqkRow=ac.sqk==='7700'||ac.sqk==='7500'?' sqk-emerg':ac.sqk==='7600'?' sqk-nordo':'';
+  let trCls,icCol,cellCol;
+  if(ac.expired){
+    const dimCls=isSel?'':(ac.pinned?' dim-050':' dim-040');
+    trCls=(isSel?'selected':'')+dimCls+sqkRow;
+    icCol=isSel&&ac.pinned?'#dab24a':(isSel?'#99a':(ac.pinned?'#a08630':'#556'));
+    cellCol=icCol;
+  }else{
+    const st=acStale(ac,isSel);
+    const dimCls=st.gray?(isSel?'':' dim-050'):st.opacity<1?' dim-050':'';
+    trCls=(isSel?'selected':'')+dimCls+sqkRow;
+    icCol=st.gray?(isSel?(ac.expired&&ac.pinned?'#dab24a':'#99a'):(ac.expired&&ac.pinned?'#a08630':'#667')):color;
+    cellCol=null;
+  }
+  if(c.trCls!==trCls){tr.className=trCls;c.trCls=trCls}
+  if(c.pinCls!==pinCls){pin.className=pinCls;c.pinCls=pinCls}
+  if(c.icCol!==icCol){tds[1].style.color=icCol;c.icCol=icCol}
+  // Cell class changes on expired/live transition
+  const exp=ac.expired;
+  if(c.exp!==exp){
+    c.exp=exp;
+    if(exp){
+      tds[2].className='col-cs';tds[3].className='col-sqk';tds[4].className='';tds[5].className='';tds[6].className='';
+      tds[7].className='';tds[8].className='';tds[9].className='';tds[10].className='';tds[11].className='';
+    }else{
+      tds[2].className='col-cs';tds[3].className='col-sqk';tds[4].className='col-alt';tds[5].className='';tds[6].className='';
+      tds[7].className='col-vr';tds[8].className='col-dist';tds[9].className='col-dist';tds[10].className='col-dist';tds[11].className='col-dist';
+    }
+  }
+  // Expired: all cells inline color. Live: clear inline color (CSS classes handle it)
+  if(c.cellCol!==cellCol){
+    c.cellCol=cellCol;
+    const cc=cellCol||'';
+    for(let i=2;i<=11;i++)tds[i].style.color=cc;
+  }
+  // VR class (climbing/descending) — only for live rows
+  if(!exp){
+    const vc=ac.vr>0?'col-vr climbing':ac.vr<0?'col-vr descending':'col-vr';
+    if(c.vc!==vc){tds[7].className=vc;c.vc=vc}
+  }
+  const cs=ac.cs||'---';if(c.cs!==cs){tds[2].textContent=cs;c.cs=cs}
+  // SQK badge (uses innerHTML for badge markup)
+  const sqk=ac.sqk||'';
+  if(c.sqk!==sqk){tds[3].innerHTML=sqkBadgeHtml(sqk)||'';c.sqk=sqk}
+  const al=ac.alt!=null?ac.alt.toLocaleString():'---';if(c.al!==al){tds[4].textContent=al;c.al=al}
+  const sp=ac.speed?String(ac.speed):'---';if(c.sp!==sp){tds[5].textContent=sp;c.sp=sp}
+  const hd=ac.hdg!=null?ac.hdg+'°':'---';if(c.hd!==hd){tds[6].textContent=hd;c.hd=hd}
+  const vr=ac.vr?(ac.vr>0?'+':'')+ac.vr:'---';if(c.vr!==vr){tds[7].textContent=vr;c.vr=vr}
+  const di=ac.dist!=null?ac.dist.toFixed(1)+'nm':'---';if(c.di!==di){tds[8].textContent=di;c.di=di}
+  const br=ac.brg!=null?ac.brg+'°':'---';if(c.br!==br){tds[9].textContent=br;c.br=br}
+  tds[10].textContent=age+'s';
+  const ms=String(ac.msgs||0);if(c.ms!==ms){tds[11].textContent=ms;c.ms=ms}
+}
 function tick(){
   const n=nowTime();
   // Only expire when receiving data – freeze state when idle
   if(conn||csvPlaying){
     for(const[ic,ac]of A){
       const age=n-ac.ls;
-      if(age>EXP&&!ac.expired){
-        ac.expired=true;
-        if(selSet.has(ic)){
-          ac.pinned=true;  // keep on map — updAc renders selected expired
+      if(!ac.expired&&age>EXP){
+        ac.expired=true;tblDirty=true;
+        if(selSet.has(ic))_detDirty=true;
+        if(!selSet.has(ic)&&!ac.pinned){
+          rmAc(ac);selSet.delete(ic);
         }else{
-          rmAc(ac);
-          selSet.delete(ic);
+          dirtyAc.add(ic);
         }
+        continue;
+      }
+      // Prune aircraft dead >30 min — free trPts memory (data reloadable from SD logs)
+      if(ac.expired&&!ac.pinned&&!selSet.has(ic)&&age>(EXP+PRUNE_MS)){
+        rmAc(ac);A.delete(ic);dirtyAc.delete(ic);
+        continue;
+      }
+      // Staleness band transitions: 0=fresh(<30s), 1=dim(30-60s), 2=gray(>60s)
+      if(!ac.expired){
+        const sb=age<30000?0:age<60000?1:2;
+        if(ac._sb!==sb){ac._sb=sb;dirtyAc.add(ic);tblDirty=true;if(selSet.has(ic))_detDirty=true}
       }
     }
   }
-  // Refresh map visuals for staleness transitions (include selected expired)
-  for(const[ic,ac]of A){if(!ac.expired||selSet.has(ic))updAc(ic,ac)}
-  updRxRings();
-  const liveCount=[...A.values()].filter(ac=>!ac.expired).length;
-  document.getElementById('ac-count').textContent=liveCount;
-  document.getElementById('msg-count').textContent=totM.toLocaleString();
-  document.getElementById('msg-rate').textContent=(mTs.length/5).toFixed(1);
-  // Lock stat widths – only grow, never shrink
-  ['ac-count','msg-count','msg-rate'].forEach(id=>{
-    const el=document.getElementById(id);
-    const w=el.scrollWidth;
-    const cur=parseInt(el.style.minWidth)||0;
-    if(w>cur)el.style.minWidth=w+'px';
-  });
-  if(selSet.size)updDet();
+  // Update only dirty aircraft on map (staleness changes, selection, mode switches)
+  for(const ic of dirtyAc){
+    const ac=A.get(ic);
+    if(ac&&(!ac.expired||selSet.has(ic)||ac.pinned))updAc(ic,ac);
+  }
+  dirtyAc.clear();
+  // Throttle ring updates — only every 5 ticks (rings don't need per-second updates)
+  if(++_ringTick>=5){_ringTick=0;updRxRings()}
+  // Efficient live count — no temporary array allocation
+  let lc=0;for(const[,ac]of A){if(!ac.expired)lc++}
+  const _acEl=document.getElementById('ac-count');
+  const _mcEl=document.getElementById('msg-count');
+  const _mrEl=document.getElementById('msg-rate');
+  const _acT=String(lc),_mcT=totM.toLocaleString(),_mrT=(mTs.length/5).toFixed(1);
+  let _statsMoved=false;
+  if(_acEl.textContent!==_acT){_acEl.textContent=_acT;_statsMoved=true}
+  if(_mcEl.textContent!==_mcT){_mcEl.textContent=_mcT;_statsMoved=true}
+  if(_mrEl.textContent!==_mrT){_mrEl.textContent=_mrT;_statsMoved=true}
+  // Reposition gain panel if open — only when stats text changed (may shift layout)
+  if(_statsMoved){
+    const _gp=document.getElementById('gain-popover');
+    if(_gp&&_gp.classList.contains('visible')){
+      const _gb=document.getElementById('gain-badge');
+      if(_gb){const _r=_gb.getBoundingClientRect();_gp.style.left=Math.max(4,Math.round(_r.left))+'px'}
+    }
+  }
+  if(selSet.size&&_detDirty){updDet();_detDirty=false}
   updSessionInfo();
   updGnss();
+  mqttFlushAircraft(); // batch publish accumulated aircraft messages (~1/sec)
+  if(v3d)update3d();
+  // Skip table rebuild when panel is collapsed — biggest mobile perf win
+  const panel=document.getElementById('panel');
+  if(panel&&panel.classList.contains('collapsed')){tblDirty=false;return}
   const tb=document.getElementById('ac-tbody');
-  // Sort: expired always at bottom, then by user-selected column or default (distance)
+  // Fast path: if no data changed, just update age cells in-place
+  if(!tblDirty){
+    for(const[ic,entry]of rowPool){
+      const ac=A.get(ic);
+      if(ac)entry.tds[10].textContent=Math.round((n-ac.ls)/1000)+'s';
+    }
+    return;
+  }
+  // Sort: expired always at bottom (except when sorting by pin — pin grouping takes priority)
   const so=[...A.entries()].sort((a,b)=>{
-    if(a[1].expired!==b[1].expired)return a[1].expired?1:-1;
+    if(sortCol!=='pin'&&a[1].expired!==b[1].expired)return a[1].expired?1:-1;
     if(sortCol&&sortDir){
       const va=sortVal(a[0],a[1],n),vb=sortVal(b[0],b[1],n);
       const cmp=typeof va==='string'?va.localeCompare(vb):va-vb;
-      return cmp*sortDir;
+      if(cmp!==0)return cmp*sortDir;
+      return(a[1].dist||999)-(b[1].dist||999);
     }
     return(a[1].dist||999)-(b[1].dist||999);
   });
-  tb.innerHTML=so.map(([ic,ac])=>{
-    const age=Math.round((n-ac.ls)/1000);
-    const vc=ac.vr>0?'climbing':ac.vr<0?'descending':'';
-    const isSel=selSet.has(ic);
-    const sel=isSel?' selected':'';
-    const c=acCol(ic,ac);
-    if(ac.expired){
-      const expOp=isSel?'opacity:0.5':'opacity:0.25';
-      const expCol=isSel?'#99a':'#556';
-      const dismiss=ac.pinned?`<span style="cursor:pointer;color:#ff6b6b;margin-left:4px" onclick="dismissAc('${ic}',event)">✕</span>`:'';
-      return`<tr data-ic="${ic}" class="${sel}" style="${expOp}" onclick="sel0('${ic}',event)"><td class="col-icao" style="color:${expCol}">${ic}${dismiss}</td><td class="col-cs" style="color:${expCol}">${ac.cs||'---'}</td><td style="color:${expCol}">${ac.alt!=null?ac.alt.toLocaleString():'---'}</td><td style="color:${expCol}">${ac.speed||'---'}</td><td style="color:${expCol}">${ac.hdg!=null?ac.hdg+'°':'---'}</td><td style="color:${expCol}">${ac.vr?(ac.vr>0?'+':'')+ac.vr:'---'}</td><td style="color:${expCol}">${ac.dist!=null?ac.dist.toFixed(1)+'nm':'---'}</td><td style="color:${expCol}">${ac.brg!=null?ac.brg+'°':'---'}</td><td style="color:${expCol}">${age}s</td><td style="color:${expCol}">${ac.msgs||0}</td></tr>`;
+  // Keyed row pool: create/update rows, reorder via appendChild
+  const activeIcs=new Set();
+  for(const[ic,ac]of so){
+    activeIcs.add(ic);
+    let entry=rowPool.get(ic);
+    if(!entry)entry=tblCreateRow(ic);
+    tblUpdateRow(entry,ic,ac,n);
+    tb.appendChild(entry.tr); // moves existing node to correct sort position
+  }
+  // Remove rows for pruned aircraft
+  for(const[ic,entry]of rowPool){
+    if(!activeIcs.has(ic)){entry.tr.remove();rowPool.delete(ic)}
+  }
+  tblDirty=false;
+  // Re-apply keyboard focus — resolve ICAO to new position
+  if(kbFocusIcao){
+    const rows=tb.children;
+    kbFocusIdx=-1;
+    for(let j=0;j<rows.length;j++){
+      if(rows[j].dataset.ic===kbFocusIcao){kbFocusIdx=j;break}
     }
-    const st=acStale(ac,isSel);
-    const rowOp=st.gray?(isSel?'opacity:0.5':'opacity:0.35'):st.opacity<1?'opacity:0.5':'';
-    const icCol=st.gray?(isSel?'#99a':'#667'):c;
-    return`<tr data-ic="${ic}" class="${sel}" style="${rowOp}" onclick="sel0('${ic}',event)"><td class="col-icao" style="color:${icCol}">${ic}</td><td class="col-cs">${ac.cs||'---'}</td><td class="col-alt">${ac.alt!=null?ac.alt.toLocaleString():'---'}</td><td>${ac.speed||'---'}</td><td>${ac.hdg!=null?ac.hdg+'°':'---'}</td><td class="col-vr ${vc}">${ac.vr?(ac.vr>0?'+':'')+ac.vr:'---'}</td><td class="col-dist">${ac.dist!=null?ac.dist.toFixed(1)+'nm':'---'}</td><td class="col-dist">${ac.brg!=null?ac.brg+'°':'---'}</td><td class="col-dist">${age}s</td><td class="col-dist">${ac.msgs||0}</td></tr>`;
-  }).join('');
-  // Re-apply keyboard focus after table rebuild
-  if(kbFocusIdx>=0){
-    const rows=tb.querySelectorAll('tr');
-    if(kbFocusIdx>=rows.length)kbFocusIdx=rows.length-1;
     if(kbFocusIdx>=0&&rows[kbFocusIdx])rows[kbFocusIdx].classList.add('kb-focus');
   }
 }
@@ -1725,6 +2703,7 @@ let panelH=Math.round(window.innerHeight*0.35);
 // Arrow Up/Down: move focus row. Enter or Space: select focused row.
 // Shift+Arrow: extend selection to focused row. Escape: deselect all.
 let kbFocusIdx=-1; // -1 = no keyboard focus
+let kbFocusIcao=null; // ICAO of focused row — survives re-sort
 function kbApplyFocus(){
   const rows=document.querySelectorAll('#ac-tbody tr');
   rows.forEach((r,i)=>r.classList.toggle('kb-focus',i===kbFocusIdx));
@@ -1737,36 +2716,93 @@ function kbApplyFocus(){
   }
 }
 document.getElementById('panel-scroll').addEventListener('keydown',function(e){
+  // Cmd/Ctrl+A: select all
+  if((e.metaKey||e.ctrlKey)&&e.key==='a'){
+    e.preventDefault();selAll();return;
+  }
   if(e.key!=='ArrowUp'&&e.key!=='ArrowDown'&&e.key!=='Enter'&&e.key!==' '&&e.key!=='Escape')return;
   const rows=document.querySelectorAll('#ac-tbody tr');
   if(!rows.length)return;
   e.preventDefault();
-  if(e.key==='Escape'){desel();kbFocusIdx=-1;kbApplyFocus();return}
+  if(e.key==='Escape'){desel();kbFocusIdx=-1;kbFocusIcao=null;kbApplyFocus();return}
   if(e.key==='ArrowUp'){
-    kbFocusIdx=kbFocusIdx<=0?rows.length-1:kbFocusIdx-1;
+    if(kbFocusIdx>0)kbFocusIdx=kbFocusIdx-1;
+    else if(kbFocusIdx<0)kbFocusIdx=0;
     const ic=rows[kbFocusIdx]?.dataset.ic;
-    if(ic)sel0(ic,e.shiftKey?{shiftKey:true}:{});
+    if(ic){kbFocusIcao=ic;sel0(ic,{shiftKey:e.shiftKey,ctrlKey:e.ctrlKey,metaKey:e.metaKey})}
     kbApplyFocus();return;
   }
   if(e.key==='ArrowDown'){
-    kbFocusIdx=kbFocusIdx>=rows.length-1?0:kbFocusIdx+1;
+    if(kbFocusIdx<rows.length-1)kbFocusIdx=kbFocusIdx+1;
+    else if(kbFocusIdx<0)kbFocusIdx=0;
     const ic=rows[kbFocusIdx]?.dataset.ic;
-    if(ic)sel0(ic,e.shiftKey?{shiftKey:true}:{});
+    if(ic){kbFocusIcao=ic;sel0(ic,{shiftKey:e.shiftKey,ctrlKey:e.ctrlKey,metaKey:e.metaKey})}
     kbApplyFocus();return;
   }
   if(e.key==='Enter'||e.key===' '){
     if(kbFocusIdx>=0&&kbFocusIdx<rows.length){
       const ic=rows[kbFocusIdx]?.dataset.ic;
-      if(ic)sel0(ic,e.shiftKey?{shiftKey:true}:{});
+      if(ic)sel0(ic,{shiftKey:e.shiftKey,ctrlKey:e.ctrlKey,metaKey:e.metaKey});
     }
     return;
   }
+});
+
+// --- Global zoom keys (+/-/=) — works in both 2D and 3D ---
+window.addEventListener('keydown',function(e){
+  if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA')return;
+  // Undo/redo selection (Cmd+Z / Ctrl+Z, Cmd+Shift+Z / Ctrl+Shift+Z / Ctrl+Y)
+  if((e.metaKey||e.ctrlKey)&&!e.altKey){
+    if(e.key==='z'||e.key==='Z'){
+      if(e.shiftKey){selRedo()}else{selUndo()}
+      e.preventDefault();return;
+    }
+    if(e.key==='y'){selRedo();e.preventDefault();return}
+  }
+  if(e.key==='Escape'&&!v3d){desel();e.preventDefault();return}
+  // P: toggle pin on selected aircraft
+  if((e.key==='p'||e.key==='P')&&!e.ctrlKey&&!e.metaKey&&!v3d){
+    if(selSet.size){
+      const anyUnpinned=[...selSet].some(ic=>{const ac=A.get(ic);return ac&&!ac.pinned});
+      for(const ic of selSet){const ac=A.get(ic);if(ac){ac.pinned=anyUnpinned;updAc(ic,ac)}}
+      tblDirty=true;updDet();
+    }
+    e.preventDefault();return;
+  }
+  if(e.key==='='||e.key==='+'){zoomSel(1);e.preventDefault()}
+  if(e.key==='-'||e.key==='_'){zoomSel(-1);e.preventDefault()}
 });
 
 // --- Meshy panel: drag to move (header), CSS resize:both for corner ---
 (function(){
   const panel=document.getElementById('meshy-panel');
   const header=document.getElementById('meshy-header');
+  let dragActive=false,dragX,dragY,panelX,panelY;
+  function dragStart(x,y,e){
+    if(e.target.tagName==='BUTTON')return;
+    dragActive=true;dragX=x;dragY=y;
+    const r=panel.getBoundingClientRect();panelX=r.left;panelY=r.top;
+    panel.style.transition='none';header.classList.add('dragging');
+    document.body.style.userSelect='none';
+  }
+  function dragMove(x,y){if(!dragActive)return;
+    const nx=Math.max(0,Math.min(window.innerWidth-60,panelX+(x-dragX)));
+    const ny=Math.max(0,Math.min(window.innerHeight-60,panelY+(y-dragY)));
+    panel.style.left=nx+'px';panel.style.top=ny+'px';panel.style.right='auto';panel.dataset.dragged='1';
+  }
+  function dragEnd(){if(!dragActive)return;dragActive=false;panel.style.transition='';header.classList.remove('dragging');document.body.style.userSelect=''}
+  header.addEventListener('mousedown',e=>{e.preventDefault();dragStart(e.clientX,e.clientY,e)});
+  window.addEventListener('mousemove',e=>{if(dragActive)dragMove(e.clientX,e.clientY)});
+  window.addEventListener('mouseup',dragEnd);
+  header.addEventListener('touchstart',e=>{dragStart(e.touches[0].clientX,e.touches[0].clientY,e)},{passive:true});
+  window.addEventListener('touchmove',e=>{if(dragActive){e.preventDefault();dragMove(e.touches[0].clientX,e.touches[0].clientY)}},{passive:false});
+  window.addEventListener('touchend',dragEnd);
+})();
+
+// --- Log panel: drag to move (header), CSS resize:both for corner ---
+(function(){
+  const panel=document.getElementById('log-panel');
+  const header=document.getElementById('log-header');
   let dragActive=false,dragX,dragY,panelX,panelY;
   function dragStart(x,y,e){
     if(e.target.tagName==='BUTTON')return;
@@ -1818,7 +2854,7 @@ document.getElementById('panel-scroll').addEventListener('keydown',function(e){
 // --- Window stacking: click any panel to bring it to front ---
 let panelZ=1001;
 function bringToFront(el){el.style.zIndex=++panelZ}
-['log-panel','files-panel','meshy-panel'].forEach(id=>{
+['log-panel','files-panel','meshy-panel','gain-popover'].forEach(id=>{
   document.getElementById(id).addEventListener('mousedown',function(){bringToFront(this)});
   document.getElementById(id).addEventListener('touchstart',function(){bringToFront(this)},{passive:true});
 });
@@ -1826,16 +2862,26 @@ function bringToFront(el){el.style.zIndex=++panelZ}
 // --- Serial ---
 let lb='';
 async function toggleSerial(){
-  if(conn){await discon();return}
+  if(conn){
+    await discon();
+    return;
+  }
   // Close CSV replay if active
   if(csvRows.length)tlClose();
+  try{
+    await serialConnect();
+  }catch(e){
+    // serialConnect already logged the error — reset UI for retry
+    const btn=document.getElementById('connect-btn');
+    btn.textContent='Connect Serial';btn.classList.remove('connected');
+  }
+}
+async function serialConnect(){
   if(!('serial' in navigator)){alert('WebSerial not supported. Use Chrome/Edge.');return}
   try{
-    port=await navigator.serial.requestPort();
+    if(!port)port=await navigator.serial.requestPort();
     await port.open({baudRate:115200,flowControl:'none'});
-    // Deassert DTR/RTS as fast as possible – but Chrome may have already
-    // toggled DTR during open(), triggering the ESP32-P4 USB-JTAG reset.
-    // We handle the resulting reboot gracefully in readLoop.
+    lb=''; // reset line buffer on (re)connect
     await port.setSignals({dataTerminalReady:false,requestToSend:false});
     conn=true;sessStart=new Date();sessEnd=null;consoleReady=false;updSessionInfo();document.getElementById('connect-btn').textContent='Disconnect';document.getElementById('connect-btn').classList.add('connected');
     addLog('[scope] Serial connected – device may reboot (DTR race), waiting for data...');
@@ -1853,41 +2899,70 @@ async function toggleSerial(){
       }
     })();
     readLoop();
-  }catch(e){addLog('[scope] Serial error: '+e.message)}
+  }catch(e){
+    addLog('[scope] Serial error: '+e.message);
+    // Clean up stale port so next Connect click re-triggers browser picker
+    try{if(port)await port.close()}catch(ex){}
+    port=null;conn=false;
+    throw e;
+  }
 }
 async function readLoop(){
   const dc=new TextDecoder();
   while(conn&&port?.readable){
     reader=port.readable.getReader();
     try{while(true){const{value,done}=await reader.read();if(done)break;if(!value)continue;lb+=dc.decode(value,{stream:true});let i;while((i=lb.indexOf('\n'))!==-1){const l=lb.substring(0,i).replace(/\r$/,'');lb=lb.substring(i+1);if(l.length>0)handleLine(l)}
-      if(cmdWaiting&&lb.includes('adsb>')){const pi=lb.indexOf('adsb>');lb=lb.substring(pi+5);if(cmdSkipPrompts>0){cmdSkipPrompts--;cmdBuf=[];}else{if(cmdResolve)cmdResolve(cmdBuf.join('\n'));cmdBuf=[];cmdWaiting=false;cmdResolve=null;if(cmdTO){clearTimeout(cmdTO);cmdTO=null;}}}
+      if(cmdWaiting&&lb.includes('adsb>')){const pi=lb.indexOf('adsb>');lb=lb.substring(pi+5);if(cmdSkipPrompts>0){cmdSkipPrompts--;cmdBuf=[];}else{const val=cmdBuf.join('\n');cmdBuf=[];cmdForceResolve(val);}}
     }}
     catch(e){if(conn)addLog('[scope] Read error: '+e.message)}
     finally{try{reader.releaseLock()}catch(e){}}
     if(conn)await new Promise(r=>setTimeout(r,500));
   }
+  // readLoop exited unexpectedly — clean up and reset UI
+  if(conn){
+    conn=false;sessEnd=new Date();consoleReady=false;cmdForceResolve(null);
+    updSessionInfo();
+    addLog('[scope] Device lost — click Connect to reconnect');
+    if(mqttDeviceSerial)mqttPubScopeEvent('serial_disconnect',{device:mqttDeviceSerial});
+    mqttDeviceSerial='';
+    try{await port.close()}catch(e){}
+    port=null;
+    const btn=document.getElementById('connect-btn');
+    btn.textContent='Connect Serial';btn.classList.remove('connected');
+  }
 }
-let cmdWaiting=false,cmdBuf=[],cmdResolve=null,cmdTO=null,cmdSkipPrompts=0,cmdInactivityMs=10000,cmdBytes=0;
+let cmdWaiting=false,cmdBuf=[],cmdResolve=null,cmdTO=null,cmdHardTO=null,cmdSkipPrompts=0,cmdInactivityMs=10000,cmdBytes=0;
+let cmdQueue=Promise.resolve(); // serializes all command calls
+
 function cmdResetTO(){
   if(cmdTO)clearTimeout(cmdTO);
   if(!cmdResolve)return;
-  cmdTO=setTimeout(()=>{cmdWaiting=false;const r=cmdResolve;cmdResolve=null;r(null);},cmdInactivityMs);
+  cmdTO=setTimeout(()=>{cmdWaiting=false;const r=cmdResolve;cmdResolve=null;if(cmdHardTO){clearTimeout(cmdHardTO);cmdHardTO=null;}r(null);},cmdInactivityMs);
+}
+function cmdForceResolve(val){
+  if(cmdTO){clearTimeout(cmdTO);cmdTO=null;}
+  if(cmdHardTO){clearTimeout(cmdHardTO);cmdHardTO=null;}
+  cmdWaiting=false;
+  const r=cmdResolve;cmdResolve=null;
+  if(r)r(val);
 }
 function handleLine(l){
   l=stripAnsi(l);
+  lastSerialMs=Date.now();
   lastSerialMs=Date.now();
   // Track device UTC from serial timestamps
   const _dts=parseDeviceTs(l);
   if(_dts&&_dts>0)deviceUtcMs=_dts;
   // Always check for console ready, even during cmd exchange
-  if(/\[CONSOLE\] Serial console (ready|heartbeat)/.test(l))consoleReady=true;
+  if(/Serial console (ready|heartbeat)/.test(l))consoleReady=true;
+  // File receive responses — intercept before cmdWaiting
+  if(recvLineHook(l))return;
   if(cmdWaiting){
     if(l.includes('adsb>')){
       if(cmdSkipPrompts>0){cmdSkipPrompts--;cmdBuf=[];return;} // skip Ctrl+C prompt
       const b=l.split('adsb>')[0].trim();if(b)cmdBuf.push(b);
-      if(cmdTO){clearTimeout(cmdTO);cmdTO=null;}
-      if(cmdResolve)cmdResolve(cmdBuf.join('\n'));
-      cmdBuf=[];cmdWaiting=false;cmdResolve=null;
+      const val=cmdBuf.join('\n');cmdBuf=[];
+      cmdForceResolve(val);
       return;
     }
     // Skip command mode banner and command echo
@@ -1909,6 +2984,19 @@ function handleLine(l){
   }
   parse(l);addLog(l);
   if(l.includes('MESHY')){handleMeshyConfig(l);handleMeshyTx(l);handleMeshyLine(l);handleMeshyNodeInfo(l);}
+  // Signal file transfer code that log backlog has been flushed
+  if(_logReplayResolve&&/buffered lines replayed/.test(l)){
+    const r=_logReplayResolve;_logReplayResolve=null;r();
+  }
+}
+let _logReplayResolve=null;
+// Wait for firmware to finish replaying buffered log lines after entering log mode.
+// If no buffered lines exist, the timeout fires after 3s — safe to proceed.
+function waitLogReplay(timeoutMs){
+  return new Promise(res=>{
+    _logReplayResolve=res;
+    setTimeout(()=>{if(_logReplayResolve===res){_logReplayResolve=null;res()}},timeoutMs||5000);
+  });
 }
 async function serialWrite(t){if(!conn||!port?.writable)return;const w=port.writable.getWriter();try{await w.write(new TextEncoder().encode(t))}finally{w.releaseLock()}}
 async function sendCmd(cmd,inactMs){
@@ -1922,13 +3010,20 @@ async function sendCmd(cmd,inactMs){
   while(cmdSkipPrompts>0&&Date.now()-waitStart<2000)await new Promise(r=>setTimeout(r,50));
   // Phase 2: Send actual command, capture response until next prompt
   cmdBuf=[];cmdSkipPrompts=0;cmdBytes=0;
+  const hardLimit=Math.max(inactMs*3,15000); // hard cap: 3× inactivity or 15s minimum
   const p=new Promise((res)=>{
     cmdResolve=res;
     cmdResetTO(); // start first inactivity timer
+    // Hard timeout — fires even if data keeps flowing (missing prompt)
+    cmdHardTO=setTimeout(()=>{
+      console.warn('[cmd] Hard timeout after '+hardLimit+'ms for: '+cmd);
+      cmdForceResolve(null);
+    },hardLimit);
   });
   await serialWrite(cmd+'\n');
   const raw=await p;
   if(cmdTO){clearTimeout(cmdTO);cmdTO=null;}
+  if(cmdHardTO){clearTimeout(cmdHardTO);cmdHardTO=null;}
   if(raw===null)throw new Error('Timeout (no data for '+(cmdInactivityMs/1000)+'s)');
   // Clean response: strip ANSI codes, remove command echo (first line)
   const lines=raw.split('\n');
@@ -1944,21 +3039,36 @@ async function sendCmd(cmd,inactMs){
   return cleaned.join('\n');
 }
 async function sendCmdResume(cmd,inactMs){
-  const r=await sendCmd(cmd,inactMs);
-  // Return to log mode – 'log' command doesn't produce a prompt,
-  // so just wait briefly then stop capturing. Any lines received
-  // during the transition get flushed to the normal parser.
-  cmdBuf=[];cmdWaiting=true;cmdSkipPrompts=0;
-  await serialWrite('log\n');
-  await new Promise(r=>setTimeout(r,500));
-  const flushed=cmdBuf.slice();
-  cmdWaiting=false;cmdBuf=[];cmdSkipPrompts=0;
-  // Flush captured lines to parser (catches sd_log_print_status etc)
-  for(const l of flushed){
-    const clean=l.replace(/\x1b\[[0-9;]*m/g,'').trim();
-    if(clean&&!clean.startsWith('Entering log mode'))handleLine(l);
+  // Serialize commands — wait for any in-flight command to finish
+  const ticket=cmdQueue;
+  let unlock;
+  cmdQueue=new Promise(r=>{unlock=r;});
+  try{
+    await ticket; // wait for previous command
+    const r=await sendCmd(cmd,inactMs);
+    // Return to log mode – 'log' command doesn't produce a prompt,
+    // so just wait briefly then stop capturing. Any lines received
+    // during the transition get flushed to the normal parser.
+    cmdBuf=[];cmdWaiting=true;cmdSkipPrompts=0;
+    await serialWrite('log\n');
+    await new Promise(r=>setTimeout(r,500));
+    const flushed=cmdBuf.slice();
+    cmdWaiting=false;cmdBuf=[];cmdSkipPrompts=0;
+    // Flush captured lines to parser (catches sd_log_print_status etc)
+    for(const l of flushed){
+      const clean=l.replace(/\x1b\[[0-9;]*m/g,'').trim();
+      if(clean&&!clean.startsWith('Entering log mode')&&clean!=='log')handleLine(l);
+    }
+    return r;
+  }catch(e){
+    // On error, ensure we try to return to log mode
+    cmdWaiting=false;cmdBuf=[];cmdSkipPrompts=0;
+    try{await serialWrite('log\n')}catch(_){}
+    await new Promise(r=>setTimeout(r,300));
+    throw e;
+  }finally{
+    unlock(); // release queue for next command
   }
-  return r;
 }
 
 // --- File browser ---
@@ -2111,7 +3221,9 @@ async function discon(){
   try{if(reader){await reader.cancel();reader.releaseLock()}}catch(e){}
   try{if(port)await port.setSignals({dataTerminalReady:false,requestToSend:false})}catch(e){}
   try{if(port)await port.close()}catch(e){}
-  reader=null;port=null;cmdWaiting=false;cmdBuf=[];cmdResolve=null;addLog('[scope] Disconnected');
+  reader=null;port=null;cmdForceResolve(null);addLog('[scope] Disconnected');
+  if(mqttDeviceSerial)mqttPubScopeEvent('serial_disconnect',{device:mqttDeviceSerial});
+  mqttDeviceSerial='';  // clear device identity — MQTT stays connected
 }
 
 // --- CSV Replay ---
@@ -2240,7 +3352,7 @@ function startReplay(files){
 
   // Clear all state
   for(const[ic,ac]of A){rmAc(ac)}
-  A.clear();selSet.clear();totM=0;
+  for(const[,e]of rowPool)e.tr.remove();rowPool.clear();A.clear();selSet.clear();selAnchor=null;totM=0;tblDirty=true;
   clearMeshyState();
 
   csvRows=allRows;
@@ -2279,7 +3391,7 @@ function feedCSVRow(row){
   if(row.type==='meshy'){feedMeshyCSVRow(row);return}
   const ic=row.icao;if(!ic||ic==='000000')return;
   let ac=A.get(ic);
-  if(!ac){ac={cs:null,alt:null,speed:null,hdg:null,vr:null,lat:null,lon:null,hasPos:false,expired:false,dist:null,brg:null,ls:row.t,msgs:0,mk:null,lb:null,tr:null,trPts:[]};A.set(ic,ac)}
+  if(!ac){ac={cs:null,sqk:null,alt:null,speed:null,hdg:null,vr:null,lat:null,lon:null,hasPos:false,expired:false,dist:null,brg:null,ls:row.t,msgs:0,mk:null,lb:null,tr:null,trPts:[]};A.set(ic,ac)}
   ac.ls=row.t;ac.msgs++;
   if(ac.expired){ac.expired=false;ac.mk=null;ac.lb=null;ac.tr=null;}
   if(row.cs)ac.cs=row.cs;
@@ -2352,7 +3464,7 @@ function tlScrub(val){
   csvNow=csvRows[csvIdx].t;
   // Clear and replay up to this point to build trails + meshy state
   for(const[ic,ac]of A){rmAc(ac)}
-  A.clear();selSet.clear();
+  for(const[,e]of rowPool)e.tr.remove();rowPool.clear();A.clear();selSet.clear();selAnchor=null;tblDirty=true;
   clearMeshyState();
   const targetT=csvRows[csvIdx].t;
   const trailStart=csvRows.findIndex(r=>r.t>=targetT-60000);
@@ -2405,7 +3517,7 @@ function tlClose(){
   posTopbar();
   // Clear all replay state
   for(const[ic,ac]of A){rmAc(ac)}
-  A.clear();selSet.clear();totM=0;
+  for(const[,e]of rowPool)e.tr.remove();rowPool.clear();A.clear();selSet.clear();selAnchor=null;totM=0;tblDirty=true;
   clearMeshyState();
   addLog('[scope] CSV replay closed');
   // Re-enable meshy buttons
@@ -2698,6 +3810,8 @@ async function doFlash(binData){
       fetchLatestVersion();
       readLoop();
       flashLog('Reconnected! Waiting for boot...','fl-ok');
+      // Post-flash: check for aircraft database on SD card
+      checkAndInstallAircraftDb();
     }catch(e){
       flashLog('Auto-reconnect failed: '+e.message,'fl-err');
       flashLog('Click Connect Serial to reconnect manually.','fl-info');
@@ -2731,8 +3845,1515 @@ async function flashLocalFile(input){
   await doFlash(binData);
 }
 
+// ═══════════════════════════════════════════════════════════════
+// File upload to SD card via serial
+// ═══════════════════════════════════════════════════════════════
+const ACDB_URL='https://adsb-scope.offx1.com/aircraft.db';
+const ACDB_PATH='/sdcard/data/aircraft.db';
+const ACDB_EXPECTED_SIZE=28158222; // ADSBDB02 format, 587K records
+const ACDB_EXPECTED_CRC='B39831E1'; // CRC32 of aircraft.db
+const ACDB_MAGIC='4144534244423032'; // "ADSBDB02" as hex
+
+async function serialStatFile(sdPath){
+  try{
+    const r=await sendCmdResume('stat '+sdPath,3000);
+    if(!r)return{size:-1,hex:''};
+    const m=/^STAT (-?\d+) (\S+)/.exec(r.trim());
+    return m?{size:parseInt(m[1]),hex:m[2]}:{size:-1,hex:''};
+  }catch(e){return{size:-1,hex:''}}
+}
+
+// One-shot line handler: watches handleLine for a specific prefix, resolves promise
+// Uses indexOf instead of startsWith to handle interleaved serial output from
+// other firmware tasks (ADS-B, GNSS, etc) that can prepend data to the line.
+let recvResolve=null,recvPrefix='';
+function recvLineHook(l){
+  if(!recvResolve)return false;
+  const clean=l.replace(/\x1b\[[0-9;]*m/g,'').trim();
+  // Check for prefix match anywhere in the line
+  const pi=clean.indexOf(recvPrefix);
+  if(pi>=0){
+    const matched=clean.substring(pi); // extract from prefix onward
+    const r=recvResolve;recvResolve=null;recvPrefix='';r(matched);return true;
+  }
+  // Also catch RECV_ERR anywhere in the line
+  const ei=clean.indexOf('RECV_ERR');
+  if(ei>=0){
+    const matched=clean.substring(ei);
+    const r=recvResolve;recvResolve=null;recvPrefix='';r(matched);return true;
+  }
+  // Catch VERIFY_ responses anywhere in the line
+  const vi=clean.indexOf('VERIFY_');
+  if(vi>=0){
+    const matched=clean.substring(vi);
+    const r=recvResolve;recvResolve=null;recvPrefix='';r(matched);return true;
+  }
+  return false;
+}
+function waitRecv(prefix,timeoutMs){
+  return new Promise((res,rej)=>{
+    recvPrefix=prefix;
+    const to=setTimeout(()=>{recvResolve=null;recvPrefix='';rej(new Error('recv timeout'))},timeoutMs||15000);
+    recvResolve=(v)=>{clearTimeout(to);res(v)};
+  });
+}
+
+// Base64 encode a Uint8Array chunk → string with 76-char lines
+function b64encChunk(data){
+  // Convert to binary string efficiently using apply in small batches
+  const parts=[];
+  for(let i=0;i<data.length;i+=8192){
+    parts.push(String.fromCharCode.apply(null,data.subarray(i,Math.min(i+8192,data.length))));
+  }
+  const b64=btoa(parts.join(''));
+  // Wrap at 76 chars
+  const lines=[];
+  for(let i=0;i<b64.length;i+=76)lines.push(b64.substring(i,Math.min(i+76,b64.length)));
+  return lines.join('\n')+'\n';
+}
+
+// CRC32 (IEEE 802.3) — used for file transfer integrity verification
+function crc32(buf){
+  let crc=0xFFFFFFFF;
+  for(let i=0;i<buf.length;i++){
+    crc^=buf[i];
+    for(let j=0;j<8;j++)crc=(crc>>>1)^(crc&1?0xEDB88320:0);
+  }
+  return(crc^0xFFFFFFFF)>>>0;
+}
+function crc32hex(buf){return crc32(buf).toString(16).padStart(8,'0').toUpperCase()}
+
+// CRC32 of an entire ArrayBuffer (computes in one pass)
+function crc32ab(ab){return crc32(new Uint8Array(ab))}
+
+// Verify a file on the device by sending verify_crc32 command.
+// Returns: {ok:true}, {ok:false, actual, expected}, or {ok:null, error}
+async function verifyFileOnDevice(sdPath,expectedCrc,log){
+  log=log||flashLog;
+  try{
+    // Enter command mode
+    cmdBuf=[];cmdSkipPrompts=1;cmdWaiting=true;cmdBytes=0;
+    await serialWrite('\x03');
+    const ws=Date.now();
+    while(cmdSkipPrompts>0&&Date.now()-ws<5000)await new Promise(r=>setTimeout(r,50));
+    cmdWaiting=false;cmdBuf=[];
+    if(cmdSkipPrompts>0){
+      return{ok:null,error:'Cannot enter command mode'};
+    }
+
+    const startResult=waitRecv('VERIFY_',15000);
+    await serialWrite('verify_crc32 '+sdPath+' '+expectedCrc+'\n');
+    const startLine=await startResult;
+
+    if(startLine.startsWith('VERIFY_ERR')){
+      return{ok:null,error:startLine};
+    }
+
+    // Handle VERIFY_START → PROGRESS → OK/FAIL
+    let resultLine=startLine;
+    if(startLine.startsWith('VERIFY_START')){
+      log('  '+startLine,'fl-info');
+      let done=false;
+      while(!done){
+        const nextLine=await waitRecv('VERIFY_',15000);
+        if(nextLine.startsWith('VERIFY_PROGRESS')){
+          log('  '+nextLine,'fl-info');
+          continue;
+        }
+        resultLine=nextLine;
+        done=true;
+      }
+    }
+
+    // Parse final result
+    if(resultLine.startsWith('VERIFY_OK')){
+      return{ok:true};
+    }else if(resultLine.startsWith('VERIFY_FAIL')){
+      const fm=/actual=([0-9A-Fa-f]+)\s+expected=([0-9A-Fa-f]+)/.exec(resultLine);
+      return{ok:false,actual:fm?fm[1]:'?',expected:fm?fm[2]:expectedCrc,detail:resultLine};
+    }else if(resultLine.startsWith('VERIFY_ERR')){
+      return{ok:null,error:resultLine};
+    }
+    return{ok:null,error:'Unexpected: '+resultLine};
+  }catch(e){
+    if(e.message==='recv timeout'){
+      return{ok:null,error:'timeout'};
+    }
+    throw e;
+  }finally{
+    // Always return to log mode
+    try{
+      const replay=waitLogReplay(5000);
+      await serialWrite('log\n');
+      await replay;
+    }catch(e){}
+  }
+}
+
+async function serialSendFile(fileData,sdPath,onProgress,onLog){
+  if(!conn)throw new Error('Not connected');
+  const total=fileData.byteLength;
+  const CHUNK=32768; // 32KB raw per chunk
+  const MAX_RETRIES=3;
+  const LINES_PER_BATCH=64; // ~4.9KB per write
+  const log=onLog||flashLog;
+  let offset=0;
+
+  // Compute whole-file CRC32 upfront for final verification
+  const fileCrc=crc32hex(new Uint8Array(fileData));
+  log('Uploading '+sdPath+' ('+((total/1024/1024).toFixed(1))+' MB, CRC32:'+fileCrc+')...','fl-info');
+
+  try{
+
+  while(offset<total){
+    let retries=0;
+    let chunkOk=false;
+
+    // Pre-compute base64 + CRC BEFORE entering recv mode
+    // so firmware doesn't wait while we encode
+    let end=Math.min(offset+CHUNK,total);
+    let chunk=new Uint8Array(fileData.slice(offset,end));
+    let b64Lines=b64encChunk(chunk).split('\n').filter(l=>l.length>0);
+    let chunkCrc=crc32hex(chunk);
+
+    while(!chunkOk&&retries<MAX_RETRIES){
+      // Enter CMD mode, send recv command
+      cmdBuf=[];cmdSkipPrompts=1;cmdWaiting=true;cmdBytes=0;
+      await serialWrite('\x03');
+      // Wait for CMD prompt
+      const ws=Date.now();
+      while(cmdSkipPrompts>0&&Date.now()-ws<5000)await new Promise(r=>setTimeout(r,50));
+      const promptMs=Date.now()-ws;
+      log('[xfer] CMD prompt in '+promptMs+'ms (skip='+cmdSkipPrompts+')','fl-info');
+      cmdWaiting=false;cmdBuf=[];
+
+      // Send recv command — firmware will respond with RECV_READY <offset>
+      const recvReady=waitRecv('RECV_READY',10000);
+      await serialWrite('recv '+sdPath+' '+total+'\n');
+      log('[xfer] recv sent, waiting RECV_READY...','fl-info');
+      let readyLine;
+      try{readyLine=await recvReady}catch(e){
+        log('[xfer] waitRecv threw: '+e.message,'fl-err');throw e;
+      }
+      log('[xfer] Got: '+readyLine,'fl-info');
+      if(readyLine.startsWith('RECV_ERR')){
+        log('Device error: '+readyLine,'fl-err');
+        throw new Error(readyLine);
+      }
+      // Set up chunk response hook AFTER confirming RECV_READY —
+      // prevents orphaned 60s timeout if readyLine was RECV_ERR
+      const chunkDone=waitRecv('RECV_',60000);
+      // Parse firmware's offset (may differ if resuming)
+      const rm=/RECV_READY (\d+)/.exec(readyLine);
+      if(rm){
+        const fwOffset=parseInt(rm[1]);
+        if(fwOffset!==offset){
+          // Firmware wants a different offset — recompute chunk data
+          // in-place. Firmware is in recv mode waiting for base64,
+          // so we MUST send data, not break out.
+          offset=fwOffset;
+          end=Math.min(offset+CHUNK,total);
+          chunk=new Uint8Array(fileData.slice(offset,end));
+          b64Lines=b64encChunk(chunk).split('\n').filter(l=>l.length>0);
+          chunkCrc=crc32hex(chunk);
+        }
+      }
+
+      // Send chunk header (v1.1) — declares expected decoded byte count
+      // so firmware can detect truncation instantly instead of waiting 10s
+      await serialWrite('CHUNK '+chunk.length+'\n');
+
+      // Send base64 data line-by-line in small batches
+      for(let i=0;i<b64Lines.length;i+=LINES_PER_BATCH){
+        const batch=b64Lines.slice(i,i+LINES_PER_BATCH).join('\n')+'\n';
+        await serialWrite(batch);
+      }
+      // Empty line terminator + CRC32 — sent together so firmware
+      // doesn't timeout between end-of-data and CRC line
+      await serialWrite('\nCHUNK_CRC32 '+chunkCrc+'\n');
+
+      log('[xfer] Data+CRC sent, awaiting response...','fl-info');
+      const result=await chunkDone;
+      log('[xfer] Result: '+result,'fl-info');
+      if(result.includes('crc_mismatch')||result.includes('CRC_MISMATCH')||result.includes('timeout')||result.includes('truncated')||result.includes('chunk_overflow')){
+        retries++;
+        const reason=result.includes('timeout')?'timeout':result.includes('truncated')?'truncated':result.includes('chunk_overflow')?'chunk overflow':'CRC mismatch';
+        log('  '+reason+' on chunk at offset '+offset+' (retry '+retries+'/'+MAX_RETRIES+')','fl-err');
+        continue;
+      }
+      if(result.startsWith('RECV_ERR')){
+        log('Write error: '+result,'fl-err');
+        throw new Error(result);
+      }
+
+      // Parse new offset
+      const cm=/RECV_(?:CHUNK|DONE) (\d+)/.exec(result);
+      if(cm)offset=parseInt(cm[1]);
+      chunkOk=true;
+
+      // Return to log mode — wait for buffered lines to flush
+      // The firmware replays cached lines when entering log mode.
+      // We must wait for "[N buffered lines replayed]" or "Entering log mode"
+      // before sending Ctrl+C, otherwise leftover data pollutes the prompt.
+      const replayDone=waitLogReplay(5000);
+      await serialWrite('log\n');
+      await replayDone;
+
+      // Report progress
+      const pct=Math.round(offset/total*100);
+      if(onProgress)onProgress(pct,offset,total);
+      log('  '+pct+'% ('+((offset/1024/1024).toFixed(1))+' / '+((total/1024/1024).toFixed(1))+' MB)','fl-info');
+
+      if(result.startsWith('RECV_DONE'))break;
+    }
+
+    if(!chunkOk){
+      log('Chunk failed after '+MAX_RETRIES+' retries — aborting','fl-err');
+      throw new Error('CRC mismatch after '+MAX_RETRIES+' retries at offset '+offset);
+    }
+  }
+
+  // Whole-file CRC32 verification
+  log('Verifying file integrity (CRC32:'+fileCrc+')...','fl-info');
+  const vr=await verifyFileOnDevice(sdPath,fileCrc,log);
+  if(vr.ok===true){
+    log('File integrity verified ✓','fl-ok');
+  }else if(vr.ok===false){
+    log('File integrity FAILED — actual='+vr.actual+' expected='+vr.expected,'fl-err');
+  }else{
+    log('Verification skipped: '+(vr.error||'unknown'),'fl-info');
+  }
+
+  log('Upload complete: '+sdPath,'fl-ok');
+  return true;
+  }finally{
+    // ALWAYS return firmware to log mode, even on error — prevents
+    // device from staying stuck in command/recv mode
+    try{
+      const finalReplay=waitLogReplay(5000);
+      await serialWrite('\x03');
+      await new Promise(r=>setTimeout(r,200));
+      await serialWrite('log\n');
+      await finalReplay;
+    }catch(e){}
+  }
+}
+
+let _acdbBusy=false;
+async function checkAndInstallAircraftDb(manual){
+  if(_acdbBusy){return}
+  _acdbBusy=true;
+  try{
+  // Wait for console ready (device booted)
+  flashLog('Waiting for device to finish booting...','fl-info');
+  for(let i=0;i<60;i++){
+    if(consoleReady)break;
+    await new Promise(r=>setTimeout(r,1000));
+  }
+  if(!consoleReady){flashLog('Device not ready — skipping DB check.','fl-info');return}
+  await new Promise(r=>setTimeout(r,1000)); // extra settle time
+
+  // Check if aircraft.db exists, is the right size, and has correct magic
+  flashLog('Checking aircraft database...','fl-info');
+  const st=await serialStatFile('data/aircraft.db');
+  const sizeOk=st.size===ACDB_EXPECTED_SIZE;
+  const magicOk=st.hex.startsWith(ACDB_MAGIC);
+  const exists=st.size>0;
+  const valid=sizeOk&&magicOk;
+
+  if(valid&&!manual){
+    flashLog('Aircraft database OK — ADSBDB02, '+((st.size/1024/1024).toFixed(1))+' MB.','fl-ok');
+    return;
+  }
+
+  let promptText,btnText,skipIsPrimary=false,showVerify=false;
+  if(valid){
+    flashLog('Aircraft database installed — ADSBDB02, '+((st.size/1024/1024).toFixed(1))+' MB.','fl-ok');
+    promptText='<strong>Aircraft database looks good</strong> (ADSBDB02, '+((st.size/1024/1024).toFixed(1))+' MB).<br>Verify integrity with a checksum? Takes up to a minute.<br>Or reinstall from scratch (27 MB download).';
+    btnText='Reinstall';
+    skipIsPrimary=true;
+    showVerify=true;
+  }else if(exists&&!magicOk){
+    flashLog('Aircraft database exists but has wrong format (header: '+st.hex.substring(0,16)+').','fl-info');
+    promptText='<strong>Install aircraft database?</strong><br>Existing file has an unrecognized format and will be replaced.<br>27 MB download — takes about 3–5 minutes to transfer.';
+    btnText='Install';
+  }else if(exists&&!sizeOk){
+    flashLog('Aircraft database exists but size mismatch ('+st.size+' vs '+ACDB_EXPECTED_SIZE+').','fl-info');
+    promptText='<strong>Install aircraft database?</strong><br>Existing file appears incomplete or outdated and will be replaced.<br>27 MB download — takes about 3–5 minutes to transfer.';
+    btnText='Install';
+  }else{
+    // No database at all
+    flashLog('No aircraft database found.','fl-info');
+    promptText='<strong>Install aircraft database?</strong><br>No database found on the SD card.<br>27 MB download — takes about 3–5 minutes to transfer.';
+    btnText='Install';
+  }
+
+  // Skip prompt for missing DB (auto-install) unless manual triggered
+  let choice='install';
+  if(!exists&&!manual){
+    // Auto-install — no prompt
+  }else{
+    // Show install prompt in flash panel
+    flashLog('','');
+    const promptDiv=document.createElement('div');
+    promptDiv.style.cssText='margin:6px 0;padding:8px 12px;background:rgba(0,229,160,0.08);border:1px solid var(--accent);border-radius:6px;text-align:center';
+    const primaryStyle='padding:4px 16px;background:var(--accent);color:#000;border:none;border-radius:4px;cursor:pointer;font-weight:600;font-family:inherit;font-size:11px';
+    const ghostStyle='padding:4px 16px;background:transparent;color:var(--accent);border:1px solid var(--accent);border-radius:4px;cursor:pointer;font-weight:600;font-family:inherit;font-size:11px';
+    promptDiv.innerHTML=`
+      <div style="color:var(--text);margin-bottom:6px;font-size:11px;line-height:1.5">${promptText}</div>
+      <div style="display:flex;gap:8px;justify-content:center">
+        ${showVerify?'<button id="acdb-verify-btn" style="'+ghostStyle+'">Verify</button>':''}
+        <button id="acdb-install-btn" style="${ghostStyle}">${btnText}</button>
+        <button id="acdb-skip-btn" style="${showVerify||skipIsPrimary?primaryStyle:ghostStyle}">Skip</button>
+      </div>
+    `;
+    document.getElementById('flash-log').appendChild(promptDiv);
+    promptDiv.scrollIntoView({behavior:'smooth'});
+
+    choice=await new Promise(res=>{
+      document.getElementById('acdb-install-btn').onclick=()=>res('install');
+      document.getElementById('acdb-skip-btn').onclick=()=>res('skip');
+      if(showVerify)document.getElementById('acdb-verify-btn').onclick=()=>res('verify');
+    });
+    promptDiv.remove();
+  }
+
+  // Handle verify path
+  if(choice==='verify'){
+    flashLog('Verifying aircraft database integrity...','fl-info');
+    const vr=await verifyFileOnDevice(ACDB_PATH,ACDB_EXPECTED_CRC,flashLog);
+    if(vr.ok===true){
+      flashLog('Database integrity verified ✓','fl-ok');
+      flashStatus('DB verified','ok');
+      return;
+    }else if(vr.ok===false){
+      flashLog('⚠ Database checksum failed! actual='+vr.actual+' expected='+vr.expected,'fl-err');
+      flashLog('The file on the SD card is corrupted.','fl-err');
+      // Show reinstall prompt
+      const failDiv=document.createElement('div');
+      failDiv.style.cssText='margin:6px 0;padding:8px 12px;background:rgba(0,229,160,0.08);border:1px solid var(--accent);border-radius:6px;text-align:center';
+      const primaryStyle2='padding:4px 16px;background:var(--accent);color:#000;border:none;border-radius:4px;cursor:pointer;font-weight:600;font-family:inherit;font-size:11px';
+      const ghostStyle2='padding:4px 16px;background:transparent;color:var(--accent);border:1px solid var(--accent);border-radius:4px;cursor:pointer;font-weight:600;font-family:inherit;font-size:11px';
+      failDiv.innerHTML=`
+        <div style="color:var(--text);margin-bottom:6px;font-size:11px;line-height:1.5"><strong>⚠ Database checksum failed!</strong><br>actual=${vr.actual} expected=${vr.expected}<br>The file on the SD card is corrupted.</div>
+        <div style="display:flex;gap:8px;justify-content:center">
+          <button id="acdb-skip2-btn" style="${ghostStyle2}">Skip</button>
+          <button id="acdb-reinstall-btn" style="${primaryStyle2}">Reinstall</button>
+        </div>
+      `;
+      document.getElementById('flash-log').appendChild(failDiv);
+      failDiv.scrollIntoView({behavior:'smooth'});
+      const reinstall=await new Promise(res=>{
+        document.getElementById('acdb-reinstall-btn').onclick=()=>res(true);
+        document.getElementById('acdb-skip2-btn').onclick=()=>res(false);
+      });
+      failDiv.remove();
+      if(!reinstall){flashLog('Skipped reinstall.','fl-info');return}
+      choice='install'; // fall through to download
+    }else{
+      flashLog('Verification failed: '+(vr.error||'unknown error'),'fl-err');
+      flashStatus('Verify failed','warn');
+      return;
+    }
+  }
+
+  if(choice==='skip'){flashLog('Skipped aircraft database install.','fl-info');return}
+
+  if(choice!=='install'){return}
+
+  // Download from CDN
+  flashLog('Downloading aircraft database from CDN...','fl-info');
+  flashProgress(0);
+  try{
+    const resp=await fetch(ACDB_URL);
+    if(!resp.ok)throw new Error('HTTP '+resp.status);
+    const data=await resp.arrayBuffer();
+    flashLog('Downloaded '+((data.byteLength/1024/1024).toFixed(1))+' MB','fl-ok');
+
+    // Verify size
+    if(data.byteLength!==ACDB_EXPECTED_SIZE){
+      flashLog('Warning: size mismatch ('+data.byteLength+' vs expected '+ACDB_EXPECTED_SIZE+')','fl-info');
+    }
+
+    // Transfer to device
+    await serialSendFile(data,ACDB_PATH,
+      (pct)=>{flashProgress(pct);flashStatus('Uploading DB... '+pct+'%','')},
+      flashLog);
+    flashProgress(100);
+    flashStatus('Complete!','ok');
+    flashLog('Aircraft database installed. Reboot to activate.','fl-ok');
+  }catch(e){
+    flashLog('Aircraft DB install failed: '+e.message,'fl-err');
+    flashStatus('DB install failed','warn');
+  }
+  }finally{_acdbBusy=false}
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 3D VIEW (Three.js) — v2
+// ═══════════════════════════════════════════════════════════════
+let v3d=false,ren3d,scn3d,cam3d,cam3dCtrl,raf3d=null,nr3d=false;
+const ac3d=new Map();
+let AE=5; // altitude exaggeration (adjustable via 3D UI slider)
+const BG3D=0x060a0f;
+const flRings=[]; // FL reference ring meshes — repositioned when AE changes
+const rangeRings3d=[]; // range ring lines + labels — hidden before GPS fix
+let rxDot3d=null,rxGlow3d=null; // receiver dot — hidden before GPS fix
+
+// Reference origin for 3D view — GPS position or aircraft centroid
+let ref3d=null;
+function computeRef3d(){
+  if(rxP&&rxP.fix)return{lat:rxP.lat,lon:rxP.lon,hasFix:true};
+  // No GPS fix — use centroid of all aircraft with positions
+  let sLat=0,sLon=0,n=0;
+  for(const[,ac]of A){
+    if(ac.hasPos&&!ac.expired){sLat+=ac.lat;sLon+=ac.lon;n++}
+  }
+  if(n>0)return{lat:sLat/n,lon:sLon/n,hasFix:false};
+  return null;
+}
+function geoW(lat,lon,altFt){
+  if(!ref3d)return null;
+  return new THREE.Vector3(
+    (lon-ref3d.lon)*60*Math.cos(ref3d.lat*Math.PI/180),
+    (altFt||0)/6076.12*AE,
+    -(lat-ref3d.lat)*60
+  );
+}
+// Aircraft color as THREE.Color
+function acCol3(ic,ac){
+  if(cMode==='mono')return new THREE.Color(0x00e5a0);
+  if(cMode==='rainbow'){let h=0;for(let i=0;i<ic.length;i++)h=(h*31+ic.charCodeAt(i))&0xFFFF;return new THREE.Color().setHSL((h%360)/360,0.85,0.6)}
+  if(cMode==='alt'){const a=Math.min(Math.max(ac.alt||0,0),45000);return new THREE.Color().setHSL((240-(a/45000)*240)/360,0.85,0.55)}
+  if(cMode==='speed'){const s=Math.min(Math.max(ac.speed||0,0),500);return new THREE.Color().setHSL((120-(s/500)*120)/360,0.85,0.55)}
+  return new THREE.Color(0x00e5a0);
+}
+function ptCol3(alt,speed,fallback){
+  if(cMode==='alt'){const a=Math.min(Math.max(alt||0,0),45000);return new THREE.Color().setHSL((240-(a/45000)*240)/360,0.85,0.55)}
+  if(cMode==='speed'){const s=Math.min(Math.max(speed||0,0),500);return new THREE.Color().setHSL((120-(s/500)*120)/360,0.85,0.55)}
+  return fallback.clone();
+}
+
+// ── Procedural aircraft meshes ──
+function makeAirplaneMesh(){
+  // ~200 triangle procedural airplane: fuselage + swept wings + tailfin + horizontal stab
+  const g=new THREE.BufferGeometry();
+  const v=[],idx=[];
+  // Fuselage: tapered cylinder along -Z (nose forward)
+  const fN=8,fL=1.0,nR=0.04,bR=0.12;
+  for(let i=0;i<=fN;i++){
+    const a=(i/fN)*Math.PI*2;
+    const c=Math.cos(a),s=Math.sin(a);
+    // Nose
+    v.push(c*nR, s*nR, -fL*0.5);
+    // Tail
+    v.push(c*bR*0.8, s*bR*0.8, fL*0.5);
+    // Mid-body (widest)
+    v.push(c*bR, s*bR, -fL*0.1);
+  }
+  // Fuselage faces (nose-to-mid, mid-to-tail)
+  for(let i=0;i<fN;i++){
+    const a=i*3,b=((i+1)%fN)*3;  // this fix wraps properly but we have fN+1 verts
+    const a2=i*3,b2=(i+1)*3;
+    // Nose to mid
+    idx.push(a2,b2,a2+2); idx.push(b2,b2+2,a2+2);
+    // Mid to tail
+    idx.push(a2+2,b2+2,a2+1); idx.push(b2+2,b2+1,a2+1);
+  }
+  const base=v.length/3;
+  // Nose tip
+  v.push(0,0,-fL*0.55);
+  const noseTip=base;
+  for(let i=0;i<fN;i++){
+    idx.push(noseTip,i*3,((i+1)%fN)*3);
+  }
+  // Wings: swept planform with wide root chord tapering to narrower tip
+  const ws=0.85; // semi-span (root to tip)
+  const rcZ=-0.15,rcZt=0.22; // root chord: leading edge Z, trailing edge Z
+  const tcZ=0.12,tcZt=0.28; // tip chord: leading edge Z, trailing edge Z (swept back)
+  const wt=0.035; // half-thickness
+  // Right wing: 6 verts (top surface) + 6 verts (bottom) = tapered quad
+  const wBase=v.length/3;
+  // Top surface: root leading, root trailing, tip trailing, tip leading
+  v.push(0.06, wt, rcZ);   // 0: root leading (top)
+  v.push(0.06, wt, rcZt);  // 1: root trailing (top)
+  v.push(ws, wt, tcZt);    // 2: tip trailing (top)
+  v.push(ws, wt, tcZ);     // 3: tip leading (top)
+  // Bottom surface
+  v.push(0.06, -wt, rcZ);  // 4: root leading (bottom)
+  v.push(0.06, -wt, rcZt); // 5: root trailing (bottom)
+  v.push(ws, -wt, tcZt);   // 6: tip trailing (bottom)
+  v.push(ws, -wt, tcZ);    // 7: tip leading (bottom)
+  // Top face
+  idx.push(wBase,wBase+1,wBase+2); idx.push(wBase,wBase+2,wBase+3);
+  // Bottom face
+  idx.push(wBase+4,wBase+6,wBase+5); idx.push(wBase+4,wBase+7,wBase+6);
+  // Leading edge
+  idx.push(wBase,wBase+3,wBase+7); idx.push(wBase,wBase+7,wBase+4);
+  // Trailing edge
+  idx.push(wBase+1,wBase+5,wBase+6); idx.push(wBase+1,wBase+6,wBase+2);
+  // Tip cap
+  idx.push(wBase+3,wBase+2,wBase+6); idx.push(wBase+3,wBase+6,wBase+7);
+
+  // Left wing (mirror X)
+  const lw=v.length/3;
+  v.push(-0.06, wt, rcZ); v.push(-0.06, wt, rcZt); v.push(-ws, wt, tcZt); v.push(-ws, wt, tcZ);
+  v.push(-0.06, -wt, rcZ); v.push(-0.06, -wt, rcZt); v.push(-ws, -wt, tcZt); v.push(-ws, -wt, tcZ);
+  // Top face (reversed winding)
+  idx.push(lw,lw+2,lw+1); idx.push(lw,lw+3,lw+2);
+  // Bottom face
+  idx.push(lw+4,lw+5,lw+6); idx.push(lw+4,lw+6,lw+7);
+  // Leading edge
+  idx.push(lw,lw+4,lw+7); idx.push(lw,lw+7,lw+3);
+  // Trailing edge
+  idx.push(lw+1,lw+6,lw+5); idx.push(lw+1,lw+2,lw+6);
+  // Tip cap
+  idx.push(lw+3,lw+7,lw+6); idx.push(lw+3,lw+6,lw+2);
+  // Vertical stabilizer (tail fin)
+  const tf=v.length/3;
+  v.push(0,bR*0.8,fL*0.35); v.push(0,bR*0.8+0.35,fL*0.5); v.push(0,bR*0.8,fL*0.5);
+  idx.push(tf,tf+1,tf+2); idx.push(tf+2,tf+1,tf);
+  // Horizontal stabilizer (same planform style, smaller)
+  const hs=v.length/3;
+  const hss=0.3,hst=0.02;
+  // Right stab: root leading, root trailing, tip trailing, tip leading (top + bottom)
+  v.push(0.02,hst,fL*0.32); v.push(0.02,hst,fL*0.5); v.push(hss,hst,fL*0.5); v.push(hss,hst,fL*0.38);
+  v.push(0.02,-hst,fL*0.32); v.push(0.02,-hst,fL*0.5); v.push(hss,-hst,fL*0.5); v.push(hss,-hst,fL*0.38);
+  idx.push(hs,hs+1,hs+2); idx.push(hs,hs+2,hs+3);
+  idx.push(hs+4,hs+6,hs+5); idx.push(hs+4,hs+7,hs+6);
+  idx.push(hs,hs+3,hs+7); idx.push(hs,hs+7,hs+4);
+  idx.push(hs+1,hs+5,hs+6); idx.push(hs+1,hs+6,hs+2);
+  // Left stab (mirror)
+  const hs2=v.length/3;
+  v.push(-0.02,hst,fL*0.32); v.push(-0.02,hst,fL*0.5); v.push(-hss,hst,fL*0.5); v.push(-hss,hst,fL*0.38);
+  v.push(-0.02,-hst,fL*0.32); v.push(-0.02,-hst,fL*0.5); v.push(-hss,-hst,fL*0.5); v.push(-hss,-hst,fL*0.38);
+  idx.push(hs2,hs2+2,hs2+1); idx.push(hs2,hs2+3,hs2+2);
+  idx.push(hs2+4,hs2+5,hs2+6); idx.push(hs2+4,hs2+6,hs2+7);
+  idx.push(hs2,hs2+4,hs2+7); idx.push(hs2,hs2+7,hs2+3);
+  idx.push(hs2+1,hs2+6,hs2+5); idx.push(hs2+1,hs2+2,hs2+6);
+
+  g.setAttribute('position',new THREE.Float32BufferAttribute(v,3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+}
+
+function makeHeliBodyGeo(){
+  // Improved helicopter body: tapered fuselage + mast + tail boom + tail fin + tail rotor
+  const v=[],idx=[];
+  // ── Fuselage: profiled cross-sections along Z axis ──
+  // Profile: [z, radiusX, radiusY, offsetY] — nose at +Z (front), tail at -Z
+  const prof=[
+    [ 0.22, 0.04, 0.04, -0.01],  // nose tip
+    [ 0.16, 0.08, 0.07,  0.00],  // nose
+    [ 0.08, 0.11, 0.09,  0.00],  // cockpit (widest)
+    [ 0.00, 0.12, 0.09,  0.00],  // mid body
+    [-0.10, 0.10, 0.08,  0.01],  // rear body
+    [-0.18, 0.05, 0.05,  0.02],  // tail taper
+  ];
+  const segs=10;
+  for(let p=0;p<prof.length;p++){
+    const [z,rx,ry,oy]=prof[p];
+    for(let s=0;s<=segs;s++){
+      const theta=(s/segs)*Math.PI*2;
+      const x=Math.cos(theta)*rx;
+      const y=Math.sin(theta)*ry+oy;
+      // Flatten bottom slightly
+      v.push(x, y<-ry*0.5?-ry*0.5:y, z);
+    }
+  }
+  for(let p=0;p<prof.length-1;p++){
+    for(let s=0;s<segs;s++){
+      const a=p*(segs+1)+s, b=a+segs+1;
+      idx.push(a,b,a+1); idx.push(b,b+1,a+1);
+    }
+  }
+
+  // ── Mast: short cylinder from top of fuselage ──
+  const mastBase=v.length/3;
+  const mR=0.02, mH=0.06, mSegs=6;
+  const mastY=0.09; // top of fuselage
+  for(let s=0;s<=mSegs;s++){
+    const a=(s/mSegs)*Math.PI*2;
+    v.push(Math.cos(a)*mR, mastY, Math.sin(a)*mR*0.5+0.02);
+    v.push(Math.cos(a)*mR*0.8, mastY+mH, Math.sin(a)*mR*0.5+0.02);
+  }
+  for(let s=0;s<mSegs;s++){
+    const a=mastBase+s*2, b=mastBase+((s+1)%mSegs)*2;
+    idx.push(a,b,a+1); idx.push(b,b+1,a+1);
+  }
+
+  // ── Tail boom: thin tapering cylinder ──
+  const tb=v.length/3;
+  const tSegs=6, tLen=0.48, tR0=0.028, tR1=0.014;
+  for(let s=0;s<=tSegs;s++){
+    const a=(s/tSegs)*Math.PI*2;
+    v.push(Math.cos(a)*tR0, Math.sin(a)*tR0+0.02, -0.18);
+    v.push(Math.cos(a)*tR1, Math.sin(a)*tR1+0.03, -0.18-tLen);
+  }
+  for(let s=0;s<tSegs;s++){
+    const a=tb+s*2, b=tb+((s+1)%tSegs)*2;
+    idx.push(a,b,a+1); idx.push(b,b+1,a+1);
+  }
+
+  // ── Tail fin: vertical stabilizer (triangular) ──
+  const tf=v.length/3;
+  const tEndZ=-0.18-tLen;
+  v.push(0, 0.03, tEndZ);          // base front
+  v.push(0, 0.03, tEndZ+0.06);     // base rear (toward body)
+  v.push(0, 0.12, tEndZ+0.02);     // tip
+  idx.push(tf, tf+1, tf+2);
+  // Other side
+  v.push(0, 0.03, tEndZ);
+  v.push(0, 0.12, tEndZ+0.02);
+  v.push(0, 0.03, tEndZ+0.06);
+  idx.push(tf+3, tf+4, tf+5);
+
+  // ── Horizontal stabilizer: small wing at tail ──
+  const hs=v.length/3;
+  v.push(-0.06, 0.03, tEndZ+0.03);  // left tip
+  v.push( 0.06, 0.03, tEndZ+0.03);  // right tip
+  v.push( 0.00, 0.03, tEndZ+0.08);  // rear center
+  v.push( 0.00, 0.03, tEndZ-0.01);  // front center
+  idx.push(hs,hs+3,hs+1); idx.push(hs,hs+1,hs+2);
+  // Reverse side
+  idx.push(hs+1,hs+3,hs); idx.push(hs+2,hs+1,hs);
+
+  // ── Tail rotor: small vertical disc at end of boom ──
+  const tr=v.length/3;
+  const trR=0.06, trSegs=8;
+  v.push(0.015, 0.07, tEndZ+0.01); // center offset to side
+  for(let s=0;s<=trSegs;s++){
+    const a=(s/trSegs)*Math.PI*2;
+    v.push(0.015, 0.07+Math.cos(a)*trR, tEndZ+0.01+Math.sin(a)*trR);
+  }
+  for(let s=0;s<trSegs;s++){
+    idx.push(tr, tr+1+s, tr+2+s);
+  }
+
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position',new THREE.Float32BufferAttribute(v,3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+}
+
+function makeHeliRotorGeo(){
+  // Main rotor disc: flat circle on top, higher segment count for smooth edge
+  const v=[],idx=[];
+  const rR=0.4, rSegs=20;
+  const rY=0.09+0.06+0.02; // top of mast + clearance
+  v.push(0, rY, 0.02); // center (slightly forward of mast)
+  for(let s=0;s<=rSegs;s++){
+    const a=(s/rSegs)*Math.PI*2;
+    v.push(Math.cos(a)*rR, rY, Math.sin(a)*rR+0.02);
+  }
+  for(let s=0;s<rSegs;s++){
+    idx.push(0, s+1, s+2);
+  }
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position',new THREE.Float32BufferAttribute(v,3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+}
+
+// Cache geometries
+let geoPlane=null,geoHeliBody=null,geoHeliRotor=null;
+function getPlaneGeo(){if(!geoPlane)geoPlane=makeAirplaneMesh();return geoPlane}
+function getHeliBodyGeo(){if(!geoHeliBody)geoHeliBody=makeHeliBodyGeo();return geoHeliBody}
+function getHeliRotorGeo(){if(!geoHeliRotor)geoHeliRotor=makeHeliRotorGeo();return geoHeliRotor}
+
+// ── Camera controller ──
+// Modes: 'orbit' (default), 'track' (orbit selected), 'free' (WASD fly)
+let camMode='orbit';
+const camOrbit={r:40,theta:Math.PI*0.25,phi:Math.PI*0.35};
+const camTarget=new THREE.Vector3(0,3,0);
+const camTargetSmooth=new THREE.Vector3(0,3,0);
+let camDrag=0,camLX=0,camLY=0;
+let camDidDrag=false; // true if pointer moved during drag — prevents click-deselect
+// Free-fly state
+const camFreeVel=new THREE.Vector3();
+const camFreeKeys={w:false,a:false,s:false,d:false,q:false,e:false};
+const camArrowKeys={up:false,down:false,left:false,right:false};
+let camShift=false;
+let camTrackHOff=0; // persistent height offset for Q/E in track mode
+let camFreeYaw=Math.PI*0.25,camFreePitch=-0.35;
+
+function camSetMode(mode){
+  if(mode==='track')camTrackHOff=0; // reset height offset for fresh tracking
+  camMode=mode;
+  // Update indicator
+  const ind=document.getElementById('cam-mode-ind');
+  if(ind)ind.textContent=mode==='orbit'?'ORBIT':mode==='track'?'TRACK':'FLY';
+  nr3d=true;
+}
+
+function camOrbUpdate(){
+  const sp=Math.sin(camOrbit.phi),cp=Math.cos(camOrbit.phi);
+  const st=Math.sin(camOrbit.theta),ct=Math.cos(camOrbit.theta);
+  let cy=camTargetSmooth.y+camOrbit.r*cp;
+  if(cy<2)cy=2; // ground clamp — never below 2m
+  cam3d.position.set(
+    camTargetSmooth.x+camOrbit.r*sp*st,
+    cy,
+    camTargetSmooth.z+camOrbit.r*sp*ct
+  );
+  cam3d.lookAt(camTargetSmooth);
+  nr3d=true;
+}
+
+function camComputeTrackTarget(){
+  // If single selection, track that aircraft
+  if(selSet.size===1){
+    const ic=[...selSet][0];
+    const o=ac3d.get(ic);
+    if(o)return o.mesh.position.clone();
+  }
+  // Multiple selections: geometric center
+  if(selSet.size>1){
+    const c=new THREE.Vector3();let n=0;
+    for(const ic of selSet){const o=ac3d.get(ic);if(o){c.add(o.mesh.position);n++}}
+    if(n)return c.divideScalar(n);
+  }
+  // Fallback: center of all visible aircraft
+  if(ac3d.size>0){
+    const c=new THREE.Vector3();let n=0;
+    for(const[,o]of ac3d){c.add(o.mesh.position);n++}
+    if(n)return c.divideScalar(n);
+  }
+  return new THREE.Vector3(0,3,0);
+}
+
+function camFreeUpdate(dt){
+  // Arrow keys adjust look direction (shift = fast)
+  const lookSpeed=(camShift?2.0:0.6)*dt;
+  if(camArrowKeys.left)camFreeYaw-=lookSpeed;
+  if(camArrowKeys.right)camFreeYaw+=lookSpeed;
+  if(camArrowKeys.up)camFreePitch=Math.min(1.5,camFreePitch+lookSpeed);
+  if(camArrowKeys.down)camFreePitch=Math.max(-1.5,camFreePitch-lookSpeed);
+
+  // Apply mouse look to camera orientation
+  const q=new THREE.Quaternion();
+  q.setFromEuler(new THREE.Euler(camFreePitch,camFreeYaw,0,'YXZ'));
+  cam3d.quaternion.copy(q);
+
+  // WASD movement relative to camera
+  const speed=camOrbit.r*0.3*dt;
+  const dir=new THREE.Vector3();
+  if(camFreeKeys.w)dir.z-=1;if(camFreeKeys.s)dir.z+=1;
+  if(camFreeKeys.a)dir.x-=1;if(camFreeKeys.d)dir.x+=1;
+  if(camFreeKeys.e)dir.y+=1;if(camFreeKeys.q)dir.y-=1;
+  if(dir.lengthSq()>0){
+    dir.normalize().multiplyScalar(speed);
+    dir.applyQuaternion(cam3d.quaternion);
+    cam3d.position.add(dir);
+  }
+  // Ground clamp: ~2m head height, scaled by altitude exaggeration
+  const groundY=6.5/6076.12*AE;
+  if(cam3d.position.y<groundY)cam3d.position.y=groundY;
+  if(camArrowKeys.left||camArrowKeys.right||camArrowKeys.up||camArrowKeys.down||dir.lengthSq()>0)nr3d=true;
+}
+
+function initCamControls(cv){
+  // Pointer: orbit (left-drag), pan (right-drag)
+  cv.addEventListener('pointerdown',e=>{
+    document.getElementById('panel-scroll').blur();
+    camDidDrag=false;
+    if(camMode==='free'){camDrag=3;camLX=e.clientX;camLY=e.clientY;cv.setPointerCapture(e.pointerId);return}
+    camDrag=e.button===2?2:1;camLX=e.clientX;camLY=e.clientY;
+    cv.setPointerCapture(e.pointerId);
+  });
+  cv.addEventListener('pointermove',e=>{
+    if(!camDrag)return;
+    const dx=e.clientX-camLX,dy=e.clientY-camLY;camLX=e.clientX;camLY=e.clientY;
+    if(Math.abs(dx)>2||Math.abs(dy)>2)camDidDrag=true;
+    if(camMode==='free'||camDrag===3){
+      // Mouse-look in free mode
+      camFreeYaw-=dx*0.003;
+      camFreePitch=Math.max(-1.5,Math.min(1.5,camFreePitch-dy*0.003));
+      nr3d=true;
+    }else if(camDrag===1){
+      camOrbit.theta-=dx*0.005;
+      const phiMax=camMode==='track'?Math.PI-0.01:1.56;
+      camOrbit.phi=Math.max(0.01,Math.min(phiMax,camOrbit.phi-dy*0.005));
+      camOrbUpdate();
+    }else if(camDrag===2){
+      const right=new THREE.Vector3().setFromMatrixColumn(cam3d.matrix,0);
+      const fwd=new THREE.Vector3(0,0,-1).applyQuaternion(cam3d.quaternion);
+      fwd.y=0;fwd.normalize();
+      camTarget.addScaledVector(right,-dx*camOrbit.r*0.0006);
+      camTarget.addScaledVector(fwd,dy*camOrbit.r*0.0006);
+      if(camMode==='track')camSetMode('orbit'); // pan breaks tracking
+      camOrbUpdate();
+    }
+  });
+  cv.addEventListener('pointerup',e=>{camDrag=0;cv.releasePointerCapture(e.pointerId)});
+  cv.addEventListener('wheel',e=>{
+    camOrbit.r*=1+e.deltaY*0.001;
+    camOrbit.r=Math.max(2,Math.min(250,camOrbit.r));
+    if(camMode!=='free')camOrbUpdate();
+    e.preventDefault();
+  },{passive:false});
+
+  // Double-click: aircraft = track, empty space = deselect + orbit reset
+  cv.addEventListener('dblclick',e=>{
+    const rect=cv.getBoundingClientRect();
+    const m=new THREE.Vector2(
+      ((e.clientX-rect.left)/rect.width)*2-1,
+      -((e.clientY-rect.top)/rect.height)*2+1
+    );
+    const ray=new THREE.Raycaster();
+    ray.setFromCamera(m,cam3d);
+    const meshes=[];
+    const mesh2ic=new Map();
+    for(const[ic,o]of ac3d){
+      if(o.isH){for(const c of o.mesh.children){meshes.push(c);mesh2ic.set(c,ic)}}
+      else{meshes.push(o.mesh);mesh2ic.set(o.mesh,ic)}
+    }
+    const hits=ray.intersectObjects(meshes);
+    if(hits.length){
+      const ic=mesh2ic.get(hits[0].object);
+      if(ic){sel0(ic,e);camSetMode('track');return}
+    }else{
+      // Double-click empty space: deselect all, reset to orbit
+      desel();
+      camSetMode('orbit');
+      camTarget.set(0,3,0);
+      camOrbUpdate();
+    }
+  });
+
+  // Keyboard: WASD for free-fly, F to toggle free, Escape for orbit
+  window.addEventListener('keydown',e=>{
+    if(!v3d)return;
+    if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA')return;
+    // Zoom keys work even when panel-scroll has focus
+    if(e.key==='='||e.key==='+'){zoomSel(1);e.preventDefault();return}
+    if(e.key==='-'||e.key==='_'){zoomSel(-1);e.preventDefault();return}
+    const ps=document.getElementById('panel-scroll');
+    if(ps&&(e.target===ps||ps.contains(e.target)))return; // let table nav work
+    const k=e.key.toLowerCase();
+    if(k==='f'&&!e.ctrlKey&&!e.metaKey){
+      if(camMode==='free'){
+        camSetMode(selSet.size?'track':'orbit');
+        camOrbUpdate();
+      }else{
+        // Enter free-fly from current camera position
+        camFreeYaw=camOrbit.theta;
+        camFreePitch=-(camOrbit.phi-Math.PI/2);
+        camSetMode('free');
+      }
+      e.preventDefault();return;
+    }
+    if(k==='escape'){
+      desel();
+      if(camMode!=='orbit'){
+        camSetMode('orbit');
+        camTarget.set(0,3,0);
+        camOrbUpdate();
+      }
+      e.preventDefault();return;
+    }
+    if(k==='r'&&!e.ctrlKey&&!e.metaKey){
+      // Full view reset: default zoom, orientation, height, orbit mode
+      desel();
+      camSetMode('orbit');
+      camOrbit.r=40;
+      camOrbit.theta=Math.PI*0.25;
+      camOrbit.phi=Math.PI*0.35;
+      camTarget.set(0,3,0);
+      camTargetSmooth.set(0,3,0);
+      camOrbUpdate();
+      e.preventDefault();return;
+    }
+    if(k==='p'&&!e.ctrlKey&&!e.metaKey){
+      if(selSet.size){
+        const anyUnpinned=[...selSet].some(ic=>{const ac=A.get(ic);return ac&&!ac.pinned});
+        for(const ic of selSet){const ac=A.get(ic);if(ac){ac.pinned=anyUnpinned;updAc(ic,ac)}}
+        tblDirty=true;updDet();
+      }
+      e.preventDefault();return;
+    }
+    if('wasdeq'.includes(k)){
+      camFreeKeys[k]=true;
+      // In free-fly: WASD moves. In orbit/track: WASD controls camera orbit.
+      // WASD does NOT auto-enter free-fly — press F for that.
+      e.preventDefault();
+    }
+    // Arrow keys: orbit rotation (orbit/track) or look (free-fly)
+    if(e.key==='ArrowLeft'){camArrowKeys.left=true;e.preventDefault()}
+    if(e.key==='ArrowRight'){camArrowKeys.right=true;e.preventDefault()}
+    if(e.key==='ArrowUp'){camArrowKeys.up=true;e.preventDefault()}
+    if(e.key==='ArrowDown'){camArrowKeys.down=true;e.preventDefault()}
+    // Track shift state for speed modifier
+    if(e.key==='Shift')camShift=true;
+  });
+  window.addEventListener('keyup',e=>{
+    const k=e.key.toLowerCase();
+    if('wasdeq'.includes(k))camFreeKeys[k]=false;
+    if(e.key==='ArrowLeft')camArrowKeys.left=false;
+    if(e.key==='ArrowRight')camArrowKeys.right=false;
+    if(e.key==='ArrowUp')camArrowKeys.up=false;
+    if(e.key==='ArrowDown')camArrowKeys.down=false;
+    if(e.key==='Shift')camShift=false;
+  });
+}
+
+function init3d(){
+  const ct=document.getElementById('view3d-container');
+  const cv=document.getElementById('view3d-canvas');
+  ren3d=new THREE.WebGLRenderer({canvas:cv,antialias:true,alpha:false});
+  ren3d.setPixelRatio(Math.min(window.devicePixelRatio,2));
+  ren3d.setClearColor(BG3D);
+  scn3d=new THREE.Scene();
+  scn3d.fog=new THREE.FogExp2(BG3D,0.004); // reduced from 0.012 — see much further
+  cam3d=new THREE.PerspectiveCamera(50,cv.clientWidth/cv.clientHeight,0.1,600);
+
+  // ── Ground grid ── (extended to ±120, two density levels)
+  const gp=[];
+  // Fine grid: every 5 nm out to ±60
+  for(let i=-60;i<=60;i+=5){
+    gp.push(new THREE.Vector3(i,0,-60),new THREE.Vector3(i,0,60));
+    gp.push(new THREE.Vector3(-60,0,i),new THREE.Vector3(60,0,i));
+  }
+  scn3d.add(new THREE.LineSegments(
+    new THREE.BufferGeometry().setFromPoints(gp),
+    new THREE.LineBasicMaterial({color:0x0d2f1e,transparent:true,opacity:0.45})
+  ));
+  // Coarse grid: every 10 nm from ±60 to ±120
+  const gp2=[];
+  for(let i=-120;i<=120;i+=10){
+    gp2.push(new THREE.Vector3(i,0,-120),new THREE.Vector3(i,0,120));
+    gp2.push(new THREE.Vector3(-120,0,i),new THREE.Vector3(120,0,i));
+  }
+  scn3d.add(new THREE.LineSegments(
+    new THREE.BufferGeometry().setFromPoints(gp2),
+    new THREE.LineBasicMaterial({color:0x0d2f1e,transparent:true,opacity:0.2})
+  ));
+
+  // ── Range rings ── (brighter, more segments for smoothness)
+  [5,10,25,50].forEach((r,ri)=>{
+    const rp=[];
+    for(let i=0;i<=128;i++){const a=(i/128)*Math.PI*2;rp.push(new THREE.Vector3(Math.cos(a)*r,0,Math.sin(a)*r))}
+    const opa=ri<2?0.35:0.25;
+    const line=new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints(rp),
+      new THREE.LineBasicMaterial({color:0x00e5a0,transparent:true,opacity:opa})
+    );
+    scn3d.add(line);
+    // Ring label (HTML overlay)
+    const lbl=document.createElement('div');
+    lbl.className='lbl3d';lbl.style.color='rgba(0,229,160,0.55)';lbl.style.fontSize='11px';
+    lbl.style.pointerEvents='none';lbl.textContent=r+' nm';lbl.dataset.ringR=r;
+    document.getElementById('view3d-labels').appendChild(lbl);
+    rangeRings3d.push({line,lbl});
+  });
+
+  // ── Compass labels ── (larger, further out, brighter)
+  [{t:'N',x:0,z:-70},{t:'S',x:0,z:70},{t:'E',x:70,z:0},{t:'W',x:-70,z:0}].forEach(c=>{
+    const lbl=document.createElement('div');
+    lbl.className='lbl3d';lbl.style.color='rgba(0,229,160,0.45)';lbl.style.fontSize='16px';
+    lbl.style.fontWeight='700';lbl.style.pointerEvents='none';lbl.style.transform='translate(-50%,-50%)';
+    lbl.textContent=c.t;lbl.dataset.compassX=c.x;lbl.dataset.compassZ=c.z;
+    document.getElementById('view3d-labels').appendChild(lbl);
+  });
+
+  // ── Altitude reference planes ──
+  [10000,20000,30000,40000].forEach(fl=>{
+    const y=fl/6076.12*AE;
+    const rp=[];
+    for(let i=0;i<=64;i++){const a=(i/64)*Math.PI*2;rp.push(new THREE.Vector3(Math.cos(a)*50,y,Math.sin(a)*50))}
+    const ring=new THREE.Line(new THREE.BufferGeometry().setFromPoints(rp),
+      new THREE.LineBasicMaterial({color:0x1a3a4a,transparent:true,opacity:0.12}));
+    scn3d.add(ring);
+    // FL label
+    const lbl=document.createElement('div');
+    lbl.className='lbl3d';lbl.style.color='rgba(60,120,150,0.35)';lbl.style.fontSize='9px';
+    lbl.style.pointerEvents='none';lbl.textContent='FL'+Math.round(fl/100);
+    lbl.dataset.flY=y;lbl.dataset.flFt=fl;
+    document.getElementById('view3d-labels').appendChild(lbl);
+    flRings.push({ring,fl,lbl});
+  });
+
+  // ── Receiver dot (pulsing glow) ──
+  rxDot3d=new THREE.Mesh(
+    new THREE.SphereGeometry(0.33,16,16),
+    new THREE.MeshBasicMaterial({color:0x00e5a0})
+  );
+  scn3d.add(rxDot3d);
+  // Glow ring around receiver
+  rxGlow3d=new THREE.Mesh(
+    new THREE.RingGeometry(0.33,1.0,32),
+    new THREE.MeshBasicMaterial({color:0x00e5a0,transparent:true,opacity:0.08,side:THREE.DoubleSide})
+  );
+  rxGlow3d.rotation.x=-Math.PI/2;
+  scn3d.add(rxGlow3d);
+
+  // ── Camera controls ──
+  initCamControls(cv);
+  camOrbUpdate();
+
+  // ── Camera mode indicator ──
+  const ind=document.createElement('div');
+  ind.id='cam-mode-ind';
+  ind.style.cssText='position:absolute;bottom:48px;left:8px;font-size:10px;font-family:"JetBrains Mono",monospace;color:rgba(0,229,160,0.5);pointer-events:none;letter-spacing:1px;z-index:1001';
+  ind.textContent='ORBIT';
+  document.getElementById('view3d-container').appendChild(ind);
+
+  // ── Altitude exaggeration slider ──
+  const aeWrap=document.createElement('div');
+  aeWrap.id='ae-slider';
+  aeWrap.style.cssText='position:absolute;bottom:48px;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:8px;font-size:10px;font-family:"JetBrains Mono",monospace;color:rgba(0,229,160,0.5);z-index:1001';
+  const aeLabel=document.createElement('span');
+  aeLabel.textContent='ALT';
+  aeLabel.style.letterSpacing='1px';
+  const aeSlider=document.createElement('input');
+  aeSlider.type='range';aeSlider.min='1';aeSlider.max='10';aeSlider.value=AE;aeSlider.step='0.5';
+  aeSlider.style.cssText='width:100px;accent-color:#00e5a0;opacity:0.6;cursor:pointer';
+  aeSlider.title='Altitude exaggeration';
+  const aeVal=document.createElement('span');
+  aeVal.textContent=AE+'×';
+  aeVal.style.minWidth='28px';
+  aeSlider.addEventListener('input',()=>{
+    AE=parseFloat(aeSlider.value);
+    aeVal.textContent=(AE%1===0?AE:AE.toFixed(1))+'×';
+    // Reposition FL reference rings
+    for(const fr of flRings){
+      const y=fr.fl/6076.12*AE;
+      const rp=[];
+      for(let i=0;i<=64;i++){const a=(i/64)*Math.PI*2;rp.push(new THREE.Vector3(Math.cos(a)*50,y,Math.sin(a)*50))}
+      fr.ring.geometry.setFromPoints(rp);
+      fr.lbl.dataset.flY=y;
+    }
+    update3d();
+  });
+  aeWrap.appendChild(aeLabel);aeWrap.appendChild(aeSlider);aeWrap.appendChild(aeVal);
+  document.getElementById('view3d-container').appendChild(aeWrap);
+
+  // ── Help hint ──
+  const help=document.createElement('div');
+  help.id='cam-help';
+  help.style.cssText='position:absolute;bottom:48px;left:55%;right:104px;font-size:9px;font-family:"JetBrains Mono",monospace;color:rgba(0,229,160,0.3);pointer-events:none;text-align:right;line-height:1.6;z-index:1001';
+  help.innerHTML='<span style="white-space:nowrap">Shift: fast</span> · <span style="white-space:nowrap">Double-click: track</span> · <span style="white-space:nowrap">F: free-fly</span> · <span style="white-space:nowrap">Esc: deselect</span> · <span style="white-space:nowrap">R: reset view</span><br><span style="white-space:nowrap">Drag: orbit</span> · <span style="white-space:nowrap">Right-drag: pan</span> · <span style="white-space:nowrap">Scroll/WS: zoom</span> · <span style="white-space:nowrap">Arrows/AD: rotate</span> · <span style="white-space:nowrap">QE: height</span>';
+  document.getElementById('view3d-container').appendChild(help);
+  posZoom(); // position 3D overlays above panel
+
+  // ── Selection via raycasting ──
+  cv.addEventListener('click',e=>{
+    if(e.detail===0)return;
+    if(camDrag)return;
+    if(camDidDrag)return; // was a drag, not a click — don't deselect
+    // Take focus from table so arrow keys control 3D view
+    document.getElementById('panel-scroll').blur();
+    const rect=cv.getBoundingClientRect();
+    const m=new THREE.Vector2(
+      ((e.clientX-rect.left)/rect.width)*2-1,
+      -((e.clientY-rect.top)/rect.height)*2+1
+    );
+    const ray=new THREE.Raycaster();
+    ray.setFromCamera(m,cam3d);
+    const meshes=[];
+    const mesh2ic=new Map();
+    for(const[ic,o]of ac3d){
+      if(o.isH){for(const c of o.mesh.children){meshes.push(c);mesh2ic.set(c,ic)}}
+      else{meshes.push(o.mesh);mesh2ic.set(o.mesh,ic)}
+    }
+    const hits=ray.intersectObjects(meshes);
+    if(hits.length){
+      const ic=mesh2ic.get(hits[0].object);
+      if(ic){sel0(ic,e);return}
+    }
+    // Single click on empty space: do nothing (use Escape to deselect)
+  });
+  cv.addEventListener('contextmenu',e=>e.preventDefault());
+
+  // ── Resize ──
+  new ResizeObserver(()=>{
+    if(!v3d)return;
+    const w=ct.clientWidth,h=ct.clientHeight;
+    ren3d.setSize(w,h);cam3d.aspect=w/h;cam3d.updateProjectionMatrix();nr3d=true;
+  }).observe(ct);
+}
+
+function toggle3dView(){
+  if(typeof THREE==='undefined'){alert('Three.js failed to load');return}
+  v3d=!v3d;
+  document.getElementById('view3d-btn').classList.toggle('active',v3d);
+  document.getElementById('map').style.display=v3d?'none':'';
+  document.getElementById('view3d-container').style.display=v3d?'block':'none';
+  if(v3d){
+    if(!ren3d)init3d();
+    const ct=document.getElementById('view3d-container');
+    ren3d.setSize(ct.clientWidth,ct.clientHeight);
+    cam3d.aspect=ct.clientWidth/ct.clientHeight;
+    cam3d.updateProjectionMatrix();
+    update3d();
+    last3dT=performance.now();
+    raf3d=requestAnimationFrame(loop3d);
+  }else{
+    if(raf3d){cancelAnimationFrame(raf3d);raf3d=null}
+    for(const[,o]of ac3d){if(o.lbl)o.lbl.style.display='none'}
+    // Reset free-fly keys
+    Object.keys(camFreeKeys).forEach(k=>camFreeKeys[k]=false);
+    Object.keys(camArrowKeys).forEach(k=>camArrowKeys[k]=false);
+    camShift=false;
+    map.invalidateSize();
+  }
+}
+
+let last3dT=0;
+function loop3d(){
+  if(!v3d)return;
+  const now=performance.now();
+  const dt=Math.min((now-last3dT)/1000,0.1);
+  last3dT=now;
+
+  // Camera updates
+  // Arrow/WASD speed: default gentle, shift = fast
+  const orbSpeed=(camShift?2.0:0.6)*dt;
+  const anyArrow=camArrowKeys.left||camArrowKeys.right||camArrowKeys.up||camArrowKeys.down;
+  const anyWASD=camFreeKeys.w||camFreeKeys.s||camFreeKeys.a||camFreeKeys.d||camFreeKeys.q||camFreeKeys.e;
+
+  if(camMode==='track'){
+    const t=camComputeTrackTarget();
+    const rawY=t.y; // aircraft Y before offset, for Q floor clamp
+    t.y+=camTrackHOff; // include height offset in lerp target
+    camTargetSmooth.lerp(t,Math.min(1,dt*5));
+    // Arrow keys + WASD rotate orbit around tracked aircraft
+    if(camArrowKeys.left||camFreeKeys.a)camOrbit.theta-=orbSpeed;
+    if(camArrowKeys.right||camFreeKeys.d)camOrbit.theta+=orbSpeed;
+    if(camArrowKeys.up)camOrbit.phi=Math.max(0.01,camOrbit.phi-orbSpeed);
+    if(camArrowKeys.down)camOrbit.phi=Math.min(Math.PI-0.01,camOrbit.phi+orbSpeed);
+    // Q/E: raise/lower orbit center height
+    const hSpeed=camOrbit.r*0.3*dt;
+    if(camFreeKeys.e){camTrackHOff+=hSpeed;nr3d=true}
+    if(camFreeKeys.q){camTrackHOff=Math.max(-rawY,camTrackHOff-hSpeed);nr3d=true}
+    if(camFreeKeys.w){camOrbit.r*=1-dt*1.2;camOrbit.r=Math.max(2,camOrbit.r)}
+    if(camFreeKeys.s){camOrbit.r*=1+dt*1.2;camOrbit.r=Math.min(250,camOrbit.r)}
+    if(anyArrow||anyWASD)nr3d=true;
+    camOrbUpdate();
+  }else if(camMode==='orbit'){
+    // Arrow keys + WASD smoothly control orbit
+    let moved=false;
+    if(camArrowKeys.left||camFreeKeys.a){camOrbit.theta-=orbSpeed;moved=true}
+    if(camArrowKeys.right||camFreeKeys.d){camOrbit.theta+=orbSpeed;moved=true}
+    if(camArrowKeys.up){camOrbit.phi=Math.max(0.01,camOrbit.phi-orbSpeed);moved=true}
+    if(camArrowKeys.down){camOrbit.phi=Math.min(1.56,camOrbit.phi+orbSpeed);moved=true}
+    // Q/E: raise/lower camera orbit center
+    const hSpeed=camOrbit.r*0.3*dt;
+    if(camFreeKeys.e){camTarget.y+=hSpeed;moved=true}
+    if(camFreeKeys.q){camTarget.y=Math.max(0,camTarget.y-hSpeed);moved=true}
+    if(camFreeKeys.w){camOrbit.r*=1-dt*1.2;camOrbit.r=Math.max(2,camOrbit.r);moved=true}
+    if(camFreeKeys.s){camOrbit.r*=1+dt*1.2;camOrbit.r=Math.min(250,camOrbit.r);moved=true}
+    camTargetSmooth.lerp(camTarget,Math.min(1,dt*8));
+    if(moved)nr3d=true;
+    camOrbUpdate();
+  }else if(camMode==='free'){
+    camFreeUpdate(dt);
+  }
+
+  // Always need to render during tracking/free for smooth animation
+  if(camMode!=='orbit'||nr3d){
+    ren3d.render(scn3d,cam3d);nr3d=false;
+    updateLabels3d();
+  }
+  raf3d=requestAnimationFrame(loop3d);
+}
+
+function update3d(){
+  if(!v3d||!ren3d)return;
+  // Compute reference origin (GPS position or aircraft centroid)
+  ref3d=computeRef3d();
+  // Toggle GPS-dependent elements
+  const hasFix=ref3d&&ref3d.hasFix;
+  for(const rr of rangeRings3d){rr.line.visible=hasFix;rr.lbl.style.display=hasFix?'':'none'}
+  if(rxDot3d)rxDot3d.visible=hasFix;
+  if(rxGlow3d)rxGlow3d.visible=hasFix;
+
+  const seen=new Set();
+  const n=nowTime();
+
+  for(const[ic,ac]of A){
+    if(!ac.hasPos)continue;
+    const age=(n-ac.ls)/1000;
+    if(ac.expired&&!selSet.has(ic)&&!ac.pinned)continue;
+    const pos=geoW(ac.lat,ac.lon,ac.alt);
+    if(!pos)continue;
+    seen.add(ic);
+
+    let o=ac3d.get(ic);
+    if(!o){
+      // ── Create aircraft ──
+      const db=icaoDb.get(ic);
+      const isH=db&&db.cls==='H';
+      let mesh;
+      if(isH){
+        // Helicopter: Group with body (opaque) + rotor disc (translucent)
+        mesh=new THREE.Group();
+        const bodyMat=new THREE.MeshBasicMaterial({color:0xffffff,side:THREE.DoubleSide});
+        const body=new THREE.Mesh(getHeliBodyGeo(),bodyMat);
+        const rotorMat=new THREE.MeshBasicMaterial({color:0xffffff,side:THREE.DoubleSide,transparent:true,opacity:0.67,depthWrite:false});
+        const rotor=new THREE.Mesh(getHeliRotorGeo(),rotorMat);
+        rotor.userData.baseOpacity=0.67;
+        mesh.add(body);
+        mesh.add(rotor);
+      }else{
+        const mat=new THREE.MeshBasicMaterial({color:0xffffff,side:THREE.DoubleSide});
+        mesh=new THREE.Mesh(getPlaneGeo(),mat);
+      }
+      scn3d.add(mesh);
+
+      // Altitude stem
+      const stemGeo=new THREE.BufferGeometry();
+      const stem=new THREE.Line(stemGeo,new THREE.LineBasicMaterial({color:0xffffff,transparent:true,opacity:0.15}));
+      scn3d.add(stem);
+      // Stem ground tick (small cross at base)
+      const tickGeo=new THREE.BufferGeometry();
+      const tick=new THREE.LineSegments(tickGeo,new THREE.LineBasicMaterial({color:0xffffff,transparent:true,opacity:0.1}));
+      scn3d.add(tick);
+
+      // Trail: primary line + glow line (additive blending)
+      const trailGeo=new THREE.BufferGeometry();
+      const trail=new THREE.Line(trailGeo,new THREE.LineBasicMaterial({
+        vertexColors:true,transparent:true,opacity:0.7
+      }));
+      scn3d.add(trail);
+      // Glow trail (wider appearance via additive blending)
+      const glowGeo=new THREE.BufferGeometry();
+      const glow=new THREE.Line(glowGeo,new THREE.LineBasicMaterial({
+        vertexColors:true,transparent:true,opacity:0.15,
+        blending:THREE.AdditiveBlending,depthWrite:false
+      }));
+      scn3d.add(glow);
+      // Gap trail: dashed LineSegments for segments spanning signal gaps
+      const gapTrailGeo=new THREE.BufferGeometry();
+      const gapTrail=new THREE.LineSegments(gapTrailGeo,new THREE.LineBasicMaterial({
+        vertexColors:true,transparent:true,opacity:0.4
+      }));
+      scn3d.add(gapTrail);
+
+      // HTML label
+      const lbl=document.createElement('div');
+      lbl.className='lbl3d';
+      lbl.addEventListener('click',e=>{e.stopPropagation();sel0(ic,e)});
+      document.getElementById('view3d-labels').appendChild(lbl);
+
+      o={mesh,stem,stemGeo,tick,tickGeo,trail,trailGeo,glow,glowGeo,gapTrail,gapTrailGeo,lbl,isH};
+      ac3d.set(ic,o);
+    }
+
+    // ── Update position + rotation ──
+    o.mesh.position.copy(pos);
+    let col=acCol3(ic,ac);
+    const sel=selSet.has(ic);
+    const sc=sel?1.8:1;
+    o.mesh.scale.set(sc,sc,sc);
+    let opa=age<30?1:age<60?0.5:(sel?0.8:0.4);
+
+    // Expired aircraft: gold if pinned, grey if unpinned
+    if(ac.expired){
+      if(ac.pinned){
+        col=sel?new THREE.Color(0xdab24a):new THREE.Color(0xa08630);
+        opa=sel?0.8:0.40;
+      }else{
+        col=sel?new THREE.Color(0x9999aa):new THREE.Color(0x556677);
+        opa=sel?0.7:0.35;
+      }
+    }
+
+    if(o.isH){
+      // Group: update each child's material
+      for(const c of o.mesh.children){
+        c.material.color.copy(col);
+        const bo=c.userData.baseOpacity||1;
+        c.material.transparent=opa*bo<1;
+        c.material.opacity=opa*bo;
+      }
+    }else{
+      o.mesh.material.color.copy(col);
+      o.mesh.material.transparent=opa<1;o.mesh.material.opacity=opa;
+    }
+    // Heading + pitch rotation
+    // Pitch derived from trail path — works for both real and dead-reckoned positions
+    if(ac.hdg!=null){
+      const yaw=-ac.hdg*Math.PI/180;
+      let pitch=0;
+      if(ac.trPts&&ac.trPts.length>=2){
+        const p1=ac.trPts[ac.trPts.length-1];
+        const p2=ac.trPts[ac.trPts.length-2];
+        const w1=geoW(p1.lat,p1.lng,p1.alt||0);
+        const w2=geoW(p2.lat,p2.lng,p2.alt||0);
+        if(w1&&w2){
+          const dx=w1.x-w2.x,dy=w1.y-w2.y,dz=w1.z-w2.z;
+          const horiz=Math.sqrt(dx*dx+dz*dz);
+          if(horiz>0.01){
+            pitch=Math.atan2(dy,horiz);
+            pitch=Math.max(-0.5,Math.min(0.5,pitch)); // clamp ~±28°
+          }
+        }
+      }
+      o.mesh.rotation.set(pitch,yaw,0,'YXZ');
+    }
+
+    // ── Altitude stem ──
+    const groundPt=new THREE.Vector3(pos.x,0,pos.z);
+    o.stemGeo.setFromPoints([groundPt,pos]);
+    o.stem.material.color.copy(col);
+    o.stem.material.opacity=sel?0.3:0.12;
+    // Ground tick
+    const ts=0.3;
+    o.tickGeo.setFromPoints([
+      new THREE.Vector3(pos.x-ts,0,pos.z),new THREE.Vector3(pos.x+ts,0,pos.z),
+      new THREE.Vector3(pos.x,0,pos.z-ts),new THREE.Vector3(pos.x,0,pos.z+ts)
+    ]);
+    o.tick.material.color.copy(col);
+    o.tick.material.opacity=sel?0.2:0.08;
+
+    // ── Trail: solid segments, dashed across signal gaps ──
+    if(ac.trPts&&ac.trPts.length>=2){
+      const GAP=10000; // ms — segments spanning >10s are signal gaps
+      const tp=[],tc=[]; // solid trail
+      const gp=[],gc=[]; // gap dashed trail (LineSegments pairs)
+      const DASH=0.4,DGAP=0.25; // dash/gap lengths in nm
+
+      for(let i=0;i<ac.trPts.length;i++){
+        const p=ac.trPts[i];
+        const w=geoW(p.lat,p.lng,p.alt||0);
+        if(!w)continue;
+        const c=ptCol3(p.alt,p.speed,col);
+
+        if(i>0&&p.ts&&ac.trPts[i-1].ts&&(p.ts-ac.trPts[i-1].ts)>GAP){
+          // Signal gap — build dashed connector
+          const pw=geoW(ac.trPts[i-1].lat,ac.trPts[i-1].lng,ac.trPts[i-1].alt||0);
+          if(pw){
+            const dx=w.x-pw.x,dy=w.y-pw.y,dz=w.z-pw.z;
+            const segLen=Math.sqrt(dx*dx+dy*dy+dz*dz);
+            if(segLen>0.01){
+              const nx=dx/segLen,ny=dy/segLen,nz=dz/segLen;
+              const cr=c.r*0.5,cg=c.g*0.5,cb=c.b*0.5;
+              let t=0;
+              while(t<segLen){
+                const dEnd=Math.min(t+DASH,segLen);
+                gp.push(pw.x+nx*t,pw.y+ny*t,pw.z+nz*t);
+                gp.push(pw.x+nx*dEnd,pw.y+ny*dEnd,pw.z+nz*dEnd);
+                gc.push(cr,cg,cb,cr,cg,cb);
+                t=dEnd+DGAP;
+              }
+            }
+          }
+          // Start new solid segment from this point
+          // (Line needs at least the start vertex for the next solid run)
+        }
+        tp.push(w.x,w.y,w.z);
+        tc.push(c.r,c.g,c.b);
+      }
+      // Add current position
+      tp.push(pos.x,pos.y,pos.z);tc.push(col.r,col.g,col.b);
+
+      if(tp.length>=6){
+        const posAttr=new THREE.Float32BufferAttribute(tp,3);
+        const colAttr=new THREE.Float32BufferAttribute(tc,3);
+        o.trailGeo.setAttribute('position',posAttr);
+        o.trailGeo.setAttribute('color',colAttr);
+        o.trailGeo.computeBoundingSphere();
+        o.glowGeo.setAttribute('position',posAttr);
+        o.glowGeo.setAttribute('color',colAttr);
+        o.glowGeo.computeBoundingSphere();
+      }
+      // Gap dashed segments
+      if(gp.length>=6){
+        o.gapTrailGeo.setAttribute('position',new THREE.Float32BufferAttribute(gp,3));
+        o.gapTrailGeo.setAttribute('color',new THREE.Float32BufferAttribute(gc,3));
+        o.gapTrailGeo.computeBoundingSphere();
+      }else{
+        o.gapTrailGeo.setAttribute('position',new THREE.Float32BufferAttribute([],3));
+        o.gapTrailGeo.setAttribute('color',new THREE.Float32BufferAttribute([],3));
+      }
+    }
+
+    // ── Trail opacity: boost for selected aircraft ──
+    o.trail.material.opacity=sel?1.0:0.7;
+    o.glow.material.opacity=sel?0.35:0.15;
+    o.gapTrail.material.opacity=sel?0.7:0.4;
+
+    // ── Label (respects lMode: alt or dist) ──
+    const name=ac.cs||ic;
+    let lbl2='';
+    if(lMode==='dist'){lbl2=ac.dist!=null?' '+ac.dist.toFixed(1)+'nm':''}
+    else{lbl2=ac.alt!=null?' FL'+Math.round(ac.alt/100):''}
+    o.lbl.textContent=name+lbl2;
+    o.lbl.style.color=col.getStyle();
+    o.lbl.style.opacity=opa;
+    o.lbl.classList.toggle('sel3d',sel);
+  }
+
+  // ── Remove expired ──
+  for(const[ic,o]of ac3d){
+    if(!seen.has(ic)){
+      scn3d.remove(o.mesh);scn3d.remove(o.stem);scn3d.remove(o.trail);
+      scn3d.remove(o.glow);scn3d.remove(o.tick);scn3d.remove(o.gapTrail);
+      if(o.isH){for(const c of o.mesh.children)c.material.dispose()}
+      else{o.mesh.material.dispose()}
+      o.stemGeo.dispose();o.stem.material.dispose();
+      o.trailGeo.dispose();o.trail.material.dispose();
+      o.glowGeo.dispose();o.glow.material.dispose();
+      o.gapTrailGeo.dispose();o.gapTrail.material.dispose();
+      o.tickGeo.dispose();o.tick.material.dispose();
+      o.lbl.remove();
+      ac3d.delete(ic);
+    }
+  }
+  nr3d=true;
+}
+
+function updateLabels3d(){
+  const cv=ren3d.domElement;
+  const w=cv.clientWidth,h=cv.clientHeight;
+  const camDist=cam3d.position.length();
+  // Aircraft labels
+  for(const[,o]of ac3d){
+    const v=o.mesh.position.clone().project(cam3d);
+    if(v.z>1||v.x<-1.2||v.x>1.2||v.y<-1.2||v.y>1.2){
+      o.lbl.style.display='none';
+    }else{
+      o.lbl.style.display='';
+      o.lbl.style.left=((v.x*0.5+0.5)*w)+'px';
+      o.lbl.style.top=((-v.y*0.5+0.5)*h)+'px';
+    }
+  }
+  // Ring labels — scale font with distance
+  document.querySelectorAll('[data-ring-r]').forEach(el=>{
+    const r=parseFloat(el.dataset.ringR);
+    const v=new THREE.Vector3(r,0,0).project(cam3d);
+    if(v.z>1){el.style.display='none';return}
+    el.style.display='';
+    el.style.left=((v.x*0.5+0.5)*w)+'px';
+    el.style.top=((-v.y*0.5+0.5)*h)+'px';
+    el.style.fontSize=Math.max(9,Math.min(14,140/camDist*10))+'px';
+  });
+  // Compass labels — scale with distance
+  document.querySelectorAll('[data-compass-x]').forEach(el=>{
+    const v=new THREE.Vector3(parseFloat(el.dataset.compassX),0,parseFloat(el.dataset.compassZ)).project(cam3d);
+    if(v.z>1){el.style.display='none';return}
+    el.style.display='';
+    el.style.left=((v.x*0.5+0.5)*w)+'px';
+    el.style.top=((-v.y*0.5+0.5)*h)+'px';
+    el.style.fontSize=Math.max(12,Math.min(22,200/camDist*10))+'px';
+  });
+  // FL altitude labels — position at edge of rings
+  document.querySelectorAll('[data-fl-y]').forEach(el=>{
+    const y=parseFloat(el.dataset.flY);
+    const v=new THREE.Vector3(50,y,0).project(cam3d);
+    if(v.z>1){el.style.display='none';return}
+    el.style.display='';
+    el.style.left=((v.x*0.5+0.5)*w)+'px';
+    el.style.top=((-v.y*0.5+0.5)*h)+'px';
+  });
+}
+
 initMap();syncPanelH();setInterval(tick,1000);fetchLatestVersion();
-function posZoom(){const h=document.getElementById('panel').offsetHeight;document.getElementById('zoom-ctrl').style.bottom=(h+12)+'px';document.getElementById('legend').style.bottom=(h+12)+'px'}
+function posZoom(){const h=document.getElementById('panel').offsetHeight;const b=(h+12)+'px';document.getElementById('zoom-ctrl').style.bottom=b;document.getElementById('legend').style.bottom=b;const ae=document.getElementById('ae-slider');if(ae)ae.style.bottom=b;const ci=document.getElementById('cam-mode-ind');if(ci)ci.style.bottom=b;const ch=document.getElementById('cam-help');if(ch)ch.style.bottom=b}
 function posTopbar(){
   const tb=document.getElementById('topbar').offsetHeight;
   const tl=document.getElementById('timeline');
@@ -2740,12 +5361,15 @@ function posTopbar(){
   const tlH=tl.classList.contains('visible')?tl.offsetHeight:0;
   const top=(tb+tlH+8)+'px';
   document.getElementById('gnss-info').style.top=top;
+  document.getElementById('gain-popover').style.top=top;
   document.getElementById('detail-wrap').style.top=top;
   document.getElementById('session-panel').style.top=top;
   // Position log/files panels below gnss-info
   const gi=document.getElementById('gnss-info');
   const logTop=(gi.offsetTop+gi.offsetHeight+8)+'px';
-  document.getElementById('log-panel').style.top=logTop;
+  // Log panel: only set initial top (it's draggable, don't override after drag)
+  const lp=document.getElementById('log-panel');
+  if(!lp.dataset.dragged)lp.style.top=logTop;
   // Files panel: only set initial top (it's draggable, don't override after drag)
   const fp=document.getElementById('files-panel');
   if(!fp.dataset.dragged)fp.style.top=logTop;
@@ -2758,7 +5382,246 @@ new MutationObserver(posZoom).observe(document.getElementById('panel'),{attribut
 new ResizeObserver(posTopbar).observe(document.getElementById('topbar'));
 new ResizeObserver(posTopbar).observe(document.getElementById('gnss-info'));
 window.addEventListener('resize',posTopbar);
+// ═══════════════════════════════════════════════════════════════════════════
+// MQTT Feeder — publishes aircraft and status to MQTT broker
+// ═══════════════════════════════════════════════════════════════════════════
+const mqtt_cfg={
+  get enabled(){return localStorage.getItem('mqtt_enabled')!=='false'},
+  set enabled(v){localStorage.setItem('mqtt_enabled',v?'true':'false')},
+  get url(){return localStorage.getItem('mqtt_url')||'wss://mqtt.offx1.com:9883'},
+  set url(v){localStorage.setItem('mqtt_url',v)},
+  get user(){return localStorage.getItem('mqtt_user')||'adsb-scope-alpha'},
+  set user(v){localStorage.setItem('mqtt_user',v)},
+  get pass(){return localStorage.getItem('mqtt_pass')||'d744212ba48991327c3846c51a864828581af730'},
+  set pass(v){localStorage.setItem('mqtt_pass',v)},
+  get username(){return localStorage.getItem('mqtt_username')||''},
+  set username(v){localStorage.setItem('mqtt_username',v)},
+};
+
+let mqttDeviceSerial=''; // parsed from firmware boot log: "MQTT: Device ID: p4-xxx"
+
+let mqttClient=null;
+let mqttConnected=false;
+let mqttStatusTimer=null;
+let mqttState='off'; // 'off','connecting','on','error'
+const mqttTabId=Math.random().toString(36).substring(2,8); // unique per tab, not persisted
+let mqttRetryCount=0;
+let mqttRetryTimer=null;
+let mqttReconnecting=false; // guard against close event during teardown
+
+function mqttScheduleRetry(){
+  if(!mqtt_cfg.enabled||mqttReconnecting)return;
+  if(mqttRetryTimer){clearTimeout(mqttRetryTimer);mqttRetryTimer=null;}
+  const delay=mqttRetryCount===0?0:mqttRetryCount<3?5000:30000;
+  mqttRetryCount++;
+  addLog('[mqtt] Reconnect '+(delay===0?'immediately':'in '+(delay/1000)+'s')+' (attempt '+mqttRetryCount+')');
+  mqttRetryTimer=setTimeout(()=>{mqttRetryTimer=null;mqttConnect()},delay);
+}
+function mqttCancelRetry(){
+  if(mqttRetryTimer){clearTimeout(mqttRetryTimer);mqttRetryTimer=null;}
+}
+
+function renderMqtt(){
+  const el=document.getElementById('mqtt-status');
+  if(!el)return;
+  switch(mqttState){
+    case'off':el.textContent='off';el.className='mqtt-off';break;
+    case'connecting':el.textContent='connecting...';el.className='mqtt-connecting';break;
+    case'on':el.textContent='● connected';el.className='mqtt-on';break;
+    case'error':el.textContent='✕ error';el.className='mqtt-err';break;
+  }
+}
+
+function mqttToggleConfig(ev){
+  ev.stopPropagation();
+  const cfg=document.getElementById('mqtt-config');
+  const info=document.getElementById('mqtt-info');
+  const vis=cfg.style.display!=='none';
+  cfg.style.display=vis?'none':'block';
+  info.classList.toggle('mqtt-open',!vis);
+  if(!vis){
+    // Populate fields from current config
+    document.getElementById('mqtt-cfg-on').checked=mqtt_cfg.enabled;
+    document.getElementById('mqtt-cfg-url').value=mqtt_cfg.url;
+    document.getElementById('mqtt-cfg-user').value=mqtt_cfg.user;
+    document.getElementById('mqtt-cfg-pass').value=mqtt_cfg.pass;
+    document.getElementById('mqtt-cfg-username').value=mqtt_cfg.username;
+  }
+}
+
+function mqttCfgSave(){
+  mqtt_cfg.enabled=document.getElementById('mqtt-cfg-on').checked;
+  mqtt_cfg.url=document.getElementById('mqtt-cfg-url').value.trim();
+  mqtt_cfg.user=document.getElementById('mqtt-cfg-user').value.trim();
+  mqtt_cfg.pass=document.getElementById('mqtt-cfg-pass').value;
+  mqtt_cfg.username=document.getElementById('mqtt-cfg-username').value.trim();
+}
+
+function mqttCfgApply(){
+  mqttCfgSave();
+  mqttDisconnect();
+  if(mqtt_cfg.enabled&&mqtt_cfg.url){
+    mqttConnect();
+  }else{
+    mqttState='off';
+    renderMqtt();
+  }
+  document.getElementById('mqtt-config').style.display='none';
+}
+
+// Scope event topic — uses MQTT broker username for ACL compatibility.
+// Today: scope/adsb-scope-alpha/events (shared). Future: scope/{username}/events (per-user).
+function mqttScopeTopic(){return `scope/${mqtt_cfg.user}/events`}
+
+function mqttPubScopeEvent(type,extra){
+  if(!mqttConnected||!mqttClient)return;
+  const evt={type,tab:mqttTabId,ts:new Date().toISOString()};
+  if(mqtt_cfg.username)evt.username=mqtt_cfg.username;
+  if(mqttDeviceSerial)evt.device=mqttDeviceSerial;
+  if(extra)Object.assign(evt,extra);
+  try{mqttClient.publish(mqttScopeTopic(),JSON.stringify(evt),{qos:1})}catch(e){}
+}
+
+function mqttConnect(){
+  if(typeof mqtt==='undefined'){mqttState='off';renderMqtt();return}
+  mqttCancelRetry();  // cancel any pending retry timer
+  mqttReconnecting=true;  // suppress close→retry during teardown
+  if(mqttClient){try{mqttClient.end(true)}catch(e){}}
+  mqttClient=null;mqttConnected=false;
+  mqttReconnecting=false;
+  if(!mqtt_cfg.enabled||!mqtt_cfg.url){mqttState='off';renderMqtt();return}
+  mqttState='connecting';renderMqtt();
+  // Client ID: always scope-{name}-{tabId} — normalized, always unique
+  const clientId=`scope-${mqtt_cfg.username||'nobody'}-${mqttTabId}`;
+  // LWT: broker publishes page_close if we disconnect ungracefully
+  const opts={
+    clientId,
+    clean:true,
+    reconnectPeriod:0,  // we handle reconnect manually
+    connectTimeout:10000,
+    will:{
+      topic:mqttScopeTopic(),
+      payload:JSON.stringify({type:'page_close',tab:mqttTabId,username:mqtt_cfg.username||null,ts:new Date().toISOString()}),
+      qos:1,retain:false
+    },
+  };
+  if(mqtt_cfg.user)opts.username=mqtt_cfg.user;
+  if(mqtt_cfg.pass)opts.password=mqtt_cfg.pass;
+  try{
+    mqttClient=mqtt.connect(mqtt_cfg.url,opts);
+  }catch(e){
+    addLog('[mqtt] Connection error: '+e.message);
+    mqttState='error';renderMqtt();
+    return;  // don't retry on connect exception — likely a config error
+  }
+  const thisClient=mqttClient; // capture for stale-close detection
+  mqttClient.on('connect',()=>{
+    mqttConnected=true;
+    mqttRetryCount=0;mqttCancelRetry();
+    mqttState='on';renderMqtt();
+    addLog('[mqtt] Connected to '+mqtt_cfg.url+' ('+clientId+')');
+    mqttPubScopeEvent('page_open');
+    // If device is already identified (reconnect after broker hiccup), re-announce
+    if(mqttDeviceSerial){
+      mqttPubScopeEvent('serial_connect',{device:mqttDeviceSerial});
+      mqttPubMeta();
+      if(mqttStatusTimer)clearInterval(mqttStatusTimer);
+      mqttStatusTimer=setInterval(mqttPubStatus,30000);
+      mqttPubStatus();
+    }
+  });
+  mqttClient.on('error',(e)=>{mqttState='error';renderMqtt();addLog('[mqtt] Error: '+e.message)});
+  mqttClient.on('close',()=>{
+    if(thisClient!==mqttClient)return; // stale close from old client — ignore
+    mqttConnected=false;
+    if(mqttDeviceSerial){
+      mqttState='connecting';renderMqtt();
+      mqttScheduleRetry();  // device on serial — broker hiccup, retry
+    }else{
+      mqttState='off';renderMqtt();  // no device — don't retry
+    }
+  });
+}
+
+function mqttDisconnect(){
+  mqttCancelRetry();mqttRetryCount=0;
+  if(mqttStatusTimer){clearInterval(mqttStatusTimer);mqttStatusTimer=null}
+  if(mqttClient){try{mqttClient.end(true)}catch(e){}}
+  mqttClient=null;mqttConnected=false;
+  mqttState='off';renderMqtt();
+}
+
+const mqttBatchQueue=[]; // accumulates per-message aircraft data, flushed once/sec in tick
+function mqttBatchAircraft(ic,ac){
+  if(!mqttConnected||!mqttClient||!mqttDeviceSerial)return;
+  const msg={
+    icao:ic,
+    ts:deviceUtcMs?new Date(deviceUtcMs).toISOString():new Date().toISOString(),
+    callsign:ac.cs||null,
+    lat:ac.lat,lon:ac.lon,
+    alt:ac.alt,speed:ac.speed,hdg:ac.hdg,vr:ac.vr,
+    dist:ac.dist,brg:ac.brg,sqk:ac.sqk||null,
+  };
+  const db=icaoDb.get(ic);
+  if(db){msg.reg=db.reg;msg.type_code=db.tc;msg.model=db.model;msg.owner=db.owner;msg.operator=db.op}
+  mqttBatchQueue.push(msg);
+}
+function mqttFlushAircraft(){
+  if(!mqttBatchQueue.length||!mqttConnected||!mqttClient||!mqttDeviceSerial)return;
+  const envelope={
+    ts:new Date().toISOString(),
+    rx_lat:rxP?.lat||null,
+    rx_lon:rxP?.lon||null,
+    aircraft:mqttBatchQueue.splice(0)
+  };
+  const topic=`adsb/${mqttDeviceSerial}/aircraft`;
+  try{mqttClient.publish(topic,JSON.stringify(envelope),{qos:0})}catch(e){}
+}
+
+function mqttPubStatus(){
+  if(!mqttConnected||!mqttClient||!mqttDeviceSerial)return;
+  const status={
+    lat:rxP?.lat||null,
+    lon:rxP?.lon||null,
+    sats:rxP?.sats||null,
+    hdop:rxP?.hdop||null,
+    gain_db:gainDb,
+    gain_phase:gainPhase===1?'converging':(gainPhase===2?'steady':'unknown'),
+    error_rate:gainErrEma,
+    pos_rate:gainPosRate,
+    max_range_nm:gainRange,
+    ac_count:A.size,
+    msg_count:totM,
+    msg_rate:mTs.length?(mTs.length/5).toFixed(1):0,
+    firmware_ver:deviceVersion||null
+  };
+  const topic=`adsb/${mqttDeviceSerial}/status`;
+  try{mqttClient.publish(topic,JSON.stringify(status),{qos:1})}catch(e){}
+}
+
+function mqttPubMeta(){
+  if(!mqttConnected||!mqttClient||!mqttDeviceSerial)return;
+  const meta={
+    device_id:mqttDeviceSerial,
+    client_type:'webapp',
+    firmware_ver:deviceVersion||null,
+    user_agent:navigator.userAgent
+  };
+  const topic=`adsb/${mqttDeviceSerial}/meta`;
+  try{mqttClient.publish(topic,JSON.stringify(meta),{qos:1,retain:true})}catch(e){}
+}
+
+// Connect MQTT on page load — scope events publish immediately,
+// aircraft/status data starts flowing when device serial is parsed from serial.
+if(mqtt_cfg.enabled&&mqtt_cfg.url)mqttConnect();
+else renderMqtt();
+
 if(!('serial' in navigator)){const b=document.getElementById('connect-btn');b.textContent='No WebSerial';b.disabled=true;b.style.opacity=0.4}
+
+// Graceful page_close — best-effort. LWT is the reliable backup.
+window.addEventListener('beforeunload',()=>{
+  mqttPubScopeEvent('page_close');
+});
 </script>
 <!-- Google Analytics — loaded last so offline/DNS failure can't affect app -->
 <script async src="https://www.googletagmanager.com/gtag/js?id=G-T71ZHWG166"></script>

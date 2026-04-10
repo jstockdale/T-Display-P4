@@ -15,6 +15,10 @@
 #include <stdio.h>
 
 static const char *TAG = "HTTP_FS";
+
+// SD I/O mutex + DMA fence — protects SPI bus from AXI contention
+extern bool sd_io_take(uint32_t timeout_ms);
+extern void sd_io_give(void);
 #define SD_BASE "/sdcard"
 #define FILE_BUF_SIZE  4096
 
@@ -55,7 +59,12 @@ static void url_decode(char *str) {
 // ============================================================
 
 static esp_err_t index_handler(httpd_req_t *req) {
+    if (!sd_io_take(2000)) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SD card busy");
+        return ESP_FAIL;
+    }
     DIR *dir = opendir(SD_BASE);
+    sd_io_give();
     if (!dir) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
                             "SD card not mounted or /sdcard not accessible");
@@ -86,7 +95,7 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "<tr><th>Name</th><th class='sz'>Size</th></tr>";
     httpd_resp_sendstr_chunk(req, header);
 
-    // List files
+    // List files — per-entry sd_io for stat() calls
     struct dirent *ent;
     int file_count = 0;
     char line[768];
@@ -100,7 +109,10 @@ static esp_err_t index_handler(httpd_req_t *req) {
         snprintf(fullpath, sizeof(fullpath), SD_BASE "/%s", ent->d_name);
 
         struct stat st;
-        if (stat(fullpath, &st) != 0) continue;
+        if (!sd_io_take(200)) continue;
+        int sr = stat(fullpath, &st);
+        sd_io_give();
+        if (sr != 0) continue;
 
         if (S_ISDIR(st.st_mode)) {
             snprintf(line, sizeof(line),
@@ -115,7 +127,8 @@ static esp_err_t index_handler(httpd_req_t *req) {
         httpd_resp_sendstr_chunk(req, line);
         file_count++;
     }
-    closedir(dir);
+    if (sd_io_take(200)) { closedir(dir); sd_io_give(); }
+    else closedir(dir);
 
     if (file_count == 0) {
         httpd_resp_sendstr_chunk(req, "<tr><td class='empty' colspan='2'>No files found</td></tr>");
@@ -153,7 +166,13 @@ static esp_err_t download_handler(httpd_req_t *req) {
     char filepath[280];
     snprintf(filepath, sizeof(filepath), SD_BASE "/%s", decoded);
 
+    // Open file under sd_io fence
+    if (!sd_io_take(2000)) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SD card busy");
+        return ESP_FAIL;
+    }
     FILE *f = fopen(filepath, "r");
+    sd_io_give();
     if (!f) {
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "File not found");
         return ESP_FAIL;
@@ -167,16 +186,22 @@ static esp_err_t download_handler(httpd_req_t *req) {
     snprintf(disposition, sizeof(disposition), "attachment; filename=\"%s\"", decoded);
     httpd_resp_set_hdr(req, "Content-Disposition", disposition);
 
-    // Stream file in chunks
+    // Stream file in chunks — hold sd_io only for fread, release before
+    // httpd_resp_send_chunk which may block on network I/O.
     char *buf = malloc(FILE_BUF_SIZE);
     if (!buf) {
-        fclose(f);
+        if (sd_io_take(200)) { fclose(f); sd_io_give(); }
+        else fclose(f);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
         return ESP_FAIL;
     }
 
     size_t n;
-    while ((n = fread(buf, 1, FILE_BUF_SIZE, f)) > 0) {
+    while (1) {
+        if (!sd_io_take(2000)) break;  // SD busy — stop serving
+        n = fread(buf, 1, FILE_BUF_SIZE, f);
+        sd_io_give();
+        if (n == 0) break;
         if (httpd_resp_send_chunk(req, buf, n) != ESP_OK) {
             ESP_LOGW(TAG, "Client disconnected during transfer");
             break;
@@ -184,7 +209,8 @@ static esp_err_t download_handler(httpd_req_t *req) {
     }
 
     free(buf);
-    fclose(f);
+    if (sd_io_take(200)) { fclose(f); sd_io_give(); }
+    else fclose(f);
 
     httpd_resp_send_chunk(req, NULL, 0);  // finish
     return ESP_OK;

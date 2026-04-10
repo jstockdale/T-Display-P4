@@ -44,9 +44,11 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "esp_heap_caps.h"
 
 // Time manager — must be included before event handler uses esp_sntp / NTP functions
 #include "time_manager.h"
+#include "serial_console.h"  // for serial_console_print, log_format_timestamp
 
 // XL9535 GPIO expander pin control (from your project)
 // These must be provided by the caller or linked from main.cpp
@@ -134,6 +136,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         s_wifi_connected = true;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
 
+        // Log to serial console so webapp can see the IP
+        char _ts[32]; log_format_timestamp(_ts, sizeof(_ts));
+        char ip[16];
+        snprintf(ip, sizeof(ip), IPSTR, IP2STR(&event->ip_info.ip));
+        serial_console_print("%sWIFI: Connected, IP: %s\n", _ts, ip);
+
         // Start NTP on every (re)connect — time_manager handles dedup
         if (!esp_sntp_enabled()) {
             time_manager_start_ntp();
@@ -161,11 +169,76 @@ static inline void wifi_hosted_set_credentials(const char *ssid, const char *pas
  * Initialize WiFi via ESP-Hosted.
  * Powers on the C6, starts ESP-Hosted SDIO transport, connects to AP.
  *
- * Blocks until connected or max retries exceeded.
- * Returns ESP_OK on success.
+ * Degrades gracefully if the C6 doesn't have ESP-Hosted firmware:
+ *   - esp_wifi_init() runs on a separate task with a 3-second timeout
+ *   - If the C6 doesn't respond on SDIO, returns ESP_ERR_TIMEOUT
+ *   - All partial init is cleaned up (C6 powered off, netif destroyed)
+ *   - Caller prints a message and continues without WiFi
  *
+ * Returns ESP_OK on success, error code on failure.
  * Call AFTER SD card is mounted on SPI (not SDMMC).
  */
+
+// ── esp_wifi_init timeout wrapper ────────────────────────────────────────────
+// esp_wifi_init() establishes the ESP-Hosted SDIO transport to the C6.
+// If the C6 has no ESP-Hosted firmware, this call hangs indefinitely
+// waiting for the SDIO slave to respond.  We run it on a dedicated task
+// and wait on a semaphore with a timeout to detect this case.
+//
+// The context and semaphore are static so the task can safely write to
+// them even if we time out and return — avoids use-after-free on stack.
+
+struct wifi_init_ctx_t {
+    wifi_init_config_t cfg;
+    esp_err_t result;
+    SemaphoreHandle_t done;
+};
+
+static struct wifi_init_ctx_t s_wifi_init_ctx;
+
+static void wifi_init_task_fn(void *arg) {
+    struct wifi_init_ctx_t *ctx = (struct wifi_init_ctx_t *)arg;
+    ctx->result = esp_wifi_init(&ctx->cfg);
+    // Semaphore may have been taken by the caller already (timeout path).
+    // xSemaphoreGive is safe regardless — worst case it goes to max count.
+    if (ctx->done) xSemaphoreGive(ctx->done);
+    vTaskDelete(NULL);
+}
+
+static esp_err_t wifi_init_with_timeout(wifi_init_config_t *cfg, uint32_t timeout_ms) {
+    s_wifi_init_ctx.cfg = *cfg;
+    s_wifi_init_ctx.result = ESP_ERR_TIMEOUT;
+    s_wifi_init_ctx.done = xSemaphoreCreateBinary();
+    if (!s_wifi_init_ctx.done) return ESP_ERR_NO_MEM;
+
+    TaskHandle_t task = NULL;
+    BaseType_t ret = xTaskCreateWithCaps(wifi_init_task_fn, "wifi_probe", 4096,
+                                 &s_wifi_init_ctx, 5, &task, MALLOC_CAP_SPIRAM);
+    if (ret != pdPASS) {
+        vSemaphoreDelete(s_wifi_init_ctx.done);
+        s_wifi_init_ctx.done = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
+    bool completed = (xSemaphoreTake(s_wifi_init_ctx.done,
+                                     pdMS_TO_TICKS(timeout_ms)) == pdTRUE);
+
+    if (!completed) {
+        // Task is stuck in SDIO — leave it running.  SDIO Slot 1 is
+        // dedicated to ESP-Hosted, so no resource conflict with SD card
+        // (which uses SPI3).  The ~200B semaphore + task stack leak is
+        // acceptable for a one-time error path.
+        ESP_LOGE(WIFI_TAG, "esp_wifi_init timed out after %lums — "
+                 "C6 not responding on SDIO (no ESP-Hosted firmware?)",
+                 (unsigned long)timeout_ms);
+        return ESP_ERR_TIMEOUT;
+    }
+
+    vSemaphoreDelete(s_wifi_init_ctx.done);
+    s_wifi_init_ctx.done = NULL;
+    return s_wifi_init_ctx.result;
+}
+
 static inline esp_err_t wifi_hosted_init(void) {
     if (s_wifi_initialized) {
         ESP_LOGW(WIFI_TAG, "Already initialized");
@@ -185,38 +258,84 @@ static inline esp_err_t wifi_hosted_init(void) {
     vTaskDelay(pdMS_TO_TICKS(100));  // C6 boot time
 
     // ── 2. Initialize networking stack ──
-    ESP_ERROR_CHECK(esp_netif_init());
-    // Note: esp_event_loop_create_default() may already be called in main
-    // — ignore ESP_ERR_INVALID_STATE if so
-    esp_err_t err = esp_event_loop_create_default();
+    // These are idempotent — Ethernet_Init() may have already called them.
+    esp_err_t err = esp_netif_init();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(WIFI_TAG, "netif init failed: %s", esp_err_to_name(err));
+        goto fail_c6;
+    }
+    err = esp_event_loop_create_default();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(WIFI_TAG, "Event loop create failed: %s", esp_err_to_name(err));
-        return err;
+        goto fail_c6;
     }
     s_sta_netif = esp_netif_create_default_wifi_sta();
 
-    // ── 3. Initialize WiFi (ESP-Hosted transport is configured via sdkconfig) ──
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    // ── 3. Initialize WiFi (ESP-Hosted SDIO transport to C6) ──
+    // This is the critical call that communicates with the C6.  If the C6
+    // doesn't have ESP-Hosted firmware, this either returns an error or
+    // hangs.  The timeout wrapper handles both cases.
+    {
+        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+        err = wifi_init_with_timeout(&cfg, 3000);  // 3s timeout
+        if (err != ESP_OK) {
+            if (err == ESP_ERR_TIMEOUT) {
+                ESP_LOGE(WIFI_TAG, "C6 does not have ESP-Hosted firmware — WiFi unavailable");
+                ESP_LOGE(WIFI_TAG, "Flash ESP-Hosted network_adapter to C6 to enable WiFi");
+            } else {
+                ESP_LOGE(WIFI_TAG, "esp_wifi_init failed: %s — WiFi unavailable",
+                         esp_err_to_name(err));
+            }
+            goto fail_netif;
+        }
+    }
+    ESP_LOGI(WIFI_TAG, "ESP-Hosted transport established (C6 responding)");
 
     // ── 4. Register event handlers ──
     s_wifi_event_group = xEventGroupCreate();
+    if (!s_wifi_event_group) {
+        ESP_LOGE(WIFI_TAG, "Failed to create event group");
+        err = ESP_ERR_NO_MEM;
+        goto fail_wifi;
+    }
 
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+    err = esp_event_handler_instance_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(WIFI_TAG, "WiFi event handler register failed: %s", esp_err_to_name(err));
+        goto fail_event;
+    }
+    err = esp_event_handler_instance_register(
+        IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(WIFI_TAG, "IP event handler register failed: %s", esp_err_to_name(err));
+        goto fail_event;
+    }
 
     // ── 5. Configure and start ──
-    wifi_config_t wifi_config = {};
-    strncpy((char *)wifi_config.sta.ssid, s_wifi_ssid, sizeof(wifi_config.sta.ssid));
-    strncpy((char *)wifi_config.sta.password, s_wifi_pass, sizeof(wifi_config.sta.password));
-    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-    wifi_config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+    {
+        wifi_config_t wifi_config = {};
+        strncpy((char *)wifi_config.sta.ssid, s_wifi_ssid, sizeof(wifi_config.sta.ssid));
+        strncpy((char *)wifi_config.sta.password, s_wifi_pass, sizeof(wifi_config.sta.password));
+        wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+        wifi_config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
+        err = esp_wifi_set_mode(WIFI_MODE_STA);
+        if (err != ESP_OK) {
+            ESP_LOGE(WIFI_TAG, "set_mode failed: %s", esp_err_to_name(err));
+            goto fail_event;
+        }
+        err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+        if (err != ESP_OK) {
+            ESP_LOGE(WIFI_TAG, "set_config failed: %s", esp_err_to_name(err));
+            goto fail_event;
+        }
+        err = esp_wifi_start();
+        if (err != ESP_OK) {
+            ESP_LOGE(WIFI_TAG, "wifi_start failed: %s", esp_err_to_name(err));
+            goto fail_event;
+        }
+    }
 
     s_wifi_initialized = true;
     s_wifi_paused = false;
@@ -226,6 +345,27 @@ static inline esp_err_t wifi_hosted_init(void) {
     // IP_EVENT → starts NTP. No 30s boot delay.
     // Caller can poll wifi_hosted_is_connected() if needed.
     return ESP_OK;
+
+    // ── Cleanup on failure ─────────────────────────────────────────────────
+    // Unwind partial initialization so the system can continue without WiFi.
+    // Everything downstream (MQTT, NTP, OTA) gates on s_wifi_initialized or
+    // s_wifi_has_ip, so leaving these false is sufficient.
+fail_event:
+    if (s_wifi_event_group) {
+        vEventGroupDelete(s_wifi_event_group);
+        s_wifi_event_group = NULL;
+    }
+fail_wifi:
+    esp_wifi_deinit();
+fail_netif:
+    if (s_sta_netif) {
+        esp_netif_destroy_default_wifi(s_sta_netif);
+        s_sta_netif = NULL;
+    }
+fail_c6:
+    xl9535_c6_enable(false);  // power off C6 — nothing to talk to
+    ESP_LOGW(WIFI_TAG, "Continuing without WiFi — all other features remain functional");
+    return err;
 }
 
 /**

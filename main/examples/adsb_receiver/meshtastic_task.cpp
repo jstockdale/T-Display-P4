@@ -14,12 +14,15 @@
  */
 
 #include "meshtastic_task.h"
+#include "sd_logger.h"
 
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <errno.h>
 #include <sys/unistd.h>
+#include <sys/stat.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -30,12 +33,11 @@
 #include "esp_heap_caps.h"
 #include "device_settings.h"
 
-// GPS fix epoch — set in GPS task on first quality fix.
-extern volatile time_t g_gps_fix_epoch;
+// Trusted time check — true when GPS, NTP, or PPS has synced.
+extern "C" bool time_manager_is_trusted_fn(void);
 extern "C" bool sd_msc_is_active_fn(void);
 extern "C" bool sd_is_mounted(void);
-extern "C" void sd_safe_shutdown(void);
-extern "C" bool sd_remount(void);
+// sd_io_take/give, sd_safe_shutdown, sd_remount now called by sd_logger.c
 #include "meshy_channels.h"
 #include "serial_console.h"
 #include "sd_config.h"
@@ -103,109 +105,79 @@ static int s_msg_write_idx = 0;
 static int s_msg_count = 0;
 
 // ─── SD Card Logging ────────────────────────────────────────────────────────
-// Follows the same pattern as ADS-B CSV logging: PSRAM buffer, periodic flush,
-// file stays closed between flushes for FAT32 safety on hard reset.
+// Uses shared sd_logger module for flush/recovery coordination with ADS-B.
 
 #define MESHY_SD_BUFSIZE     (32 * 1024)
-#define MESHY_SD_SYNC_US     5000000LL    // flush every 5s
-#define MESHY_SD_SYNC_COUNT  50           // or every 50 messages
+#define MESHY_SD_SYNC_US       4500000LL    // flush every 4.5s
+#define MESHY_SD_ADSB_GAP_US    500000LL    // require 0.5s gap after last ADS-B flush
+#define MESHY_SD_MAX_US       10000000LL    // hard max: 10s (if ADS-B not running)
+#define MESHY_SD_MIN_BYTES     512           // min data for time-based flush
 
-static char   meshy_sd_filename[64] = {0};
-static bool   meshy_sd_initialized = false;
+static sd_log_ch_t meshy_ch;
 static char  *meshy_sd_buf = nullptr;
 static int    meshy_sd_buf_pos = 0;
 static int64_t meshy_sd_last_sync = 0;
-static int    meshy_sd_writes = 0;
 
-static void meshy_sd_pick_filename(void) {
+static char meshy_sd_filename_buf[64];  // scratch for filename generation
+
+extern "C" bool meshy_sd_is_active(void) {
+    return meshy_ch.initialized;
+}
+
+static const char *meshy_sd_pick_filename(void) {
     time_t now;
     struct tm timeinfo;
     time(&now);
     gmtime_r(&now, &timeinfo);
-    if (now < 1704067200LL) {
-        snprintf(meshy_sd_filename, sizeof(meshy_sd_filename),
-            "/sdcard/mesh_boot%s.csv", sd_config_boot_id());
+    if (!time_manager_is_trusted_fn() || now < 1704067200LL) {
+        // No GPS/NTP fix yet — use boot-numbered name.
+        // Will be renamed to UTC timestamp when trusted time arrives.
+        snprintf(meshy_sd_filename_buf, sizeof(meshy_sd_filename_buf),
+            "/sdcard/logs/mesh_boot%s.csv", sd_config_boot_id());
     } else {
-        strftime(meshy_sd_filename, sizeof(meshy_sd_filename),
-            "/sdcard/mesh_%Y-%m-%dT%H%M%SZ.csv", &timeinfo);
+        strftime(meshy_sd_filename_buf, sizeof(meshy_sd_filename_buf),
+            "/sdcard/logs/mesh_%Y-%m-%dT%H%M%SZ.csv", &timeinfo);
     }
+    return meshy_sd_filename_buf;
 }
 
+#define MESHY_CSV_HEADER \
+    "timestamp_utc,from_hex,to_hex,packet_id,channel,rssi,snr," \
+    "hop_limit,hop_start,portnum,port_name," \
+    "text,lat,lon,altitude_m," \
+    "long_name,short_name," \
+    "battery_pct,voltage,ch_util_pct,air_util_pct," \
+    "rx_count,is_pki\n"
+
 static void meshy_sd_create(void) {
-    meshy_sd_pick_filename();
-    FILE *f = fopen(meshy_sd_filename, "w");
-    if (!f) {
-        ESP_LOGW(TAG, "Failed to open meshy SD log: %s", meshy_sd_filename);
-        return;
-    }
-    fprintf(f, "timestamp_utc,from_hex,to_hex,packet_id,channel,rssi,snr,"
-               "hop_limit,hop_start,portnum,port_name,"
-               "text,lat,lon,altitude_m,"
-               "long_name,short_name,"
-               "battery_pct,voltage,ch_util_pct,air_util_pct,"
-               "rx_count,is_pki\n");
-    fflush(f);
-    fsync(fileno(f));
-    fclose(f);
-    meshy_sd_initialized = true;
+    const char *fn = meshy_sd_pick_filename();
+    if (!sd_log_ch_open(&meshy_ch, fn, MESHY_CSV_HEADER)) return;
     meshy_sd_last_sync = esp_timer_get_time();
-    meshy_sd_writes = 0;
-    meshy_sd_buf_pos = 0;
-    MESHY_LOGI("Meshy SD log: %s", meshy_sd_filename);
+    // NOTE: meshy_sd_buf_pos intentionally NOT zeroed — buffer may contain
+    // valid CSV rows from before a failure.  Caller flushes after create/reopen.
 }
 
 static void meshy_sd_flush(void) {
-    if (!meshy_sd_initialized || meshy_sd_buf_pos == 0) return;
-
-    static int s_meshy_flush_fail_count = 0;
-
-    FILE *f = fopen(meshy_sd_filename, "a");
-    if (!f) {
-        s_meshy_flush_fail_count++;
-        ESP_LOGW(TAG, "Meshy SD flush: cannot open %s (%d consecutive)", meshy_sd_filename, s_meshy_flush_fail_count);
-        if (s_meshy_flush_fail_count >= 5) {
-            // SD card likely removed — mark log uninitialized and unmount.
-            // Set uninitialized FIRST to prevent recursion:
-            // sd_safe_shutdown → meshy_sd_close → meshy_sd_flush → returns immediately
-            ESP_LOGW(TAG, "SD card unresponsive — closing meshy log and unmounting");
-            meshy_sd_initialized = false;
-            meshy_sd_filename[0] = '\0';
-            meshy_sd_buf_pos = 0;
-            s_meshy_flush_fail_count = 0;
-            if (sd_is_mounted()) {
-                sd_safe_shutdown();  // unmounts card, sets sd_card_handle = NULL
-            }
-        }
-        return;
-    }
-    s_meshy_flush_fail_count = 0;  // reset on success
-    size_t written = fwrite(meshy_sd_buf, 1, meshy_sd_buf_pos, f);
-    fflush(f);
-    fsync(fileno(f));
-    fclose(f);
-    if ((int)written == meshy_sd_buf_pos) {
+    if (!meshy_ch.initialized || meshy_sd_buf_pos == 0) return;
+    int n = meshy_sd_buf_pos;
+    sd_log_ch_flush(&meshy_ch, meshy_sd_buf, n);
+    if (meshy_ch.initialized) {
         meshy_sd_buf_pos = 0;
-    } else {
-        int remain = meshy_sd_buf_pos - (int)written;
-        memmove(meshy_sd_buf, meshy_sd_buf + written, remain);
-        meshy_sd_buf_pos = remain;
+        meshy_sd_last_sync = esp_timer_get_time();
+        sd_log_record_flush(SD_FLUSH_CH_MESHY);
     }
-    meshy_sd_last_sync = esp_timer_get_time();
-    meshy_sd_writes = 0;
 }
 
 // Close the meshy log permanently (for MSC mode / shutdown).
 extern "C" void meshy_sd_close(void) {
-    if (!meshy_sd_initialized) return;  // already closed or never opened
+    if (!meshy_ch.initialized) return;
     meshy_sd_flush();
-    meshy_sd_initialized = false;
-    MESHY_LOGI("Meshy SD log closed: %s", meshy_sd_filename);
-    meshy_sd_filename[0] = '\0';
+    sd_log_ch_close(&meshy_ch);
 }
 
 // Close current log and create a fresh one with a new timestamp.
 extern "C" void meshy_sd_create_new(void) {
-    if (meshy_sd_initialized) meshy_sd_close();
+    if (meshy_ch.initialized) meshy_sd_close();
     meshy_sd_create();
 }
 
@@ -241,33 +213,78 @@ static void meshy_sd_log_msg(const meshy_msg_t *msg) {
             return;
         }
         meshy_sd_buf_pos = 0;
+        sd_log_ch_init(&meshy_ch, TAG);
     }
-    if (!meshy_sd_initialized) {
-        static int64_t last_meshy_mount_retry = 0;
+    if (!meshy_ch.initialized) {
+        // If the FAT is structurally corrupt, stop retrying entirely.
+        // User must reformat the card and run 'mount'.
+        if (sd_log_bus_failed()) return;
+
+        static int64_t last_meshy_retry = 0;
         int64_t now_us = esp_timer_get_time();
-        meshy_sd_create();
-        if (!meshy_sd_initialized && (now_us - last_meshy_mount_retry > 30000000LL)) {
-            last_meshy_mount_retry = now_us;
-            if (sd_remount()) {
-                meshy_sd_create();
+        if (now_us - last_meshy_retry < 5000000LL) return;  // 5s throttle
+        last_meshy_retry = now_us;
+
+        // 1. If we have a previous filename and card is mounted, try reopen
+        if (meshy_ch.filename[0] && sd_is_mounted()) {
+            sd_log_ch_reopen(&meshy_ch);
+            if (meshy_ch.initialized && meshy_sd_buf_pos > 0) {
+                meshy_sd_flush();
             }
         }
-        if (!meshy_sd_initialized) return;
+
+        // 2. Card mounted but reopen failed (or no previous file) → new file
+        if (!meshy_ch.initialized && sd_is_mounted()) {
+            meshy_sd_create();
+            if (meshy_ch.initialized && meshy_sd_buf_pos > 0) {
+                meshy_sd_flush();
+            }
+        }
+
+        // 3. Card not mounted → try recovery, then reopen or create
+        if (!meshy_ch.initialized) {
+            if (sd_log_try_recovery(TAG)) {
+                if (meshy_ch.filename[0]) {
+                    sd_log_ch_reopen(&meshy_ch);
+                }
+                if (!meshy_ch.initialized) {
+                    meshy_sd_create();
+                }
+                if (meshy_ch.initialized && meshy_sd_buf_pos > 0) {
+                    meshy_sd_flush();
+                }
+            }
+        }
+
+        // 4. Card is mounted but we still can't create files → FAT is
+        //    structurally corrupt (zombie card).  Stop retrying to avoid
+        //    an infinite 5s loop of failed fopen() calls.
+        if (!meshy_ch.initialized && sd_is_mounted()) {
+            sd_log_bus_fail("Card mounted but cannot create files "
+                            "— FAT corrupted, reformat card and run 'mount'");
+        }
+
+        if (!meshy_ch.initialized) return;
     }
 
-    // Check if GPS fix arrived and we should rename the file
-    if (g_gps_fix_epoch > 0 && strstr(meshy_sd_filename, "_boot")) {
-        meshy_sd_flush();
-        char old_name[64];
-        strncpy(old_name, meshy_sd_filename, sizeof(old_name));
-        // Use GPS fix epoch for filename — matches ADS-B log timestamp
+    // Check if trusted time arrived and we should rename the file
+    if (time_manager_is_trusted_fn() && strstr(meshy_ch.filename, "_boot")) {
         struct tm timeinfo;
-        time_t fix_time = g_gps_fix_epoch;
+        time_t fix_time;
+        time(&fix_time);
         gmtime_r(&fix_time, &timeinfo);
-        strftime(meshy_sd_filename, sizeof(meshy_sd_filename),
-            "/sdcard/mesh_%Y-%m-%dT%H%M%SZ.csv", &timeinfo);
-        rename(old_name, meshy_sd_filename);
-        MESHY_LOGI("Meshy SD log renamed: %s → %s", old_name, meshy_sd_filename);
+        char new_filename[64];
+        strftime(new_filename, sizeof(new_filename),
+            "/sdcard/logs/mesh_%Y-%m-%dT%H%M%SZ.csv", &timeinfo);
+        if (sd_log_ch_rename(&meshy_ch, new_filename,
+                             meshy_sd_buf, meshy_sd_buf_pos)) {
+            meshy_sd_buf_pos = 0;  // buffer was flushed by rename
+        } else {
+            // Rename failed — channel is now uninitialized.  Create a fresh
+            // file (meshy_sd_create picks a new timestamp name + writes header).
+            meshy_sd_buf_pos = 0;
+            meshy_sd_create();
+        }
     }
 
     // Format timestamp (static to keep off 4KB stack)
@@ -336,14 +353,32 @@ static void meshy_sd_log_msg(const meshy_msg_t *msg) {
     if (meshy_sd_buf_pos + n < MESHY_SD_BUFSIZE) {
         memcpy(meshy_sd_buf + meshy_sd_buf_pos, row, n);
         meshy_sd_buf_pos += n;
-        meshy_sd_writes++;
     }
 
-    // Flush if buffer getting full or time/count threshold hit
+    // Periodic flush — interleaved with ADS-B:
+    //   • Buffer nearly full → immediate (safety)
+    //   • ≥4.5s since own last flush AND ≥0.5s since last ADS-B flush
+    //     → slots meshy between two consecutive ADS-B 1s flushes
+    //   • ≥10s hard max (if ADS-B not running)
+    //   • All time-based triggers require ≥512 bytes (one full sector)
     int64_t now_us = esp_timer_get_time();
-    if (meshy_sd_buf_pos > MESHY_SD_BUFSIZE - 512 ||
-        meshy_sd_writes >= MESHY_SD_SYNC_COUNT ||
-        (now_us - meshy_sd_last_sync) > MESHY_SD_SYNC_US) {
+    int64_t since_self = now_us - meshy_sd_last_sync;
+    int64_t other_ts = sd_log_other_flush_time(SD_FLUSH_CH_MESHY);
+    int64_t since_adsb = (other_ts > 0) ? (now_us - other_ts) : INT64_MAX;
+    bool buf_critical = meshy_sd_buf_pos > MESHY_SD_BUFSIZE - 512;
+    bool has_block = meshy_sd_buf_pos >= MESHY_SD_MIN_BYTES;
+
+    bool should_flush = false;
+    if (buf_critical) {
+        should_flush = true;
+    } else if (since_self >= MESHY_SD_MAX_US && meshy_sd_buf_pos > 0) {
+        should_flush = true;                                          // 10s hard max
+    } else if (since_self >= MESHY_SD_SYNC_US && has_block &&
+               since_adsb >= MESHY_SD_ADSB_GAP_US) {
+        should_flush = true;                                          // 4.5s + gap
+    }
+
+    if (should_flush) {
         meshy_sd_flush();
     }
 }
@@ -1112,9 +1147,10 @@ extern "C" bool meshy_start(void) {
     // Ensure PKI keypair exists (generates on first boot, loads from NVS after)
     meshy_pki_ensure();
 
-    // Create queues and allocate message history in PSRAM
-    if (!s_rx_queue) s_rx_queue = xQueueCreate(16, sizeof(meshy_msg_t));
-    if (!s_tx_queue) s_tx_queue = xQueueCreate(8, sizeof(tx_request_t));
+    // Create queues in PSRAM — meshy_msg_t is ~400 bytes × 16 = ~6.4 KB,
+    // tx_request_t is ~248 bytes × 8 = ~2 KB. No DMA involved, PSRAM is safe.
+    if (!s_rx_queue) s_rx_queue = xQueueCreateWithCaps(16, sizeof(meshy_msg_t), MALLOC_CAP_SPIRAM);
+    if (!s_tx_queue) s_tx_queue = xQueueCreateWithCaps(8, sizeof(tx_request_t), MALLOC_CAP_SPIRAM);
     if (!s_node_mutex) s_node_mutex = xSemaphoreCreateMutex();
     if (!s_spi_mutex)  s_spi_mutex  = xSemaphoreCreateMutex();
     if (!s_msg_history) {

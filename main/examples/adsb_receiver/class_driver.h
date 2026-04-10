@@ -135,9 +135,25 @@ typedef struct {
     double   nearest_dist_nm;   // distance to nearest in nautical miles
     int      nearest_alt;       // altitude of nearest aircraft
     char     nearest_callsign[9]; // callsign of nearest (empty string if none)
+    double   farthest_dist_nm;  // distance to farthest aircraft in nautical miles
+    uint32_t farthest_icao;     // ICAO of farthest aircraft (0 if none)
+    uint16_t gain_tenths;       // current tuner gain in tenths of dB (e.g. 496 = 49.6 dB)
+    bool     gain_auto;         // true if using adaptive gain
+    int      gain_phase;        // 1 = fast convergence, 2 = steady-state
+    float    crc_error_rate;    // CRC failure rate (0.0 – 1.0) over last evaluation window
+    float    pos_rate;          // position updates per second (EMA in phase 2)
+    uint32_t avg_signal;        // avg preamble signal level of CRC-ok messages (0–65167)
+    uint32_t avg_delta;         // avg bit delta / SNR proxy of CRC-ok messages (noise floor ~2550)
+    char     dongle_model[64];  // human-readable RTL-SDR dongle description (e.g. "RTL-SDR Blog V4 (R828D)")
 } adsb_stats_t;
 
 extern adsb_stats_t adsb_get_stats(void);
+
+// Set tuner gain: mode 0=auto (adaptive), mode 1=manual at gain_tenths
+extern void adsb_set_gain(int mode, uint16_t gain_tenths);
+
+// Restart adaptive gain from current level — re-enters P1 without resetting to max.
+extern void adsb_gain_restart(void);
 
 // Sort column for on-device aircraft list
 typedef enum {
@@ -170,6 +186,8 @@ extern void adsb_set_bias_tee(bool on);
 extern void free_adsb_transfer(void);
 
 // Aircraft data for scope radar display
+#define MAX_SCOPE_AIRCRAFT 128
+
 typedef struct {
     uint32_t icao;
     char callsign[9];

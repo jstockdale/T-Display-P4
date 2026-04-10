@@ -4,9 +4,24 @@ CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 //CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_model.csv"
 
+# ─── FreeRTOS Tick Rate (~1ms) ────────────────────────────────────────────
+CONFIG_FREERTOS_HZ=1000
+
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_HEX=y
 CONFIG_SPIRAM_SPEED_200M=y
+
+# ─── PSRAM memory optimization ────────────────────────────────────────────
+# Move LWIP/net80211/wpa .bss to PSRAM (saves ~18KB internal)
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+# Allow any-size malloc to go to internal (0 = no threshold, PSRAM preferred by other flags)
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0
+# DMA reserve pool at 32KB
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+# LWIP runtime allocs prefer PSRAM
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+# Allow task stacks in PSRAM
+CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
 
 CONFIG_CACHE_L2_CACHE_256KB=y
 CONFIG_CACHE_L2_CACHE_LINE_128B=y
@@ -63,23 +78,79 @@ CONFIG_CAMERA_OV2710_MIPI_RAW10_1280X720_25FPS=y
 CONFIG_CAMERA_OV5645=y
 CONFIG_CAMERA_OV5645_MIPI_RGB565_1280X960_30FPS=y
 
-//add wi-fi remote config for better performance:
-CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=16
-CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=64
+# ─── WiFi (ESP-Hosted via C6 on SDMMC Slot 1) ────────────────────────────
+# Minimize P4 internal RAM usage — actual WiFi buffers live on C6
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG_RX_BUF_SIZE=16384
+CONFIG_ESP_WIFI_REMOTE_ENABLED=y
+CONFIG_ESP_HOSTED_ENABLED=y
+CONFIG_ESP_HOSTED_TRANSPORT_SDIO=y
+CONFIG_ESP_HOSTED_SDIO_SLOT=1
+CONFIG_ESP_HOSTED_SDIO_CLK_GPIO=18
+CONFIG_ESP_HOSTED_SDIO_CMD_GPIO=19
+CONFIG_ESP_HOSTED_SDIO_D0_GPIO=14
+CONFIG_ESP_HOSTED_SDIO_D1_GPIO=15
+CONFIG_ESP_HOSTED_SDIO_D2_GPIO=16
+CONFIG_ESP_HOSTED_SDIO_D3_GPIO=17
+CONFIG_ESP_HOSTED_DFLT_TASK_FROM_SPIRAM=y 
+CONFIG_ESP_HOSTED_DFLT_TASK_STACK=5120
+CONFIG_ESP_HOSTED_RPC_TASK_STACK=5120
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=64
 CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=y
 CONFIG_ESP_WIFI_TX_BA_WIN=32
 CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=y
-CONFIG_ESP_WIFI_RX_BA_WIN=32
+CONFIG_ESP_WIFI_RX_BA_WIN=4
+CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n
 
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=65534
-CONFIG_LWIP_TCP_WND_DEFAULT=65534
+# ─── LWIP (small buffers — NTP only, no heavy traffic on P4) ─────────────
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=4096
+CONFIG_LWIP_TCP_WND_DEFAULT=4096
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=64
 CONFIG_LWIP_UDP_RECVMBOX_SIZE=64
 CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
-
 CONFIG_LWIP_TCP_SACK_OUT=y
+CONFIG_LWIP_SNTP_MAX_SERVERS=1
 
 CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=8192
 
-CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+CONFIG_MBEDTLS_ECP_DP_CURVE25519_ENABLED=y
+
+# ─── Move mbedTLS allocations to PSRAM ────────────────────────────────────────
+# Without this, mbedTLS uses malloc() which may allocate in internal RAM
+# even with CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0 (mbedTLS has its own
+# allocation path in some ESP-IDF versions).
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+
+# ─── Certificate bundle: disabled ────────────────────────────────────────────
+# We embed the ISRG Root X1 PEM directly in mqtt_feeder.c for Let's Encrypt.
+# The default full bundle (200 CAs) wastes ~64KB flash and PSRAM parse buffers
+# that are never used. Disable it entirely.
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=n
+
+# ─── Don't keep peer certificate after TLS handshake ─────────────────────────
+# Saves ~1.5KB per connection (the server cert chain). We only have one
+# persistent MQTT connection and never re-verify after handshake.
+CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE=n
+
+# ─── Ethernet DMA: reduced buffers ────────────────────────────────────────
+# The T-Display-P4 has an internal EMAC that should work when plugged in.
+# The default 20 RX + 10 TX DMA buffers (512B each = 15,360 bytes) is
+# overkill — 4+4 is plenty for MQTT-level traffic and saves 11,264 bytes
+# of DMA-capable internal RAM that the SD card SPI bus needs.
+CONFIG_ETH_DMA_RX_BUFFER_NUM=4
+CONFIG_ETH_DMA_TX_BUFFER_NUM=4
+
+# ─── TinyUSB for USB MSC mode ──────────────────────────────────────────────
+CONFIG_TINYUSB_ENABLED=y
+CONFIG_TINYUSB_MSC_ENABLED=y
+CONFIG_TINYUSB_MSC_BUFSIZE=4096
+
+# ─── Reduce TLS record buffer sizes ──────────────────────────────────────────
+# Default is 16384 (16 KB) per direction = 32 KB for both.
+# MQTT payloads are small (our largest is ~4 KB JSON batch).
+# 4096 bytes is sufficient and saves 24 KB.
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=6144
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
+

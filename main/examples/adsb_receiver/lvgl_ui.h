@@ -75,6 +75,8 @@ namespace Lvgl_Ui
     public:
         uint32_t _width;
         uint32_t _height;
+        bool _has_sd = true;
+        lv_display_rotation_t _home_rotation = LV_DISPLAY_ROTATION_0;  // captured once in begin()
 
         enum class Current_Win
         {
@@ -90,6 +92,10 @@ namespace Lvgl_Ui
             CIT_NFC_TEST,
 #endif
             CAMERA,
+            ADSB,
+            MESHY,
+            SCOPE,
+            SETTINGS,
             RF,
             RF_SETINGS,
             MUSIC,
@@ -145,6 +151,9 @@ namespace Lvgl_Ui
                 lv_obj_t *time_label;
                 lv_obj_t *battery_icon;
                 lv_obj_t *wifi_signal_icon;
+                lv_obj_t *gps_icon;
+                lv_obj_t *adsb_icon;
+                lv_obj_t *sd_icon;
             } status_bar;
 
             struct
@@ -288,6 +297,86 @@ namespace Lvgl_Ui
                 struct
                 {
                     lv_obj_t *root;
+                    lv_obj_t *stats_label;
+                    lv_obj_t *list_label;
+                    bool rotated = false;
+                    lv_display_rotation_t user_rotation = LV_DISPLAY_ROTATION_0;
+                    bool has_user_rotation = false;
+
+                    // Draggable divider state
+                    lv_obj_t *divider;
+                    lv_obj_t *stats_panel;
+                    lv_obj_t *list_panel;
+                    lv_obj_t *list_header;
+                    int32_t divider_y = 0;  // current Y position of divider
+
+                    // Sort state
+                    int sort_col;        // adsb_sort_col_t value (0=DIST default)
+                    bool sort_asc = true; // true = ascending (nearest first for DIST)
+                } adsb;
+
+                struct
+                {
+                    lv_obj_t *root;
+                    lv_obj_t *stats_label;
+                    lv_obj_t *tx_textarea;
+                    lv_obj_t *msg_label;       // fallback if canvas fails
+                    lv_obj_t *msg_canvas;       // emoji-capable message display
+                    void     *msg_canvas_buf;
+                    int32_t   msg_canvas_w;
+                    int32_t   msg_canvas_max_h;
+                    int32_t   msg_canvas_stride;
+                } meshy;
+
+                struct
+                {
+                    lv_obj_t *root;
+                    lv_obj_t *scroll_container;
+                } settings;
+
+                struct
+                {
+                    lv_obj_t *root = nullptr;
+                    lv_obj_t *canvas = nullptr;
+                    void     *canvas_buf = nullptr;   // PSRAM canvas buffer
+                    int32_t   canvas_w = 0;
+                    int32_t   canvas_h = 0;
+                    lv_obj_t *info_label = nullptr;   // bottom info text
+                    lv_obj_t *detail_label = nullptr;  // selected aircraft detail
+                    lv_timer_t *redraw_timer = nullptr; // LVGL timer for periodic redraw
+                    // Pan/zoom state
+                    float     pan_x = 0;              // pixel offset from center
+                    float     pan_y = 0;
+                    float     zoom = 1.0f;            // 1.0 = auto-range, >1 = zoomed in
+                    float     range_nm = 10.0f;       // current display range
+                    // Touch tracking
+                    bool      touch_active = false;
+                    int32_t   touch_start_x = 0;
+                    int32_t   touch_start_y = 0;
+                    float     pan_start_x = 0;
+                    float     pan_start_y = 0;
+                    // Pinch zoom
+                    bool      pinch_active = false;
+                    float     pinch_start_dist = 0;
+                    float     zoom_start = 1.0f;
+                    // Selected aircraft
+                    uint32_t  selected_icao = 0;
+                    // Color mode: 0=Mono(green), 1=Rainbow, 2=ALT, 3=SPD
+                    int       color_mode = 0;
+                    // Tap-cycle state (for clustered aircraft)
+                    uint32_t  tap_candidates[8] = {0};
+                    int       tap_candidate_count = 0;
+                    int       tap_cycle_idx = 0;
+                    int32_t   last_tap_x = -1;
+                    int32_t   last_tap_y = -1;
+                    // Render timing (adaptive FPS)
+                    uint32_t  last_render_us = 0;    // microseconds for last frame
+                    int       visible_count = 0;     // aircraft drawn on screen last frame
+                } scope;
+
+                struct
+                {
+                    lv_obj_t *root;
 
                     lv_obj_t *send_box_container;
                     lv_obj_t *chat_message_container;
@@ -394,6 +483,7 @@ namespace Lvgl_Ui
                 struct
                 {
                     lv_obj_t *root;
+                    lv_obj_t *album_art;
                     bool play_flag = 0;
                     double current_time_s = 0;
                     double total_time_s = 0;
@@ -407,6 +497,8 @@ namespace Lvgl_Ui
 
                     struct
                     {
+                        lv_obj_t *song_name;
+                        lv_obj_t *artist;
                         lv_obj_t *current_time;
                         lv_obj_t *total_time;
                     } label;
@@ -492,6 +584,20 @@ namespace Lvgl_Ui
 
         bool _wifi_connect_status = false;
 
+        // GPS status
+        bool _gps_fix_valid = false;
+        int  _gps_sats = 0;
+
+        // ADS-B status
+        bool _adsb_connected = false;
+        bool _adsb_error = false;    // device seen but transfer buffer failed
+        int  _adsb_aircraft_count = 0;
+
+        // SD card status
+        bool _sd_mounted = false;
+        bool _sd_logging = false;
+        bool _sd_msc = false;
+
         std::unique_ptr<lv_color_t[]> _lv_color_win_draw_buf = std::make_unique<lv_color_t[]>(_width * _height);
 
         Registry _registry;
@@ -572,17 +678,24 @@ namespace Lvgl_Ui
 
         Rf_Chip_Type _rf_chip_type = Rf_Chip_Type::SX1262;
 
-#if defined CONFIG_SCREEN_TYPE_HI8561
-        Hi8561_Touch::Touch_Point _touch_point;
-#elif defined CONFIG_SCREEN_TYPE_RM69A10
-        Gt9895::Touch_Point _touch_point;
-#else
-#error "unknown macro definition, please select the correct macro definition."
-#endif
+        // Generic touch point — compatible with both Hi8561_Touch and Gt9895
+        struct TouchInfo {
+            uint16_t x = 0;
+            uint16_t y = 0;
+            uint16_t pressure_value = 0;
+        };
+        struct TouchPoint {
+            uint8_t finger_count = 0;
+            bool edge_touch_flag = false;
+            std::vector<TouchInfo> info;
+        };
+        TouchPoint _touch_point;
 
         bool _edge_touch_flag = false;
 
         void (*_device_vibration_callback)(uint8_t vibration_count) = nullptr;
+        void (*_device_brightness_callback)(uint8_t percent) = nullptr;
+        void (*_device_volume_callback)(uint8_t percent) = nullptr;
 
         void (*_win_cit_speaker_test_callback)(void) = nullptr;
 
@@ -601,6 +714,10 @@ namespace Lvgl_Ui
         // void (*_device_start_sleep_test_callback)(Sleep_Mode mode) = nullptr;
 
         void (*_win_camera_status_callback)(bool status) = nullptr;
+
+        void (*_win_adsb_status_callback)(bool status) = nullptr;
+        void (*_win_meshy_status_callback)(bool status) = nullptr;
+        void (*_win_scope_status_callback)(bool status) = nullptr;
 
         bool (*_win_rf_config_sx1262_params_callback)(Device_Sx1262 device_sx1262) = nullptr;
 
@@ -621,13 +738,22 @@ namespace Lvgl_Ui
         {
         }
 
-        void begin();
+        // Update screen dimensions after runtime detection, before begin()
+        void set_screen_size(uint32_t width, uint32_t height) {
+            _width = width;
+            _height = height;
+        }
+
+        void begin(bool has_sd = true);
 
         Current_Win get_current_win(void);
 
         void set_time(Pcf8563x::Time time);
         void set_battery_level(uint16_t battery_level);
         void set_wifi_connect_status(bool status);
+        void set_gps_status(bool fix_valid, int sats);
+        void set_adsb_status(bool connected, bool error, int aircraft_count);
+        void set_sd_status(bool mounted, bool logging, bool msc = false);
 
         void add_event_cb_win_return_to_cit(lv_obj_t *obj);
 
@@ -650,6 +776,9 @@ namespace Lvgl_Ui
         void status_bar_time_update(void);
         void status_bar_battery_level_update(void);
         void status_bar_wifi_connect_status_update(void);
+        void status_bar_gps_update(void);
+        void status_bar_adsb_update(void);
+        void status_bar_sd_update(void);
 
         void win_home_time_update(void);
 
@@ -685,6 +814,14 @@ namespace Lvgl_Ui
         // void init_win_cit_sleep_test(void);
 
         void init_win_camera(void);
+
+        void init_win_adsb(void);
+        void win_adsb_update(const char *stats_text, const char *list_text);
+        void init_win_meshy(void);
+        void win_meshy_update(const char *stats_text, const char *msg_text);
+        void init_win_scope(void);
+        void init_win_settings(void);
+        void win_scope_redraw(void);
 
         void init_win_rf(void);
         void win_rf_chat_message_data_update(std::vector<Win_Rf_Chat_Message> wlcm);

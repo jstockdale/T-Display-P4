@@ -113,6 +113,10 @@ struct rtlsdr_dev
     int driver_active;
     unsigned int xfer_errors;
     int i2c_repeater_on;
+    /* dongle model identification (populated from USB descriptors) */
+    char manufact[256];
+    char product[256];
+    int force_bt;   /* force bias tee always on (EEPROM IR-Endpoint bit cleared) */
 };
 
 void rtlsdr_set_gpio_bit(rtlsdr_dev_t *dev, uint8_t gpio, int val);
@@ -364,6 +368,7 @@ static rtlsdr_dongle_t known_devices[] = {
 #define BULK_TIMEOUT 0
 
 #define EEPROM_ADDR 0xa0
+#define EEPROM_SIZE 256
 
 enum usb_reg
 {
@@ -805,25 +810,64 @@ int rtlsdr_get_usb_strings(rtlsdr_dev_t *dev, char *manufact, char *product,
     ESP_ERROR_CHECK(usb_host_device_info(dev->driver_obj->dev_hdl, &dev_info));
     const int buf_max = 256;
 
-    if (dev_info.str_desc_manufacturer)
+    if (dev_info.str_desc_manufacturer && manufact)
     {
         memset(manufact, 0, buf_max);
         esp_libusb_get_string_descriptor_ascii(dev_info.str_desc_manufacturer, manufact);
     }
 
-    if (dev_info.str_desc_product)
+    if (dev_info.str_desc_product && product)
     {
         memset(product, 0, buf_max);
         esp_libusb_get_string_descriptor_ascii(dev_info.str_desc_product, product);
     }
 
-    if (dev_info.str_desc_serial_num)
+    if (dev_info.str_desc_serial_num && serial)
     {
         memset(serial, 0, buf_max);
         esp_libusb_get_string_descriptor_ascii(dev_info.str_desc_serial_num, serial);
     }
 
     return 0;
+}
+
+/* Check if the dongle's EEPROM manufacturer and product strings match.
+ * Used to identify RTL-SDR Blog V4 ("RTLSDRBlog", "Blog V4") and
+ * V4 Lite ("RTLSDRBlog", "Blog V4L") variants which need special
+ * tuner input switching and xtal frequency handling.
+ * Returns 1 on match, 0 otherwise. */
+int rtlsdr_check_dongle_model(void *dev, const char *manufact_check, const char *product_check)
+{
+    rtlsdr_dev_t *d = (rtlsdr_dev_t *)dev;
+    if (d->manufact[0] == '\0') return 0;  /* not populated yet */
+    return (strcmp(d->manufact, manufact_check) == 0 &&
+            strcmp(d->product, product_check) == 0);
+}
+
+/* Accessor for dongle identification — class_driver.c can't see struct internals. */
+void rtlsdr_get_dongle_info(void *dev, char *model_out, int model_len,
+                            int *tuner_type_out, int *force_bt_out)
+{
+    rtlsdr_dev_t *d = (rtlsdr_dev_t *)dev;
+    if (tuner_type_out) *tuner_type_out = (int)d->tuner_type;
+    if (force_bt_out)   *force_bt_out = d->force_bt;
+    if (model_out && model_len > 0) {
+        const char *tuner_name = "Unknown";
+        switch (d->tuner_type) {
+            case RTLSDR_TUNER_R820T: tuner_name = "R820T"; break;
+            case RTLSDR_TUNER_R828D: tuner_name = "R828D"; break;
+            case RTLSDR_TUNER_E4000: tuner_name = "E4000"; break;
+            case RTLSDR_TUNER_FC0012: tuner_name = "FC0012"; break;
+            case RTLSDR_TUNER_FC0013: tuner_name = "FC0013"; break;
+            case RTLSDR_TUNER_FC2580: tuner_name = "FC2580"; break;
+            default: break;
+        }
+        if (d->manufact[0] && d->product[0]) {
+            snprintf(model_out, model_len, "%s %s (%s)", d->manufact, d->product, tuner_name);
+        } else {
+            snprintf(model_out, model_len, "RTL-SDR (%s)", tuner_name);
+        }
+    }
 }
 
 int rtlsdr_write_eeprom(rtlsdr_dev_t *dev, uint8_t *data, uint8_t offset, uint16_t len)
@@ -1387,11 +1431,19 @@ int rtlsdr_open(rtlsdr_dev_t **out_dev, uint8_t index, usb_host_client_handle_t 
     rtlsdr_init_baseband(dev);
     dev->dev_lost = 0;
 
+    /* Read USB descriptor strings for dongle model identification.
+     * Must happen before tuner probing — Blog V4 detection affects
+     * xtal frequency and input switching configuration. */
+    dev->manufact[0] = '\0';
+    dev->product[0] = '\0';
+    dev->force_bt = 0;
+    rtlsdr_get_usb_strings(dev, dev->manufact, dev->product, NULL);
+    ESP_LOGI(TAG_ADSB, "USB: manufact=\"%s\" product=\"%s\"", dev->manufact, dev->product);
+
     /* Probe tuners */
     rtlsdr_set_i2c_repeater(dev, 1);
 
     // reg = rtlsdr_i2c_read_reg(dev, E4K_I2C_ADDR, E4K_CHECK_ADDR);
-    // fprintf(stderr, "rtlsdr_i2c_read_reg E4K_I2C_ADDR setting done\n");
     // if (reg == E4K_CHECK_VAL)
     // {
     //     fprintf(stderr, "Found Elonics E4000 tuner\n");
@@ -1400,7 +1452,6 @@ int rtlsdr_open(rtlsdr_dev_t **out_dev, uint8_t index, usb_host_client_handle_t 
     // }
 
     // reg = rtlsdr_i2c_read_reg(dev, FC0013_I2C_ADDR, FC0013_CHECK_ADDR);
-    // fprintf(stderr, "rtlsdr_i2c_read_reg FC0013_I2C_ADDR setting done\n");
     // if (reg == FC0013_CHECK_VAL)
     // {
     //     fprintf(stderr, "Found Fitipower FC0013 tuner\n");
@@ -1409,23 +1460,24 @@ int rtlsdr_open(rtlsdr_dev_t **out_dev, uint8_t index, usb_host_client_handle_t 
     // }
 
     reg = rtlsdr_i2c_read_reg(dev, R820T_I2C_ADDR, R82XX_CHECK_ADDR);
-    ESP_LOGI(TAG_ADSB, "rtl device number %d", reg);
-    fprintf(stderr, "rtlsdr_i2c_read_reg R82XX_CHECK_ADDR setting done\n");
     if (reg == R82XX_CHECK_VAL)
     {
-        fprintf(stderr, "Found Rafael Micro R820T tuner\n");
+        ESP_LOGI(TAG_ADSB, "Found Rafael Micro R820T tuner (I2C 0x%02x)", R820T_I2C_ADDR);
+        if (rtlsdr_check_dongle_model(dev, "RTLSDRBlog", "Blog V4L"))
+            ESP_LOGI(TAG_ADSB, "RTL-SDR Blog V4 Lite detected");
         dev->tuner_type = RTLSDR_TUNER_R820T;
         goto found;
     }
 
-    // reg = rtlsdr_i2c_read_reg(dev, R828D_I2C_ADDR, R82XX_CHECK_ADDR);
-    // fprintf(stderr, "rtlsdr_i2c_read_reg R828D_I2C_ADDR setting done\n");
-    // if (reg == R82XX_CHECK_VAL)
-    // {
-    //     fprintf(stderr, "Found Rafael Micro R828D tuner\n");
-    //     dev->tuner_type = RTLSDR_TUNER_R828D;
-    //     goto found;
-    // }
+    reg = rtlsdr_i2c_read_reg(dev, R828D_I2C_ADDR, R82XX_CHECK_ADDR);
+    if (reg == R82XX_CHECK_VAL)
+    {
+        ESP_LOGI(TAG_ADSB, "Found Rafael Micro R828D tuner (I2C 0x%02x)", R828D_I2C_ADDR);
+        if (rtlsdr_check_dongle_model(dev, "RTLSDRBlog", "Blog V4"))
+            ESP_LOGI(TAG_ADSB, "RTL-SDR Blog V4 detected");
+        dev->tuner_type = RTLSDR_TUNER_R828D;
+        goto found;
+    }
 
     // /* initialise GPIOs */
     // rtlsdr_set_gpio_output(dev, 4);
@@ -1459,7 +1511,14 @@ found:
     switch (dev->tuner_type)
     {
     case RTLSDR_TUNER_R828D:
-        dev->tun_xtal = R828D_XTAL_FREQ;
+        /* Blog V4 uses the same 28.8 MHz xtal as the RTL2832U — keep default.
+         * Generic R828D dongles use a separate 16 MHz xtal. */
+        if (!rtlsdr_check_dongle_model(dev, "RTLSDRBlog", "Blog V4")) {
+            dev->tun_xtal = R828D_XTAL_FREQ;  /* 16 MHz for generic R828D */
+            ESP_LOGI(TAG_ADSB, "R828D xtal: 16 MHz (generic)");
+        } else {
+            ESP_LOGI(TAG_ADSB, "R828D xtal: 28.8 MHz (Blog V4 — shared with RTL2832U)");
+        }
         /* fall-through */
     case RTLSDR_TUNER_R820T:
         /* disable Zero-IF mode */
@@ -1481,6 +1540,21 @@ found:
         break;
     default:
         break;
+    }
+
+    /* Check EEPROM for forced bias tee.  If the IR-Endpoint bit
+     * (byte 7, bit 1) is cleared, force the bias tee permanently on.
+     * The RTL-SDR Blog V4 uses this to power its internal upconverter. */
+    {
+        uint8_t eeprom_buf[EEPROM_SIZE];
+        r = rtlsdr_read_eeprom(dev, eeprom_buf, 0, EEPROM_SIZE);
+        if (r == 0) {
+            dev->force_bt = (eeprom_buf[7] & 0x02) ? 0 : 1;
+            if (dev->force_bt) {
+                ESP_LOGI(TAG_ADSB, "EEPROM: bias tee forced ON (IR-Endpoint bit cleared)");
+                rtlsdr_set_bias_tee(dev, 1);
+            }
+        }
     }
 
     if (dev->tuner->init)
@@ -1896,6 +1970,13 @@ int rtlsdr_set_bias_tee_gpio(rtlsdr_dev_t *dev, int gpio, int on)
 {
     if (!dev)
         return -1;
+
+    /* If this is the bias tee GPIO (0) and force_bt is set via EEPROM,
+     * don't allow the bias tee to turn off.  This prevents software
+     * (including our own init sequence) from disabling the bias tee
+     * that powers the V4's internal upconverter. */
+    if (gpio == 0 && dev->force_bt)
+        on = 1;
 
     rtlsdr_set_gpio_output(dev, gpio);
     rtlsdr_set_gpio_bit(dev, gpio, on);

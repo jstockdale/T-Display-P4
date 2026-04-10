@@ -2,6 +2,8 @@
 #include "esp_log.h"
 #include "esp_libusb.h"
 #include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <string.h>
 
 #define RTLSDR_BUF_LEN (16384 + 512)
@@ -92,25 +94,38 @@ void free_adsb_transfer(void) {
     // Intentionally empty — buffer stays allocated for reuse on reconnect
 }
 
+/* ---------------------------------------------------------------------------
+ * EP0 STALL recovery
+ *
+ * The RTL-SDR Blog V4 (R828D tuner) STALLs certain vendor control
+ * requests on EP0 — typically the demod status read-back in
+ * rtlsdr_demod_write_reg().  On Linux, libusb treats EP0 STALL as
+ * non-fatal: the pipe stays usable and the next SETUP packet clears it
+ * per USB spec §8.5.3.4.
+ *
+ * ESP-IDF's USB host marks the default pipe as HALTED on STALL, but
+ * the USBH daemon task clears it internally after processing the event.
+ * We just need to yield long enough for the daemon to run.
+ *
+ * Previous attempts to close/reopen the device broke the bulk endpoint
+ * (interface release destroys EP 0x81).  The simplest and most correct
+ * fix: don't touch anything.  Wait for the daemon, return -1 for the
+ * failed transfer, and let the caller continue.  The next control
+ * transfer will find the pipe in a clean state.
+ * ------------------------------------------------------------------------- */
+static bool esp_libusb_recover_stall(class_driver_t *driver_obj)
+{
+    ESP_LOGW(TAG_ADSB, "EP0 STALL — yielding for USBH daemon recovery");
+    vTaskDelay(pdMS_TO_TICKS(50));
+    return true;
+}
+
 void bulk_transfer_read_cb(usb_transfer_t *transfer)
 {
-    // int in_xfer = transfer->bEndpointAddress & USB_B_ENDPOINT_ADDRESS_EP_DIR_MASK;
-    // if ((transfer->status == 0) && in_xfer)
-    // {
-    //     for (int i = 0; i < 10; i++)
-    //         fprintf(stdout, "%02X", transfer->data_buffer[i]);
-    //     fprintf(stdout, "\n");
-    //     // for (int i = 0; i < transfer->actual_num_bytes; i++)
-    //     // {
-    //     //     adsbdev->response_buf[i] = transfer->data_buffer[i];
-    //     // }
-    // }
-
     adsbdev->is_done = true;
     adsbdev->is_success = transfer->status == 0;
+    adsbdev->stall_detected = false;
     adsbdev->bytes_transferred = transfer->actual_num_bytes;
-    //  printf("BULK: Transfer:Read type %d\n", transfer->actual_num_bytes);
-    // printf("BULK: Transfer:Read status %d, actual number of bytes transferred %d, databuffer size %d, %d\n", transfer->status, transfer->actual_num_bytes, transfer->data_buffer_size, adsbdev->response_buf[8]);
 }
 
 void transfer_read_cb(usb_transfer_t *transfer)
@@ -121,9 +136,8 @@ void transfer_read_cb(usb_transfer_t *transfer)
     }
     adsbdev->is_done = true;
     adsbdev->is_success = transfer->status == 0;
+    adsbdev->stall_detected = (transfer->status == USB_TRANSFER_STATUS_STALL);
     adsbdev->bytes_transferred = transfer->actual_num_bytes - sizeof(usb_setup_packet_t);
-    // printf("Transfer:Read type %d %ld \n", transfer->actual_num_bytes, transfer->flags);
-    // printf("Transfer:Read status %d, actual number of bytes transferred %d, databuffer size %d, %d\n", transfer->status, transfer->actual_num_bytes, transfer->data_buffer[8], adsbdev->response_buf[8]);
 }
 
 int esp_libusb_bulk_transfer(class_driver_t *driver_obj, unsigned char endpoint, unsigned char *data, int length, int *transferred, unsigned int timeout)
@@ -132,20 +146,7 @@ int esp_libusb_bulk_transfer(class_driver_t *driver_obj, unsigned char endpoint,
         ESP_LOGI(TAG_ADSB, "esp_libusb_bulk_transfer: no transfer allocated");
         return -1;
     }
-    // if (adsbdev->transfer != NULL) {
-    //     usb_host_transfer_free(adsbdev->transfer);
-    //     adsbdev->transfer = NULL;
-    // }
-    
-    // size_t sizePacket = usb_round_up_to_mps(length, 512);
-    // esp_err_t r = usb_host_transfer_alloc(sizePacket, 0, &adsbdev->transfer);
-    // if (r != ESP_OK)
-    // {
-    //     ESP_LOGI(TAG_ADSB, "esp_libusb_bulk_transfer a failed with %d", r);
-    //     return -1;
-    // }
 
-    //ESP_LOGI(TAG_ADSB, "esp_libusb_bulk_transfer submitting %d bytes", length);
     adsbdev->transfer->num_bytes = length;
     adsbdev->transfer->device_handle = driver_obj->dev_hdl;
     adsbdev->transfer->timeout_ms = timeout;
@@ -197,6 +198,7 @@ int esp_libusb_control_transfer(class_driver_t *driver_obj, uint8_t bm_req_type,
     adsbdev->ctrl_transfer->context = (void *)&driver_obj;
     adsbdev->ctrl_transfer->callback = transfer_read_cb;
     adsbdev->is_done = false;
+    adsbdev->stall_detected = false;
 
     if (bm_req_type == CTRL_OUT)
     {
@@ -208,7 +210,13 @@ int esp_libusb_control_transfer(class_driver_t *driver_obj, uint8_t bm_req_type,
     esp_err_t r = usb_host_transfer_submit_control(driver_obj->client_hdl, adsbdev->ctrl_transfer);
     if (r != ESP_OK)
     {
-        ESP_LOGI(TAG_ADSB, "libusb_control_transfer failed with %d", r);
+        if (r == ESP_ERR_INVALID_STATE) {
+            /* Default pipe is halted from a previous STALL — recover it.
+             * This transfer still fails, but the next one should work. */
+            esp_libusb_recover_stall(driver_obj);
+        } else {
+            ESP_LOGI(TAG_ADSB, "libusb_control_transfer failed with %d", r);
+        }
         return -1;
     }
 
@@ -218,7 +226,14 @@ int esp_libusb_control_transfer(class_driver_t *driver_obj, uint8_t bm_req_type,
     }
     if (!adsbdev->is_success)
     {
-        ESP_LOGI(TAG_ADSB, "libusb_control_transfer failed");
+        if (adsbdev->stall_detected) {
+            /* V4 dongle STALLed this request — recover the pipe so the
+             * next control transfer works.  This matches libusb behavior
+             * where EP0 STALL is non-fatal. */
+            esp_libusb_recover_stall(driver_obj);
+        }
+        /* Don't log for STALL — it's a known V4 behavior, not an error
+         * worth spamming the console about on every demod read-back. */
         return -1;
     }
     for (uint8_t i = 0; i < wLength; i++)
@@ -232,11 +247,16 @@ void esp_libusb_get_string_descriptor_ascii(const usb_str_desc_t *str_desc, char
 {
     if (str_desc == NULL)
     {
+        str[0] = '\0';
         return;
     }
 
-    for (int i = 0; i < str_desc->bLength / 2; i++)
+    /* bLength includes the 2-byte header (bLength + bDescriptorType).
+     * The actual UTF-16 character count is (bLength - 2) / 2. */
+    int nchars = (str_desc->bLength - 2) / 2;
+    for (int i = 0; i < nchars; i++)
     {
         str[i] = (char)str_desc->wData[i];
     }
+    str[nchars] = '\0';
 }

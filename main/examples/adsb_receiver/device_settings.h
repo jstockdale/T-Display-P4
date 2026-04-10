@@ -26,7 +26,7 @@ extern "C" {
 #endif
 
 #define SETTINGS_NVS_NAMESPACE "device_settings"
-#define SETTINGS_VERSION       9    // bump when struct changes
+#define SETTINGS_VERSION       13   // bump when struct changes
 
 // ─── Settings structure ──────────────────────────────────────────────────────
 
@@ -75,7 +75,7 @@ typedef struct {
 
     // ── Scope Display ──
     uint8_t  scope_fps_cap;       // 0=auto, 5/10/15/30, default 0 (auto)
-    uint8_t  scope_max_aircraft;  // 0=unlimited, 16/32/48/64, default 0
+    uint8_t  scope_max_aircraft;  // 0=unlimited (up to 128), default 0
 
     // ── Console ──
     bool     heartbeat_enabled;    // serial console heartbeat, default true
@@ -88,10 +88,29 @@ typedef struct {
     char     ntp_server[64];       // NTP server, default "pool.ntp.org"
     uint16_t ntp_poll_s;           // NTP poll interval in seconds (300-3600), default 300
 
+    // ── ADS-B Gain ──
+    uint16_t adsb_gain_tenths;    // gain in tenths of dB (e.g. 496 = 49.6 dB), default 496
+    uint8_t  adsb_gain_mode;      // 0=auto (adaptive), 1=manual (fixed), default 0
+
+    // ── GPS Integrity ──
+    uint8_t  gps_integrity_mode;  // 0=basic, 1=strict, default 0 (see GPS_INTEGRITY_*)
+
+    // ── MQTT Feeder ──
+    bool     mqtt_enabled;         // enable MQTT publishing, default true
+    char     mqtt_server[64];      // broker hostname, default "mqtt.offx1.com"
+    char     mqtt_user[33];        // broker username, default "adsb-scope-alpha"
+    char     mqtt_pass[41];        // broker password, default (see below)
+    char     mqtt_device_id[33];   // unique device identifier, default "" (auto from MAC)
+    uint16_t mqtt_port;            // broker port, default 8883 (MQTTS)
+
+    // ── Gain Target Band ──
+    uint8_t  gain_err_low;         // lower bound of target error rate (percent), default 40
+    uint8_t  gain_err_high;        // upper bound of target error rate (percent), default 50
+
     // ── ADD NEW FIELDS HERE — consume _pad bytes, bump SETTINGS_VERSION ──
 
     // ── Reserved for future fields ──
-    uint8_t  _pad[790];
+    uint8_t  _pad[610];
 } device_settings_t;
 
 // Struct must be exactly 1024 bytes — adjust _pad if this fires
@@ -141,6 +160,19 @@ static inline void settings_apply_defaults(device_settings_t *s) {
     s->wifi_pass[0]     = '\0';
     strncpy(s->ntp_server, "pool.ntp.org", sizeof(s->ntp_server));
     s->ntp_poll_s       = 300;     // 5 minutes
+    s->adsb_gain_tenths = 496;     // 49.6 dB (R820T max — adaptive will adjust)
+    s->adsb_gain_mode   = 0;       // auto (adaptive)
+    s->gps_integrity_mode = 0;     // basic (garbled NMEA guard only)
+    // MQTT feeder — enabled by default with alpha credentials
+    s->mqtt_enabled     = true;
+    strncpy(s->mqtt_server, "mqtt.offx1.com", sizeof(s->mqtt_server));
+    strncpy(s->mqtt_user, "adsb-scope-alpha", sizeof(s->mqtt_user));
+    strncpy(s->mqtt_pass, "d744212ba48991327c3846c51a864828581af730", sizeof(s->mqtt_pass));
+    s->mqtt_device_id[0]= '\0';   // empty = auto from MAC at boot
+    s->mqtt_port        = 8883;   // MQTTS default
+    // Gain target band — algorithm seeks error rate within this band
+    s->gain_err_low     = 40;     // 40% — below this, step up (deaf to distant aircraft)
+    s->gain_err_high    = 50;     // 50% — above this, step down (saturation encroaching)
 }
 
 // Legacy wrapper for any code that calls settings_defaults()
@@ -166,7 +198,7 @@ static inline void settings_validate(device_settings_t *s) {
     if (s->meshy_hop_limit < 1 || s->meshy_hop_limit > 7) s->meshy_hop_limit = 5;
     if (s->volume > 100) s->volume = 50;
     if (s->scope_fps_cap > 30) s->scope_fps_cap = 0;
-    if (s->scope_max_aircraft > 64) s->scope_max_aircraft = 0;
+    if (s->scope_max_aircraft > 128) s->scope_max_aircraft = 0; // MAX_SCOPE_AIRCRAFT
     if (s->heartbeat_period_s < 5) s->heartbeat_period_s = 30;
     // WiFi: ensure null-termination and valid poll interval
     s->wifi_ssid[32] = '\0';
@@ -174,6 +206,24 @@ static inline void settings_validate(device_settings_t *s) {
     s->ntp_server[63] = '\0';
     if (s->ntp_server[0] == '\0') strncpy(s->ntp_server, "pool.ntp.org", sizeof(s->ntp_server));
     if (s->ntp_poll_s < 300 || s->ntp_poll_s > 3600) s->ntp_poll_s = 300;
+    // ADS-B gain
+    if (s->adsb_gain_mode > 1) s->adsb_gain_mode = 0;
+    if (s->adsb_gain_tenths > 496) s->adsb_gain_tenths = 496;
+    // GPS integrity
+    if (s->gps_integrity_mode > 1) s->gps_integrity_mode = 0;
+    // MQTT feeder
+    s->mqtt_server[63] = '\0';
+    s->mqtt_user[32] = '\0';
+    s->mqtt_pass[40] = '\0';
+    s->mqtt_device_id[32] = '\0';
+    if (s->mqtt_port == 0) s->mqtt_port = 8883;
+    // Gain target band: safe operational range — keeps derived thresholds sane
+    // very_high (high+5) must stay below SEVERE (67%), very_low (low-20) must stay above 0%
+    if (s->gain_err_low < 25 || s->gain_err_low > 55) s->gain_err_low = 40;
+    if (s->gain_err_high < 35 || s->gain_err_high > 60) s->gain_err_high = 50;
+    if (s->gain_err_high < s->gain_err_low + 10) s->gain_err_high = s->gain_err_low + 10;
+    if (s->gain_err_high > s->gain_err_low + 20) s->gain_err_high = s->gain_err_low + 20;
+    if (s->gain_err_high > 60) { s->gain_err_high = 60; if (s->gain_err_low > 50) s->gain_err_low = 50; }
 }
 
 // ─── Global settings instance (defined in main.cpp) ──────────────────────────

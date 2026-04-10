@@ -31,6 +31,10 @@ extern Cpp_Bus_Driver::Es8311 *ES8311;
 
 static const char *TAG = "MUSIC";
 
+// SD I/O mutex + DMA fence — protects SPI bus from AXI contention
+extern "C" bool sd_io_take(uint32_t timeout_ms);
+extern "C" void sd_io_give(void);
+
 // ─── State ──────────────────────────────────────────────────────────────────
 
 static music_track_t *s_tracks = nullptr;  // PSRAM array
@@ -54,33 +58,46 @@ static mp3dec_t *s_mp3d = nullptr;
 #define MP3_INBUF_SIZE (16 * 1024)
 #define WAV_READ_SIZE  (8 * 1024)
 
-// ─── Async Read-Ahead Buffer ────────────────────────────────────────────────
+// ─── Async Read-Ahead Ring Buffer ───────────────────────────────────────────
 //
-// Large PSRAM buffer between SD card and decoder. A dedicated FreeRTOS task
-// handles all SD reads, so the decode loop only ever touches PSRAM (fast,
+// Large PSRAM ring buffer between SD card and decoder. A dedicated FreeRTOS
+// task handles all SD reads, so the decode loop only ever touches PSRAM (fast,
 // bounded-time). This eliminates audio skips caused by SD SPI latency.
 //
 // Architecture:
-//   Fill task (low priority):  fread → PSRAM, wakes on notification
-//   Decode loop (audio task):  PSRAM memcpy only, notifies fill task when room
-//   Mutex protects shared state (held only for fast PSRAM ops, never during fread)
+//   Fill task (low priority):  fread → PSRAM at tail, wakes on notification
+//   Decode loop (audio task):  PSRAM memcpy from head, notifies fill task after
+//   Mutex protects shared state (held only for fast pointer updates, never fread)
+//   Data semaphore blocks decode loop when buffer is empty (no spin-wait)
+//
+// Ring buffer layout:
+//   s_ra_head: read cursor (decode loop consumes from here)
+//   s_ra_tail: write cursor (fill task deposits here)
+//   s_ra_count: bytes available to read (head → tail, wrapping)
+//   s_ra_base: file offset corresponding to head position
+//
+//   If head <= tail:  [.....HEAD====TAIL.....]  (contiguous data)
+//   If head > tail:   [====TAIL.....HEAD=====]  (data wraps around end)
 
 #define READAHEAD_SIZE  (512 * 1024)   // 512KB PSRAM ring buffer
 #define READAHEAD_CHUNK (64 * 1024)    // SD read size per fill iteration
+#define READAHEAD_UNDERRUN_MAX 20      // consecutive empty reads before giving up
 
-static uint8_t  *s_readahead     = nullptr;   // PSRAM buffer
-static size_t    s_readahead_len = 0;          // valid bytes in buffer
-static size_t    s_readahead_pos = 0;          // read cursor within buffer
-static long      s_readahead_base = 0;         // file offset of s_readahead[0]
-static FILE     *s_readahead_fp  = nullptr;    // file being read (fill task only during fread)
-static bool      s_readahead_eof = false;       // hit end of file
-static size_t    s_readahead_total_sd = 0;     // diagnostic: total bytes from SD
+static uint8_t  *s_ra_buf       = nullptr;   // PSRAM ring buffer
+static size_t    s_ra_head      = 0;          // read cursor (decode side)
+static size_t    s_ra_tail      = 0;          // write cursor (fill side)
+static size_t    s_ra_count     = 0;          // bytes available to read
+static long      s_ra_base      = 0;          // file offset of head position
+static FILE     *s_ra_fp        = nullptr;    // file being read
+static bool      s_ra_eof       = false;      // hit end of file
+static size_t    s_ra_total_sd  = 0;          // diagnostic: total bytes from SD
 
 static SemaphoreHandle_t s_ra_mutex    = nullptr;   // protects shared buffer state
+static SemaphoreHandle_t s_ra_data_sem = nullptr;   // signaled when data deposited or EOF
 static TaskHandle_t      s_ra_task_hdl = nullptr;   // fill task handle
 static volatile bool     s_ra_filling  = false;     // true while fread in progress
-static volatile bool     s_ra_stop     = false;     // signals fill task to pause for close/seek
-static volatile uint32_t s_ra_gen      = 0;         // generation counter — incremented on open/seek
+static volatile bool     s_ra_stop     = false;     // signals fill task to pause
+static volatile uint32_t s_ra_gen      = 0;         // generation counter
 
 // ─── Fill Task ──────────────────────────────────────────────────────────────
 
@@ -88,50 +105,66 @@ static void readahead_fill_task(void *arg) {
     (void)arg;
     ESP_LOGI(TAG, "Readahead fill task started");
     for (;;) {
-        // Sleep until woken by readahead_read/open/seek, or poll every 50ms
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
+        // Sleep until notified — purely event-driven, no polling
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-        if (s_ra_stop) continue;  // paused for close/seek
-        if (!s_readahead || !s_readahead_fp || s_readahead_eof) continue;
+        if (s_ra_stop) continue;
+        if (!s_ra_buf || !s_ra_fp || s_ra_eof) continue;
 
-        // Phase 1: compact buffer under mutex (PSRAM memmove, <1ms)
+        // Snapshot state under mutex (fast — just pointer reads)
         xSemaphoreTake(s_ra_mutex, portMAX_DELAY);
-        if (s_readahead_pos > 0) {
-            size_t remaining = s_readahead_len - s_readahead_pos;
-            if (remaining > 0)
-                memmove(s_readahead, s_readahead + s_readahead_pos, remaining);
-            s_readahead_base += s_readahead_pos;
-            s_readahead_len = remaining;
-            s_readahead_pos = 0;
-        }
-        size_t cur_len = s_readahead_len;
-        FILE *fp = s_readahead_fp;
-        uint32_t gen = s_ra_gen;  // snapshot generation before fread
+        size_t count = s_ra_count;
+        size_t tail  = s_ra_tail;
+        FILE *fp     = s_ra_fp;
+        uint32_t gen = s_ra_gen;
         xSemaphoreGive(s_ra_mutex);
 
-        // Phase 2: read from SD — NO mutex held (this is the slow ~30-65ms part).
-        if (cur_len >= READAHEAD_SIZE || !fp) continue;
+        if (count >= READAHEAD_SIZE || !fp) continue;
 
-        size_t space = READAHEAD_SIZE - cur_len;
+        // Calculate how much to read — clamp to avoid wrapping past end of buffer
+        size_t space = READAHEAD_SIZE - count;
+        size_t to_end = READAHEAD_SIZE - tail;  // contiguous space at tail
         size_t to_read = space < READAHEAD_CHUNK ? space : READAHEAD_CHUNK;
+        if (to_read > to_end) to_read = to_end;  // don't wrap during fread
 
+        // fread — NO readahead mutex held (this is the slow ~30-65ms part).
+        // sd_io fence prevents AXI bus contention with WiFi SDIO DMA.
         s_ra_filling = true;
-        size_t got = fread(s_readahead + cur_len, 1, to_read, fp);
-        s_ra_filling = false;
+        if (sd_io_take(200)) {
+            size_t got = fread(s_ra_buf + tail, 1, to_read, fp);
+            sd_io_give();
+            s_ra_filling = false;
 
-        // Phase 3: update length under mutex — but only if generation matches
-        xSemaphoreTake(s_ra_mutex, portMAX_DELAY);
-        if (s_ra_gen == gen) {
-            s_readahead_len = cur_len + got;
-            s_readahead_total_sd += got;
-            if (got < to_read) {
-                s_readahead_eof = true;
-                ESP_LOGD(TAG, "RA fill: EOF (total_sd=%zu)", s_readahead_total_sd);
+            // Update state under mutex — only if generation matches
+            xSemaphoreTake(s_ra_mutex, portMAX_DELAY);
+            if (s_ra_gen == gen) {
+                s_ra_tail = (tail + got) % READAHEAD_SIZE;
+                s_ra_count += got;
+                s_ra_total_sd += got;
+                if (got < to_read) {
+                    s_ra_eof = true;
+                    ESP_LOGD(TAG, "RA fill: EOF (total_sd=%zu)", s_ra_total_sd);
+                }
+            } else {
+                ESP_LOGD(TAG, "RA fill: stale gen=%lu now=%lu — discarded %zu bytes",
+                         (unsigned long)gen, (unsigned long)s_ra_gen, got);
+            }
+            xSemaphoreGive(s_ra_mutex);
+
+            // Signal decode loop that data (or EOF) is available
+            if (s_ra_data_sem) xSemaphoreGive(s_ra_data_sem);
+
+            // If there's still room, wake ourselves for another chunk
+            if (got > 0 && !s_ra_eof && !s_ra_stop &&
+                s_ra_count < READAHEAD_SIZE) {
+                xTaskNotifyGive(s_ra_task_hdl);
             }
         } else {
-            ESP_LOGD(TAG, "RA fill: stale gen=%lu now=%lu — discarded %zu bytes", (unsigned long)gen, (unsigned long)s_ra_gen, got);
+            // SD busy — skip this read, try again shortly
+            s_ra_filling = false;
+            vTaskDelay(pdMS_TO_TICKS(10));
+            if (!s_ra_stop) xTaskNotifyGive(s_ra_task_hdl);
         }
-        xSemaphoreGive(s_ra_mutex);
     }
 }
 
@@ -139,6 +172,7 @@ static void readahead_fill_task(void *arg) {
 
 static void readahead_wait_idle(void) {
     s_ra_stop = true;
+    if (s_ra_task_hdl) xTaskNotifyGive(s_ra_task_hdl);  // wake so it sees stop
     while (s_ra_filling) {
         vTaskDelay(1);
     }
@@ -156,15 +190,19 @@ static void readahead_open(FILE *f) {
     readahead_wait_idle();
 
     xSemaphoreTake(s_ra_mutex, portMAX_DELAY);
-    s_readahead_fp   = f;
-    s_readahead_base = ftell(f);
-    s_readahead_len  = 0;
-    s_readahead_pos  = 0;
-    s_readahead_eof  = false;
-    s_readahead_total_sd = 0;
+    s_ra_fp       = f;
+    s_ra_base     = ftell(f);
+    s_ra_head     = 0;
+    s_ra_tail     = 0;
+    s_ra_count    = 0;
+    s_ra_eof      = false;
+    s_ra_total_sd = 0;
     s_ra_gen++;
-    ESP_LOGI(TAG, "RA open: base=%ld gen=%lu", s_readahead_base, (unsigned long)s_ra_gen);
+    ESP_LOGI(TAG, "RA open: base=%ld gen=%lu", s_ra_base, (unsigned long)s_ra_gen);
     xSemaphoreGive(s_ra_mutex);
+
+    // Reset data semaphore so decode loop doesn't see stale signals
+    if (s_ra_data_sem) xSemaphoreTake(s_ra_data_sem, 0);
 
     readahead_resume();
 }
@@ -173,54 +211,69 @@ static void readahead_close(void) {
     readahead_wait_idle();
 
     xSemaphoreTake(s_ra_mutex, portMAX_DELAY);
-    ESP_LOGI(TAG, "RA close: total_sd=%zu gen=%lu", s_readahead_total_sd, (unsigned long)(s_ra_gen + 1));
-    if (s_readahead_fp) {
-        fclose(s_readahead_fp);
-        s_readahead_fp = nullptr;
+    ESP_LOGI(TAG, "RA close: total_sd=%zu gen=%lu", s_ra_total_sd, (unsigned long)(s_ra_gen + 1));
+    if (s_ra_fp) {
+        if (sd_io_take(200)) { fclose(s_ra_fp); sd_io_give(); }
+        else fclose(s_ra_fp);  // best-effort
+        s_ra_fp = nullptr;
     }
-    s_readahead_len  = 0;
-    s_readahead_pos  = 0;
-    s_readahead_base = 0;
-    s_readahead_eof  = false;
-    s_readahead_total_sd = 0;
+    s_ra_head     = 0;
+    s_ra_tail     = 0;
+    s_ra_count    = 0;
+    s_ra_base     = 0;
+    s_ra_eof      = false;
+    s_ra_total_sd = 0;
     s_ra_gen++;
     xSemaphoreGive(s_ra_mutex);
 
     s_ra_stop = false;  // allow task to sleep normally
 }
 
-// ─── Read (decode loop) — waits for data if buffer empty, never blocks on SD ──
+// ─── Read (decode loop) — blocks on semaphore if empty, never on SD ─────────
 
 static size_t readahead_read(void *dst, size_t bytes) {
-    // If buffer is empty and not EOF, wait for fill task to deliver data.
-    for (int retries = 0; retries < 100; retries++) {  // 100 ticks × ~10ms = ~1s max
-        xSemaphoreTake(s_ra_mutex, portMAX_DELAY);
-        size_t avail = s_readahead_len - s_readahead_pos;
-        bool eof = s_readahead_eof;
-        xSemaphoreGive(s_ra_mutex);
+    // Fast path: check if data is already available
+    xSemaphoreTake(s_ra_mutex, portMAX_DELAY);
+    size_t avail = s_ra_count;
+    bool eof = s_ra_eof;
+    xSemaphoreGive(s_ra_mutex);
 
-        if (avail > 0 || eof) break;
-
-        // Buffer empty, not EOF — wake fill task and yield
-        if (s_ra_task_hdl) xTaskNotifyGive(s_ra_task_hdl);
-        vTaskDelay(1);
+    // If empty and not EOF, block until fill task deposits data
+    if (avail == 0 && !eof) {
+        if (s_ra_task_hdl) xTaskNotifyGive(s_ra_task_hdl);  // ensure fill task is awake
+        // Block with timeout — avoids infinite hang if something goes wrong
+        xSemaphoreTake(s_ra_data_sem, pdMS_TO_TICKS(500));
     }
 
+    // Copy from ring buffer under mutex
     xSemaphoreTake(s_ra_mutex, portMAX_DELAY);
 
-    size_t avail = s_readahead_len - s_readahead_pos;
+    avail = s_ra_count;
     size_t to_copy = bytes < avail ? bytes : avail;
+
     if (to_copy > 0) {
-        memcpy(dst, s_readahead + s_readahead_pos, to_copy);
-        s_readahead_pos += to_copy;
+        uint8_t *d = (uint8_t *)dst;
+        size_t head = s_ra_head;
+        size_t first = READAHEAD_SIZE - head;  // bytes before wrap
+
+        if (to_copy <= first) {
+            // No wrap — single memcpy
+            memcpy(d, s_ra_buf + head, to_copy);
+        } else {
+            // Wrap — two memcpys
+            memcpy(d, s_ra_buf + head, first);
+            memcpy(d + first, s_ra_buf, to_copy - first);
+        }
+        s_ra_head = (head + to_copy) % READAHEAD_SIZE;
+        s_ra_count -= to_copy;
+        s_ra_base += to_copy;
     }
-    avail -= to_copy;
-    bool eof = s_readahead_eof;
+    eof = s_ra_eof;
 
     xSemaphoreGive(s_ra_mutex);
 
-    // Wake fill task whenever there's room for a chunk
-    if (s_ra_task_hdl && !eof && avail < (READAHEAD_SIZE - READAHEAD_CHUNK)) {
+    // Always wake fill task after consuming data (room available now)
+    if (s_ra_task_hdl && !eof) {
         xTaskNotifyGive(s_ra_task_hdl);
     }
 
@@ -230,9 +283,29 @@ static size_t readahead_read(void *dst, size_t bytes) {
 // ─── Seek ──────────────────────────────────────────────────────────────────
 
 static void readahead_seek(long offset, int whence) {
-    if (!s_readahead_fp) return;
+    if (!s_ra_fp) return;
 
     readahead_wait_idle();
+
+    if (whence == SEEK_END) {
+        // SEEK_END: do fseek/ftell outside mutex (fill task is stopped)
+        fseek(s_ra_fp, offset, whence);
+        long new_base = ftell(s_ra_fp);
+
+        xSemaphoreTake(s_ra_mutex, portMAX_DELAY);
+        s_ra_head     = 0;
+        s_ra_tail     = 0;
+        s_ra_count    = 0;
+        s_ra_eof      = false;
+        s_ra_total_sd = 0;
+        s_ra_base     = new_base;
+        s_ra_gen++;
+        xSemaphoreGive(s_ra_mutex);
+
+        if (s_ra_data_sem) xSemaphoreTake(s_ra_data_sem, 0);
+        readahead_resume();
+        return;
+    }
 
     xSemaphoreTake(s_ra_mutex, portMAX_DELAY);
 
@@ -240,55 +313,58 @@ static void readahead_seek(long offset, int whence) {
     long target;
     if (whence == SEEK_SET) {
         target = offset;
-    } else if (whence == SEEK_CUR) {
-        target = s_readahead_base + (long)s_readahead_pos + offset;
-    } else {
-        // SEEK_END: can't optimize
-        s_readahead_len = 0;
-        s_readahead_pos = 0;
-        s_readahead_eof = false;
-        s_readahead_total_sd = 0;
-        s_ra_gen++;
-        fseek(s_readahead_fp, offset, whence);
-        s_readahead_base = ftell(s_readahead_fp);
-        xSemaphoreGive(s_ra_mutex);
-        readahead_resume();
-        return;
+    } else {  // SEEK_CUR
+        target = s_ra_base + offset;
     }
 
     // Check if target is within the currently buffered range
-    long buf_start = s_readahead_base;
-    long buf_end   = s_readahead_base + (long)s_readahead_len;
+    long buf_start = s_ra_base;
+    long buf_end   = s_ra_base + (long)s_ra_count;
 
     if (target >= buf_start && target <= buf_end) {
-        // Hit — just adjust position pointer (no SD access, no gen bump)
-        s_readahead_pos = (size_t)(target - buf_start);
+        // Hit — adjust head pointer within ring (no SD access, no gen bump)
+        size_t delta = (size_t)(target - buf_start);
+        s_ra_head = (s_ra_head + delta) % READAHEAD_SIZE;
+        s_ra_count -= delta;
+        s_ra_base = target;
         xSemaphoreGive(s_ra_mutex);
         readahead_resume();
         return;
     }
 
     // Miss — invalidate buffer and seek the file
-    s_readahead_len = 0;
-    s_readahead_pos = 0;
-    s_readahead_eof = false;
-    s_readahead_total_sd = 0;
+    s_ra_head     = 0;
+    s_ra_tail     = 0;
+    s_ra_count    = 0;
+    s_ra_eof      = false;
+    s_ra_total_sd = 0;
     s_ra_gen++;
-    fseek(s_readahead_fp, target, SEEK_SET);
-    s_readahead_base = target;
-
     xSemaphoreGive(s_ra_mutex);
+
+    // fseek outside mutex (fill task is stopped)
+    fseek(s_ra_fp, target, SEEK_SET);
+
+    xSemaphoreTake(s_ra_mutex, portMAX_DELAY);
+    s_ra_base = target;
+    xSemaphoreGive(s_ra_mutex);
+
+    if (s_ra_data_sem) xSemaphoreTake(s_ra_data_sem, 0);
     readahead_resume();
 }
 
 // Current logical file position
 static long readahead_tell(void) {
-    return s_readahead_base + (long)s_readahead_pos;
+    return s_ra_base;
 }
 
 // Bytes available without SD access
 static size_t readahead_available(void) {
-    return s_readahead_len - s_readahead_pos;
+    return s_ra_count;
+}
+
+// Is the file fully read?
+static bool readahead_eof(void) {
+    return s_ra_eof && s_ra_count == 0;
 }
 
 // Wake fill task and wait until at least some data is buffered (or EOF).
@@ -297,11 +373,11 @@ static size_t readahead_available(void) {
 static void readahead_prefetch(void) {
     if (!s_ra_task_hdl) return;
     xTaskNotifyGive(s_ra_task_hdl);
-    for (int i = 0; i < 100; i++) {  // 100 ticks × ~10ms = ~1s max wait
-        if (readahead_available() > 0 || s_readahead_eof) return;
+    for (int i = 0; i < 100; i++) {
+        if (readahead_available() > 0 || s_ra_eof) return;
         vTaskDelay(1);
     }
-    ESP_LOGW(TAG, "RA prefetch: TIMEOUT (eof=%d gen=%lu)", s_readahead_eof, (unsigned long)s_ra_gen);
+    ESP_LOGW(TAG, "RA prefetch: TIMEOUT (eof=%d gen=%lu)", s_ra_eof, (unsigned long)s_ra_gen);
 }
 
 static uint8_t  *s_mp3_inbuf = nullptr;   // MP3 decoder input window (PSRAM, 16KB)
@@ -343,12 +419,14 @@ static uint32_t id3_syncsafe(const uint8_t *b) {
 }
 
 static void id3_parse(const char *path, music_track_t *t) {
+    if (!sd_io_take(200)) return;
     FILE *f = fopen(path, "rb");
-    if (!f) return;
+    if (!f) { sd_io_give(); return; }
 
     uint8_t hdr[10];
     if (fread(hdr, 1, 10, f) != 10 || memcmp(hdr, "ID3", 3) != 0) {
         fclose(f);
+        sd_io_give();
         return;
     }
 
@@ -357,10 +435,12 @@ static void id3_parse(const char *path, music_track_t *t) {
 
     // Bulk-read the ID3 tag (up to ID3_BUF_SIZE) into PSRAM — one SD access.
     // TIT2/TPE1 are always near the start of the tag, well within 4KB.
-    if (!s_id3_buf) { fclose(f); return; }
+    if (!s_id3_buf) { fclose(f); sd_io_give(); return; }
     size_t to_read = tag_size < ID3_BUF_SIZE ? tag_size : ID3_BUF_SIZE;
     size_t got = fread(s_id3_buf, 1, to_read, f);
-    fclose(f);  // done with SD — everything parsed from PSRAM now
+    fclose(f);
+    sd_io_give();
+    // done with SD — everything parsed from PSRAM now
 
     if (got < 10) return;
 
@@ -452,19 +532,21 @@ static void id3_parse(const char *path, music_track_t *t) {
 static void id3_extract_art(const char *path) {
     s_art_size = 0;  // clear previous art
 
+    if (!sd_io_take(200)) return;
     FILE *f = fopen(path, "rb");
-    if (!f) return;
+    if (!f) { sd_io_give(); return; }
 
     uint8_t hdr[10];
     if (fread(hdr, 1, 10, f) != 10 || memcmp(hdr, "ID3", 3) != 0) {
         fclose(f);
+        sd_io_give();
         return;
     }
 
     uint8_t ver_major = hdr[3];
     uint32_t tag_size = id3_syncsafe(hdr + 6);
 
-    if (!s_art_buf) { fclose(f); return; }
+    if (!s_art_buf) { fclose(f); sd_io_give(); return; }
 
     // Bulk-read the entire ID3 tag into s_art_buf — one SD access.
     // If the tag is larger than our buffer, we read what fits and may
@@ -475,7 +557,9 @@ static void id3_extract_art(const char *path) {
                  (unsigned long)tag_size, (unsigned)ART_BUF_MAX);
     }
     size_t got = fread(s_art_buf, 1, to_read, f);
-    fclose(f);  // done with SD — everything parsed from PSRAM now
+    fclose(f);
+    sd_io_give();
+    // done with SD — everything parsed from PSRAM now
 
     if (got < 10) return;
 
@@ -620,8 +704,8 @@ void music_player_init(void) {
     if (!s_wav_buf) {
         s_wav_buf = (uint8_t *)heap_caps_malloc(WAV_READ_SIZE, MALLOC_CAP_SPIRAM);
     }
-    if (!s_readahead) {
-        s_readahead = (uint8_t *)heap_caps_malloc(READAHEAD_SIZE, MALLOC_CAP_SPIRAM);
+    if (!s_ra_buf) {
+        s_ra_buf = (uint8_t *)heap_caps_malloc(READAHEAD_SIZE, MALLOC_CAP_SPIRAM);
     }
     if (!s_id3_buf) {
         s_id3_buf = (uint8_t *)heap_caps_malloc(ID3_BUF_SIZE, MALLOC_CAP_SPIRAM);
@@ -630,15 +714,18 @@ void music_player_init(void) {
         s_art_buf = (uint8_t *)heap_caps_malloc(ART_BUF_MAX, MALLOC_CAP_SPIRAM);
     }
 
-    if (!s_tracks || !s_mp3d || !s_mp3_inbuf || !s_pcm_buf || !s_wav_buf || !s_readahead || !s_id3_buf || !s_art_buf) {
+    if (!s_tracks || !s_mp3d || !s_mp3_inbuf || !s_pcm_buf || !s_wav_buf || !s_ra_buf || !s_id3_buf || !s_art_buf) {
         ESP_LOGE(TAG, "Failed to allocate music player buffers in PSRAM");
     }
 
-    // Create readahead mutex and background fill task
+    // Create readahead mutex, data semaphore, and background fill task
     if (!s_ra_mutex) {
         s_ra_mutex = xSemaphoreCreateMutex();
     }
-    if (!s_ra_task_hdl && s_readahead && s_ra_mutex) {
+    if (!s_ra_data_sem) {
+        s_ra_data_sem = xSemaphoreCreateBinary();
+    }
+    if (!s_ra_task_hdl && s_ra_buf && s_ra_mutex) {
         xTaskCreateWithCaps(readahead_fill_task, "ra_fill", 4096,
                             nullptr, 2,  // low priority — below audio task
                             &s_ra_task_hdl, MALLOC_CAP_SPIRAM);
@@ -649,7 +736,7 @@ void music_player_init(void) {
     s_state = MUSIC_STATE_STOPPED;
 
     ESP_LOGI(TAG, "Music player initialized (buffers: mp3d=%p inbuf=%p pcm=%p wav=%p readahead=%p[%uKB] id3=%p fill_task=%p)",
-             s_mp3d, s_mp3_inbuf, s_pcm_buf, s_wav_buf, s_readahead, READAHEAD_SIZE / 1024, s_id3_buf, s_ra_task_hdl);
+             s_mp3d, s_mp3_inbuf, s_pcm_buf, s_wav_buf, s_ra_buf, READAHEAD_SIZE / 1024, s_id3_buf, s_ra_task_hdl);
 }
 
 // Forward declarations
@@ -659,7 +746,13 @@ int music_player_scan(void) {
     if (!s_tracks) return 0;
     s_track_count = 0;
 
+    // opendir reads directory sectors via SPI DMA — fence it
+    if (!sd_io_take(2000)) {
+        ESP_LOGW(TAG, "SD busy — cannot scan music directory");
+        return 0;
+    }
     DIR *dir = opendir(MUSIC_DIR);
+    sd_io_give();
     if (!dir) {
         ESP_LOGW(TAG, "Cannot open %s — no music directory", MUSIC_DIR);
         return 0;
@@ -697,7 +790,8 @@ int music_player_scan(void) {
 
         s_track_count++;
     }
-    closedir(dir);
+    if (sd_io_take(2000)) { closedir(dir); sd_io_give(); }
+    else closedir(dir);  // best-effort close without fence
 
     ESP_LOGI(TAG, "Scanned %d tracks from %s", s_track_count, MUSIC_DIR);
     dir_update_mtime();
@@ -755,7 +849,7 @@ void music_player_sd_close(void) {
     }
 
     // Close file handle (waits for any in-flight fread, then fclose).
-    // Safe to double-close: readahead_close checks s_readahead_fp before fclose.
+    // Safe to double-close: readahead_close checks s_ra_fp before fclose.
     readahead_close();
 }
 
@@ -799,8 +893,13 @@ void music_player_ack_track_change(void) { s_track_changed = false; }
 // ─── MP3 Playback ───────────────────────────────────────────────────────────
 
 static void play_mp3(const char *path) {
+    if (!sd_io_take(500)) {
+        ESP_LOGE(TAG, "SD busy, cannot open: %s", path);
+        return;
+    }
     FILE *f = fopen(path, "rb");
     if (!f) {
+        sd_io_give();
         ESP_LOGE(TAG, "Cannot open: %s", path);
         return;
     }
@@ -808,6 +907,7 @@ static void play_mp3(const char *path) {
     if (!s_mp3d || !s_mp3_inbuf || !s_pcm_buf) {
         ESP_LOGE(TAG, "MP3 buffers not allocated");
         fclose(f);
+        sd_io_give();
         return;
     }
     mp3dec_init(s_mp3d);
@@ -815,7 +915,14 @@ static void play_mp3(const char *path) {
     uint8_t *inbuf = s_mp3_inbuf;   // persistent PSRAM decoder window (16KB)
     int16_t *pcm   = s_pcm_buf;     // persistent PSRAM buffer (~4.6KB)
 
-    // Start read-ahead immediately — all reads go through PSRAM from here
+    // Get file size BEFORE opening readahead — single fseek on clean file handle
+    fseek(f, 0, SEEK_END);
+    long file_size_total = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    sd_io_give();
+    // File handle handed to readahead — it manages sd_io per-read from here
+
+    // Start read-ahead — all reads go through PSRAM from here
     readahead_open(f);
     readahead_prefetch();
 
@@ -828,12 +935,9 @@ static void play_mp3(const char *path) {
         readahead_seek(0, SEEK_SET);
     }
 
-    // Get file size for duration estimation (SEEK_END falls through to fseek)
     long data_start = readahead_tell();
-    readahead_seek(0, SEEK_END);
-    long file_size = readahead_tell() - data_start;
-    readahead_seek(data_start, SEEK_SET);
-    readahead_prefetch();  // re-fill after seek
+    long file_size = file_size_total - data_start;
+    readahead_prefetch();  // ensure buffer is primed after ID3 skip
 
     size_t inbuf_len = 0;
     size_t inbuf_consumed = 0;
@@ -843,6 +947,7 @@ static void play_mp3(const char *path) {
     uint32_t ui_update_ms = 0;
     long bytes_decoded = 0;
     bool duration_locked = false;  // once we have a reliable duration, stop re-estimating
+    int underruns = 0;             // consecutive empty reads — safety net
 
     s_position_s = 0;
     s_duration_s = 0;
@@ -896,9 +1001,18 @@ static void play_mp3(const char *path) {
             size_t to_read = MP3_INBUF_SIZE - inbuf_len;
             size_t got = readahead_read(inbuf + inbuf_len, to_read);
             inbuf_len += got;
+            if (got > 0) underruns = 0;  // data flowing — reset counter
         }
 
-        if (inbuf_len == 0) break;  // EOF
+        if (inbuf_len == 0) {
+            if (readahead_eof()) break;  // true end of file
+            if (++underruns >= READAHEAD_UNDERRUN_MAX) {
+                ESP_LOGW(TAG, "MP3: %d consecutive underruns — aborting", underruns);
+                break;
+            }
+            vTaskDelay(1);
+            continue;
+        }
 
         // Decode one frame
         mp3dec_frame_info_t frame_info;
@@ -1015,8 +1129,13 @@ static void play_mp3(const char *path) {
 }
 
 static void play_wav(const char *path) {
+    if (!sd_io_take(500)) {
+        ESP_LOGE(TAG, "SD busy, cannot open: %s", path);
+        return;
+    }
     FILE *f = fopen(path, "rb");
     if (!f) {
+        sd_io_give();
         ESP_LOGE(TAG, "Cannot open: %s", path);
         return;
     }
@@ -1024,8 +1143,11 @@ static void play_wav(const char *path) {
     if (!s_wav_buf) {
         ESP_LOGE(TAG, "WAV buffer not allocated");
         fclose(f);
+        sd_io_give();
         return;
     }
+    sd_io_give();
+    // File handle handed to readahead — it manages sd_io per-read from here
 
     // Start read-ahead from beginning of file — header + data all through PSRAM
     readahead_open(f);
@@ -1083,6 +1205,7 @@ static void play_wav(const char *path) {
     size_t bytes_remaining = hdr.data_size;
     uint32_t ui_update_ms = 0;
     double bytes_per_sec = hdr.sample_rate * hdr.num_channels * (hdr.bits_per_sample / 8.0);
+    int underruns = 0;
 
     while (bytes_remaining > 0 && !s_stop_requested) {
         // Handle pause
@@ -1110,7 +1233,16 @@ static void play_wav(const char *path) {
         if (to_read > bytes_remaining) to_read = bytes_remaining;
 
         size_t got = readahead_read(buf, to_read);
-        if (got == 0) break;
+        if (got == 0) {
+            if (readahead_eof()) break;  // true end of file
+            if (++underruns >= READAHEAD_UNDERRUN_MAX) {
+                ESP_LOGW(TAG, "WAV: %d consecutive underruns — aborting", underruns);
+                break;
+            }
+            vTaskDelay(1);
+            continue;
+        }
+        underruns = 0;  // data flowing — reset counter
 
         // ES8311 is a mono codec — downmix stereo WAV to mono in-place
         if (hdr.num_channels == 2) {
@@ -1152,14 +1284,16 @@ static time_t s_dir_mtime = 0;  // last known mtime of /sdcard/music/
  */
 static bool dir_changed(void) {
     struct stat st;
-    if (stat(MUSIC_DIR, &st) != 0) {
-        // Directory gone (SD removed?) — treat as changed if we had tracks
+    bool got_stat = false;
+    if (sd_io_take(200)) {
+        got_stat = (stat(MUSIC_DIR, &st) == 0);
+        sd_io_give();
+    }
+    if (!got_stat) {
+        // Directory gone or SD busy — treat as changed if we had tracks
         return s_track_count > 0;
     }
-    if (st.st_mtime != s_dir_mtime) {
-        return true;
-    }
-    return false;
+    return st.st_mtime != s_dir_mtime;
 }
 
 /**
@@ -1167,8 +1301,11 @@ static bool dir_changed(void) {
  */
 static void dir_update_mtime(void) {
     struct stat st;
-    if (stat(MUSIC_DIR, &st) == 0) {
-        s_dir_mtime = st.st_mtime;
+    if (sd_io_take(200)) {
+        if (stat(MUSIC_DIR, &st) == 0) {
+            s_dir_mtime = st.st_mtime;
+        }
+        sd_io_give();
     }
 }
 
@@ -1192,14 +1329,17 @@ void music_player_play_blocking(void) {
              t->format == MUSIC_FORMAT_MP3 ? "MP3" : "WAV");
 
     // Check file is accessible before attempting playback
-    FILE *test = fopen(t->path, "rb");
-    if (!test) {
-        ESP_LOGE(TAG, "Cannot open: %s (SD removed?)", t->path);
-        s_state = MUSIC_STATE_STOPPED;
-        s_position_s = 0;
-        return;  // caller should not auto-retry
+    if (sd_io_take(200)) {
+        FILE *test = fopen(t->path, "rb");
+        if (test) fclose(test);
+        sd_io_give();
+        if (!test) {
+            ESP_LOGE(TAG, "Cannot open: %s (SD removed?)", t->path);
+            s_state = MUSIC_STATE_STOPPED;
+            s_position_s = 0;
+            return;
+        }
     }
-    fclose(test);
 
     switch (t->format) {
         case MUSIC_FORMAT_MP3:

@@ -20,6 +20,20 @@ typedef struct
     int fix_errors; // Single bit error correction if true
     int aggressive; // Aggressive detection algorithm
     int check_crc;  // Only display messages with good CRC
+
+    // Statistics for adaptive gain
+    volatile uint32_t stat_preambles;  // preambles that passed all checks
+    volatile uint32_t stat_crc_ok;     // messages with valid CRC
+    volatile uint32_t stat_crc_fail;   // messages with failed CRC
+
+    // Signal quality metrics for adaptive gain (CRC-ok messages only)
+    // Preamble signal level: average of 4 preamble peaks (proportional to
+    // received power). Range 0–65167. Divide sum by stat_crc_ok for average.
+    volatile uint64_t stat_signal_sum;
+    // Bit delta: average |mag_high − mag_low| across all bits in message.
+    // SNR proxy — higher = cleaner signal. Noise floor at 2550 (10×255).
+    // Divide sum by stat_crc_ok for average.
+    volatile uint64_t stat_delta_sum;
 } mode_s_t;
 
 // The struct we use to store information about a decoded message
